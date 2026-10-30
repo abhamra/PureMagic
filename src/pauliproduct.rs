@@ -9,6 +9,9 @@ pub(crate) enum GateType {
     SX,
     CX,
     M,
+    /// Re-initialization of a single data patch to |0> after a mid-circuit measurement.
+    /// Scheduled like a single-patch `M`: it occupies the patch's node for one lcycle.
+    R,
     Z,
     X,
 }
@@ -32,6 +35,10 @@ impl GateType {
 
     pub(crate) fn is_m(&self) -> bool {
         matches!(self, GateType::M)
+    }
+
+    pub(crate) fn is_r(&self) -> bool {
+        matches!(self, GateType::R)
     }
 
     pub(crate) fn is_x(&self) -> bool {
@@ -76,6 +83,11 @@ pub(crate) struct PauliProduct {
     pub operators: Vec<Operator>,
     pub parents: Vec<i32>,
     pub children: Vec<i32>,
+    /// Extra classical dependencies, parsed from an `@a,b,..` suffix on the product's line: ids of
+    /// earlier products (normally `<M>`) whose *outcome* this product needs before it can start,
+    /// e.g. a gate conditioned on a mid-circuit measurement. They become DAG edges in
+    /// `Circuit::gen_deps` even though the products share no qubit.
+    pub after: Vec<i32>,
     pub max_qubit: u16,
     pub id: i32,
     pub gate_type: GateType,
@@ -88,6 +100,7 @@ impl Default for PauliProduct {
             max_qubit: 0,
             parents: Vec::new(),
             children: Vec::new(),
+            after: Vec::new(),
             id: -1,
             gate_type: GateType::T,
         }
@@ -99,9 +112,28 @@ impl PauliProduct {
         Self::default()
     }
 
-    /// Parses a circuit format string: `[±][X/Y/Z/_...][<gate_type>]`.
+    /// Parses a circuit format string: `[±][X/Y/Z/_...][<gate_type>][@id,id,..]`.
+    ///
+    /// The optional `@` suffix lists the ids of earlier products this one classically depends
+    /// on (see [`PauliProduct::after`]). Ids count the products kept by `Circuit::load_circuit`,
+    /// which for `transpile` output is simply the 0-based line number.
     pub(crate) fn set_from_str(&mut self, product_id: i32, s: &str) -> Result<(), Box<dyn Error>> {
         self.id = product_id;
+        let full = s;
+        let (s, after) = match s.split_once('@') {
+            Some((body, ids)) => {
+                let mut v = Vec::new();
+                for tok in ids.split(',') {
+                    let id: i32 = tok.trim().parse().map_err(|_| {
+                        format!("Bad classical dependency `{}` in product {}", tok, full)
+                    })?;
+                    v.push(id);
+                }
+                (body, v)
+            }
+            None => (s, Vec::new()),
+        };
+        self.after = after;
 
         for (i, c) in s.char_indices() {
             if i == 0 {
@@ -117,6 +149,7 @@ impl PauliProduct {
                     let gate_type = &s[i..];
                     match gate_type {
                         "<M>" => self.gate_type = GateType::M,
+                        "<R>" => self.gate_type = GateType::R,
                         "<T>" => self.gate_type = GateType::T,
                         "<CX>" => self.gate_type = GateType::CX,
                         "<S>" | "<Sdg>" => self.gate_type = GateType::S,
@@ -142,6 +175,8 @@ impl PauliProduct {
             assert_eq!(self.operators.len(), 2);
         } else if self.gate_type.is_s() || self.gate_type.is_sx() {
             assert_eq!(self.operators.len(), 1, "Should have max 1 qubit: {}", self);
+        } else if self.gate_type.is_r() {
+            assert_eq!(self.operators.len(), 1, "Reset must act on exactly 1 qubit: {}", self);
         }
         self.max_qubit = self.operators.iter().map(|op| op.qubit).max().unwrap_or(0);
         Ok(())
@@ -299,6 +334,44 @@ mod tests {
         assert!(pp.gate_type.is_m());
         assert_eq!(pp.operators.len(), 1);
         assert_eq!(pp.operators[0].qubit, 0);
+    }
+
+    #[test]
+    fn set_from_str_r_gate() {
+        let mut pp = PauliProduct::new();
+        pp.set_from_str(0, "+_Z_<R>").unwrap();
+        assert!(pp.gate_type.is_r());
+        assert!(!pp.gate_type.is_m());
+        assert!(!pp.gate_type.is_clifford());
+        assert_eq!(pp.operators.len(), 1);
+        assert_eq!(pp.operators[0].qubit, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Reset must act on exactly 1 qubit")]
+    fn set_from_str_r_gate_multi_qubit_panics() {
+        let mut pp = PauliProduct::new();
+        let _ = pp.set_from_str(0, "+ZZ<R>");
+    }
+
+    #[test]
+    fn set_from_str_classical_dependency_suffix() {
+        let mut pp = PauliProduct::new();
+        pp.set_from_str(7, "+_Z_<T>@3,5").unwrap();
+        assert!(pp.gate_type.is_t());
+        assert_eq!(pp.after, vec![3, 5]);
+        assert_eq!(pp.operators.len(), 1);
+        assert_eq!(pp.operators[0].qubit, 1);
+        let mut plain = PauliProduct::new();
+        plain.set_from_str(0, "+_Z_<T>").unwrap();
+        assert!(plain.after.is_empty());
+    }
+
+    #[test]
+    fn set_from_str_rejects_bad_classical_dependency() {
+        let mut pp = PauliProduct::new();
+        assert!(pp.set_from_str(1, "+Z<T>@x").is_err());
+        assert!(pp.set_from_str(1, "+Z<T>@").is_err());
     }
 
     #[test]

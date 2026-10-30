@@ -1151,3 +1151,99 @@ fn puremagic_all_products_scheduled_despite_t_gate_failures() {
         stdout
     );
 }
+
+// ── dynamic circuits: reset, mid-circuit measurement, classical dependencies ─────
+
+/// Run `transpile -i qasm -o workdir/out` (a thin wrapper over the same binary), writing `<workdir>/<out>`; returns whether it succeeded.
+fn transpile_to(qasm: &Path, out: &str, extra_args: &[&str], workdir: &Path) -> (bool, String) {
+    build_binaries();
+    let output = Command::new(bin_path("transpile"))
+        .args(["-i", qasm.to_str().unwrap(), "-o", workdir.join(out).to_str().unwrap()])
+        .args(extra_args)
+        .current_dir(workdir)
+        .output()
+        .expect("failed to spawn transpile");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (output.status.success(), text)
+}
+
+/// `(products, logical cycles)` from puremagic's "Scheduled N in M logical cycles" line.
+fn scheduled_counts(stdout: &str) -> (usize, usize) {
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("Scheduled") && l.contains("logical cycles"))
+        .unwrap_or_else(|| panic!("no 'Scheduled N in M logical cycles' line in:\n{}", stdout));
+    let words: Vec<&str> = line.split_whitespace().collect();
+    (words[1].parse().unwrap(), words[3].parse().unwrap())
+}
+
+#[test]
+fn dynamic_fixture_transpiles_and_schedules_in_every_reset_mode() {
+    let qasm = fixture("dyn_ancilla.cliffordt.qasm");
+    for mode in ["frame", "flush", "init"] {
+        let tmp = TempDir::new().unwrap();
+        let (ok, log) = transpile_to(&qasm, "d.trans", &["--reset_mode", mode], tmp.path());
+        assert!(ok, "transpile --reset_mode {} failed:\n{}", mode, log);
+        let sidecar = tmp.path().join("d.trans.dyn.json");
+        assert!(sidecar.exists(), "{}: dynamic circuit must write the classical sidecar", mode);
+        let trans = std::fs::read_to_string(tmp.path().join("d.trans")).unwrap();
+        // Only `init` re-initialises a patch, so only it emits <R> lines.
+        assert_eq!(trans.contains("<R>"), mode == "init", "{}: unexpected <R> presence", mode);
+        let (ok, stdout, stderr) = run_puremagic(
+            &["--circuit", tmp.path().join("d.trans").to_str().unwrap(), "-F"],
+            tmp.path(),
+        );
+        assert!(ok, "puremagic failed on {} output; stderr:\n{}", mode, stderr);
+        let n_lines = trans.lines().filter(|l| !l.trim().is_empty()).count();
+        assert!(scheduled_counts(&stdout).0 >= n_lines, "{}: not every product was scheduled", mode);
+    }
+}
+
+#[test]
+fn static_circuit_writes_no_sidecar_unless_asked() {
+    let tmp = TempDir::new().unwrap();
+    let qasm = fixture("tiny.cliffordt.qasm");
+    let (ok, log) = transpile_to(&qasm, "s.trans", &[], tmp.path());
+    assert!(ok, "{}", log);
+    assert!(!tmp.path().join("s.trans.dyn.json").exists());
+    let (ok, log) = transpile_to(&qasm, "s2.trans", &["--sidecar"], tmp.path());
+    assert!(ok, "{}", log);
+    assert!(tmp.path().join("s2.trans.dyn.json").exists());
+}
+
+#[test]
+fn reaction_latency_default_is_a_no_op_and_larger_latency_costs_cycles_per_hop() {
+    // dyn_pingpong has three feed-forward hops on its critical path, so latency L adds 3*L lcycles.
+    let tmp = TempDir::new().unwrap();
+    let (ok, log) =
+        transpile_to(&fixture("dyn_pingpong.cliffordt.qasm"), "pp.trans", &[], tmp.path());
+    assert!(ok, "{}", log);
+    let circuit = tmp.path().join("pp.trans");
+    let cycles = |extra: &[&str]| {
+        let mut args = vec!["--circuit", circuit.to_str().unwrap(), "-F"];
+        args.extend_from_slice(extra);
+        let (ok, stdout, stderr) = run_puremagic(&args, tmp.path());
+        assert!(ok, "puremagic failed; stderr:\n{}", stderr);
+        scheduled_counts(&stdout).1
+    };
+    let ideal = cycles(&[]);
+    assert_eq!(cycles(&["--reaction-latency", "0"]), ideal, "latency 0 must equal the default");
+    assert_eq!(cycles(&["--reaction-latency", "4"]), ideal + 3 * 4);
+    assert_eq!(cycles(&["--reaction-latency", "10"]), ideal + 3 * 10);
+}
+
+#[test]
+fn reaction_latency_leaves_a_static_circuit_unchanged() {
+    let tmp = TempDir::new().unwrap();
+    let circuit = fixture("tiny.trans");
+    let run = |extra: &[&str]| {
+        let mut args = vec!["--circuit", circuit.to_str().unwrap(), "-F"];
+        args.extend_from_slice(extra);
+        scheduled_counts(&run_puremagic(&args, tmp.path()).1)
+    };
+    assert_eq!(run(&[]), run(&["--reaction-latency", "25"]));
+}

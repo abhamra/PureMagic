@@ -226,6 +226,15 @@ pub(crate) struct Scheduler {
     /// `advance_clifford_state`/`check_clifford_repetitions` to treat these as complete,
     /// single-lcycle, zero-node events instead of ordinary 3-lcycle S/SX Cliffords.
     free_merged_products: HashSet<i32>,
+    /// Classical reaction latency, in lcycles. A product with a classical dependency (`after`, the
+    /// `@id,..` suffix of a `.trans` line) may start only this many lcycles later than it would
+    /// from the dependency's completion alone: the outcome of a logical measurement is not
+    /// usable until its syndrome rounds have been decoded. 0 (the default) keeps the scheduler
+    /// exactly as it was.
+    reaction_latency: usize,
+    /// `(due_lcycle, child_id)`: parent completions on classical edges whose release is held back
+    /// by `reaction_latency`. Released at the start of the first lcycle after `due_lcycle`.
+    delayed_unlocks: Vec<(usize, i32)>,
 }
 
 impl Scheduler {
@@ -292,7 +301,36 @@ impl Scheduler {
             t_conjugated_bases: HashMap::new(),
             conjugated_t_products: HashSet::new(),
             free_merged_products: HashSet::new(),
+            reaction_latency: 0,
+            delayed_unlocks: Vec::new(),
         }
+    }
+
+    /// Sets the classical reaction latency (lcycles) applied to `@`-dependency edges.
+    pub(crate) fn set_reaction_latency(&mut self, lcycles: usize) {
+        self.reaction_latency = lcycles;
+    }
+
+    /// Releases every delayed classical unlock whose latency has elapsed, making children whose
+    /// last outstanding parent it was available to the scheduler this lcycle.
+    fn release_delayed_unlocks(&mut self) {
+        if self.delayed_unlocks.is_empty() {
+            return;
+        }
+        let now = self.current_lcycle;
+        let mut still_waiting = Vec::with_capacity(self.delayed_unlocks.len());
+        for (due, child_id) in std::mem::take(&mut self.delayed_unlocks) {
+            if due >= now {
+                still_waiting.push((due, child_id));
+                continue;
+            }
+            self.remaining_parents[child_id as usize] -= 1;
+            if self.remaining_parents[child_id as usize] == 0 {
+                let child = self.input.circuit.product(child_id).clone();
+                self.pps_pending.push(child);
+            }
+        }
+        self.delayed_unlocks = still_waiting;
     }
 
     pub(crate) fn count_t_products(&self) -> usize {
@@ -332,9 +370,13 @@ impl Scheduler {
         let mut prev_pct_complete = 0usize;
         self.current_lcycle = 0;
         self.pp_paths = Vec::new();
-        while !self.pps_pending.is_empty() || !self.clifford_paths.is_empty() {
+        while !self.pps_pending.is_empty()
+            || !self.clifford_paths.is_empty()
+            || !self.delayed_unlocks.is_empty()
+        {
             self.timers.start(self.loop_timer);
             self.current_lcycle += 1;
+            self.release_delayed_unlocks();
             info_sched!(
                 "{}",
                 format!(
@@ -894,6 +936,7 @@ impl Scheduler {
             operators: vec![Operator { qubit, basis }],
             parents: vec![],
             children: vec![],
+            after: Vec::new(),
             max_qubit: qubit,
         };
         self.input.circuit.pps.push(s_pp);
@@ -1089,7 +1132,9 @@ impl Scheduler {
                         pp_id
                     );
                     PathResult::NoPath
-                } else if self.terminals_buf.len() == 1 && gate_type.is_m() {
+                } else if self.terminals_buf.len() == 1 && (gate_type.is_m() || gate_type.is_r()) {
+                    // A single-patch measurement and a patch re-initialization (`R`) both
+                    // occupy just the data patch's node for one lcycle.
                     self.sched_measurement(pp_id, plotting)
                 } else if gate_type.is_s() || gate_type.is_sx() {
                     self.sched_s_sx(pp_id, plotting)
@@ -1340,6 +1385,14 @@ impl Scheduler {
             // zero-node events - fall straight through to unlocking their children.
             let children: Vec<i32> = self.input.circuit.product(pp_id).children.clone();
             for child_id in children {
+                // A classical edge (the child's `@` list names this product) is held back by the
+                // reaction latency; ordinary qubit-overlap edges are not.
+                if self.reaction_latency > 0
+                    && self.input.circuit.product(child_id).after.contains(&pp_id)
+                {
+                    self.delayed_unlocks.push((self.current_lcycle + self.reaction_latency, child_id));
+                    continue;
+                }
                 self.remaining_parents[child_id as usize] -= 1;
                 if self.remaining_parents[child_id as usize] == 0
                     && !self.children_buf.contains(&child_id)
@@ -1967,5 +2020,67 @@ mod tests {
         assert!(sched.scheduled_products.contains(&1), "injected correction (id=1) scheduled");
         let tot_entries: usize = sched.lcycle_scheduled.iter().map(|(_, ids)| ids.len()).sum();
         assert_eq!(tot_entries, 6, "3 lcycles for the injected correction + 3 for the SX gate");
+    }
+
+    /// The lcycle in which product `id` was scheduled.
+    fn lcycle_of(sched: &Scheduler, id: i32) -> usize {
+        sched
+            .lcycle_scheduled
+            .iter()
+            .find(|(_, ids)| ids.contains(&id))
+            .map(|(l, _)| *l)
+            .unwrap_or_else(|| panic!("product {} was never scheduled", id))
+    }
+
+    #[test]
+    fn classical_dependency_without_latency_costs_one_lcycle() {
+        // Product 1 shares no qubit with product 0 but needs its outcome: it runs the lcycle after.
+        let mut sched = build_scheduler(&["+Z___<M>", "+_Z__<M>@0"], 0);
+        sched.sched_circuit().expect("sched_circuit failed");
+        assert_eq!(lcycle_of(&sched, 0), 1);
+        assert_eq!(lcycle_of(&sched, 1), 2);
+    }
+
+    #[test]
+    fn reaction_latency_delays_classically_dependent_products_exactly() {
+        for latency in [1usize, 3, 7] {
+            let mut sched = build_scheduler(&["+Z___<M>", "+_Z__<M>@0"], 0);
+            sched.set_reaction_latency(latency);
+            sched.sched_circuit().expect("sched_circuit failed");
+            assert_eq!(lcycle_of(&sched, 0), 1);
+            assert_eq!(lcycle_of(&sched, 1), 2 + latency, "latency {}", latency);
+        }
+    }
+
+    #[test]
+    fn reaction_latency_leaves_independent_products_alone() {
+        // Product 1 has no `@`: the latency must not touch it, nor a plain qubit-overlap edge.
+        let mut sched = build_scheduler(&["+Z___<M>", "+_Z__<M>", "+Z___<M>"], 0);
+        sched.set_reaction_latency(5);
+        sched.sched_circuit().expect("sched_circuit failed");
+        assert_eq!(lcycle_of(&sched, 0), 1);
+        assert_eq!(lcycle_of(&sched, 1), 1, "independent product runs in the first lcycle");
+        assert_eq!(lcycle_of(&sched, 2), 2, "qubit-overlap edge is not delayed");
+    }
+
+    #[test]
+    fn reaction_latency_waits_for_the_slowest_of_several_classical_parents() {
+        // Product 2 needs products 0 and 1; 1 is itself delayed behind 0.
+        let mut sched = build_scheduler(&["+Z___<M>", "+_Z__<M>@0", "+__Z_<M>@0,1"], 0);
+        sched.set_reaction_latency(2);
+        sched.sched_circuit().expect("sched_circuit failed");
+        assert_eq!(lcycle_of(&sched, 0), 1);
+        assert_eq!(lcycle_of(&sched, 1), 4);
+        assert_eq!(lcycle_of(&sched, 2), 7);
+    }
+
+    #[test]
+    fn reaction_latency_scheduler_still_terminates_when_only_delayed_work_remains() {
+        // After product 0 nothing is ready until the latency elapses; the loop must keep ticking.
+        let mut sched = build_scheduler(&["+Z___<M>", "+_Z__<R>@0"], 0);
+        sched.set_reaction_latency(10);
+        let (tot, n) = sched.sched_circuit().expect("sched_circuit failed");
+        assert_eq!(n, 2);
+        assert_eq!(tot, 12);
     }
 }

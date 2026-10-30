@@ -62,6 +62,7 @@ Run with `-h` to see all options.
 | `-S, --sides_only` | off | Use only side edges of data patches (not top/bottom) |
 | `-F, --no-t-failures` | off | Disable T gate failures (every T gate succeeds on first attempt) |
 | `-C, --record-cultivation-dist` | off | Record normalized cultivation-time distribution to `<name>.cultivation_dist` |
+| `--reaction-latency <L>` | `0` | Dynamic circuits: lcycles a product with an `@id` classical dependency waits after the product it names completes (outcome decoding time) |
 | `-a, --ancilla-rows <N>` | `1` | Number of ancilla rows between data patches (magic routing only) |
 | `-l, --log-scheduler <LEVEL>` | `none` | Scheduler trace log level: `none`, `info`, or `debug`; only populated in debug builds |
 | `-I, --show-product-ids` | off | Show product IDs instead of Pauli terms in circuit plots |
@@ -101,7 +102,11 @@ Each line encodes a Pauli product with a sign (`+`/`-`), per-qubit operators (`_
 <M>     Measurement
 <Z>     Z Pauli gate
 <X>     X Pauli gate
+<R>     Re-initialise one patch to |0> (dynamic circuits, `transpile --reset_mode init`)
 ```
+
+A line may end in `@3,5`, the 0-based ids of earlier products whose measurement *outcome* it needs
+(a gate conditioned on a mid-circuit measurement). See [docs/dynamic-circuits.md](docs/dynamic-circuits.md).
 
 Files in this format are produced by the `transpile` binary. The full pipeline from a raw QASM circuit to a scheduled output is:
 
@@ -154,6 +159,15 @@ back each qubit's trailing single-qubit Clifford run at a flush instead of alway
 reducing logical cycles at any weight; and `--auto`, which ignores `--max_width` and instead
 transpiles at each candidate weight (always with `--defer_trailing`) and keeps the one with the
 lowest predicted circuit depth.
+
+### Dynamic circuits (reset, mid-circuit measurement, feed-forward)
+
+`transpile` accepts `measure`, `reset` and `if(m==1) g q[i];` in the Clifford+T QASM, and
+`data_processing/dcsynth_to_cliffordt.py` lowers a dcsynth circuit (Qiskit, with `if_else` and
+`UnitaryGate`s) to that form. Resets and Pauli corrections become a classical Pauli frame and cost no
+lattice time; other conditional gates become products with `@` dependencies. Pipeline, modes
+(`--reset_mode frame|flush|init`), `--reaction-latency` and verification:
+[docs/dynamic-circuits.md](docs/dynamic-circuits.md).
 
 ## Output Files
 

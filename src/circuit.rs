@@ -6,7 +6,7 @@ use rand::Rng;
 #[cfg(test)]
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::create_dir_all;
 #[cfg(debug_assertions)]
 use std::io::{BufWriter, Write};
@@ -92,6 +92,22 @@ impl Circuit {
                     deps.push((pp.id as i32, current_id));
                 }
                 current_pps[op.qubit as usize] = pp.id as i32;
+            }
+        }
+        // Classical dependencies (`@id,..` suffix): the product needs the *outcome* of an earlier
+        // product, so it cannot start before that product completes, even with no shared qubit.
+        let existing: HashSet<(i32, i32)> = deps.iter().copied().collect();
+        for pp in self.pps.iter() {
+            for &a in &pp.after {
+                assert!(
+                    a >= 0 && a < pp.id,
+                    "product {} lists classical dependency @{}, which is not an earlier product",
+                    pp.id,
+                    a
+                );
+                if !existing.contains(&(pp.id, a)) {
+                    deps.push((pp.id, a));
+                }
             }
         }
         for (child_id, parent_id) in deps {
@@ -396,7 +412,11 @@ impl Circuit {
         let mut correction_power: HashMap<u16, u8> = HashMap::new();
 
         let mut expanded: Vec<PauliProduct> = Vec::with_capacity(self.pps.len() * 4);
+        // `first_id[k]`: where original product k starts in `expanded` (any S corrections emitted
+        // just before it come first). Classical dependencies attach to these.
+        let mut first_id: Vec<i32> = Vec::with_capacity(self.pps.len());
         for pp in &self.pps {
+            first_id.push(expanded.len() as i32);
             if pp.gate_type.is_cx() {
                 // Before a CX, emit S corrections for any tracked qubits.
                 for op in &pp.operators {
@@ -409,6 +429,7 @@ impl Circuit {
                                 operators: vec![Operator { qubit: op.qubit, basis: op.basis }],
                                 parents: vec![],
                                 children: vec![],
+                                after: vec![],
                                 max_qubit: op.qubit,
                             };
                             expanded.push(corr);
@@ -435,6 +456,7 @@ impl Circuit {
                                 operators: vec![Operator { qubit: op.qubit, basis: op.basis }],
                                 parents: vec![],
                                 children: vec![],
+                                after: vec![],
                                 max_qubit: op.qubit,
                             };
                             expanded.push(corr);
@@ -496,6 +518,17 @@ impl Circuit {
                     deps.push((pp.id, prev));
                 }
                 current_pps[op.qubit as usize] = pp.id;
+            }
+        }
+        // Classical dependencies: the child's first expanded piece waits for the last expanded
+        // piece of the product whose outcome it needs.
+        for pp in &self.pps {
+            for &a in &pp.after {
+                let child = first_id[pp.id as usize];
+                let parent = first_id.get(a as usize + 1).copied().unwrap_or(expanded.len() as i32) - 1;
+                // A duplicate of a qubit-overlap edge is harmless: parents and children stay
+                // consistent, exactly as for a CX whose two qubits share a parent.
+                deps.push((child, parent));
             }
         }
         for (child_id, parent_id) in deps {
@@ -823,6 +856,42 @@ mod tests {
         c.load_circuit().unwrap();
         assert!(c.product(0).parents.is_empty());
         assert!(c.product(1).parents.is_empty());
+    }
+
+    #[test]
+    fn classical_dependency_links_products_sharing_no_qubit() {
+        // product 2 acts on qubit 1 only, but needs the outcome of product 0 (on qubit 0).
+        let f = make_circuit_file(&["+Z_<M>", "+_Z<T>", "+_Z<S>@0"]);
+        let mut c = Circuit::new(&f.path().to_string_lossy().to_string());
+        c.load_circuit().unwrap();
+        let mut parents = c.product(2).parents.clone();
+        parents.sort();
+        assert_eq!(parents, vec![0, 1], "qubit-overlap parent 1 plus classical parent 0");
+        assert_eq!(c.product(0).children, vec![2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not an earlier product")]
+    fn classical_dependency_on_a_later_product_panics() {
+        let f = make_circuit_file(&["+Z_<T>@1", "+_Z<M>"]);
+        let mut c = Circuit::new(&f.path().to_string_lossy().to_string());
+        c.load_circuit().unwrap();
+    }
+
+    #[test]
+    fn classical_dependency_lengthens_the_layer_estimate() {
+        // Qubit 0 carries a chain of three products; the T on qubit 1 would sit in layer 1 on its
+        // own, but waiting for the outcome of the chain's last product pushes it to layer 4.
+        let free = make_circuit_file(&["+Z_<T>", "+Z_<T>", "+Z_<T>", "+_Z<T>"]);
+        let dep = make_circuit_file(&["+Z_<T>", "+Z_<T>", "+Z_<T>", "+_Z<T>@2"]);
+        let layers = |f: &NamedTempFile| {
+            let mut c = Circuit::new(&f.path().to_string_lossy().to_string());
+            c.load_circuit().unwrap();
+            let mut rng = StdRng::seed_from_u64(1);
+            (c.compute_layers().len(), c.estimate_num_layers(&mut rng, true))
+        };
+        assert_eq!(layers(&free), (3, 3));
+        assert_eq!(layers(&dep), (4, 4));
     }
 
     #[test]

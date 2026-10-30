@@ -1,0 +1,3904 @@
+diff --git a/README.md b/README.md
+index 9b12e45..53f5d81 100644
+--- a/README.md
++++ b/README.md
+@@ -62,6 +62,7 @@ Run with `-h` to see all options.
+ | `-S, --sides_only` | off | Use only side edges of data patches (not top/bottom) |
+ | `-F, --no-t-failures` | off | Disable T gate failures (every T gate succeeds on first attempt) |
+ | `-C, --record-cultivation-dist` | off | Record normalized cultivation-time distribution to `<name>.cultivation_dist` |
++| `--reaction-latency <L>` | `0` | Dynamic circuits: lcycles a product with an `@id` classical dependency waits after the product it names completes (outcome decoding time) |
+ | `-a, --ancilla-rows <N>` | `1` | Number of ancilla rows between data patches (magic routing only) |
+ | `-l, --log-scheduler <LEVEL>` | `none` | Scheduler trace log level: `none`, `info`, or `debug`; only populated in debug builds |
+ | `-I, --show-product-ids` | off | Show product IDs instead of Pauli terms in circuit plots |
+@@ -101,8 +102,12 @@ Each line encodes a Pauli product with a sign (`+`/`-`), per-qubit operators (`_
+ <M>     Measurement
+ <Z>     Z Pauli gate
+ <X>     X Pauli gate
++<R>     Re-initialise one patch to |0> (dynamic circuits, `transpile --reset_mode init`)
+ ```
+ 
++A line may end in `@3,5`, the 0-based ids of earlier products whose measurement *outcome* it needs
++(a gate conditioned on a mid-circuit measurement). See [docs/dynamic-circuits.md](docs/dynamic-circuits.md).
++
+ Files in this format are produced by the `transpile` binary. The full pipeline from a raw QASM circuit to a scheduled output is:
+ 
+ ### Step 1 — Compile to Clifford+T (Rust, optional)
+@@ -155,6 +160,15 @@ reducing logical cycles at any weight; and `--auto`, which ignores `--max_width`
+ transpiles at each candidate weight (always with `--defer_trailing`) and keeps the one with the
+ lowest predicted circuit depth.
+ 
++### Dynamic circuits (reset, mid-circuit measurement, feed-forward)
++
++`transpile` accepts `measure`, `reset` and `if(m==1) g q[i];` in the Clifford+T QASM, and
++`data_processing/dcsynth_to_cliffordt.py` lowers a dcsynth circuit (Qiskit, with `if_else` and
++`UnitaryGate`s) to that form. Resets and Pauli corrections become a classical Pauli frame and cost no
++lattice time; other conditional gates become products with `@` dependencies. Pipeline, modes
++(`--reset_mode frame|flush|init`), `--reaction-latency` and verification:
++[docs/dynamic-circuits.md](docs/dynamic-circuits.md).
++
+ ## Output Files
+ 
+ After scheduling, the following files are produced. Throughout the output, **lcycle** refers to one unit of parallel scheduling time, which is a single logical cycle in which all non-conflicting Pauli products that can be routed simultaneously are executed together.
+diff --git a/data_processing/dcsynth_to_cliffordt.py b/data_processing/dcsynth_to_cliffordt.py
+new file mode 100644
+index 0000000..e610758
+--- /dev/null
++++ b/data_processing/dcsynth_to_cliffordt.py
+@@ -0,0 +1,490 @@
++#!/usr/bin/env python3
++"""Lower a dcsynth dynamic circuit to the Clifford+T QASM that `transpile` reads.
++
++dcsynth (the dynamic-circuit ancilla-reuse compiler) assembles a Qiskit `QuantumCircuit` that
++contains `measure`, `reset`, and `if_else` blocks whose bodies are arbitrary single-qubit
++`UnitaryGate`s. PureMagic's `transpile` wants a Clifford+T circuit in OpenQASM 2 where:
++
++  * every classical bit is its own 1-bit register (`creg m0[1];`), so a condition names one bit;
++  * `measure q[i] -> m3[0];` and `reset q[i];` appear as written;
++  * a gate that depends on measurement outcomes is spelled `if(m3==1 && m5==0) t q[2];`, one
++    single-qubit gate per line, from h, s, sdg, sx, sxdg, x, y, z, t, tdg.
++
++This script does that lowering. The steps:
++
++  1. Consecutive single-qubit gates on a qubit are merged into one 2x2 matrix before synthesis
++     (fewer T gates), and flushed at every CX, measurement, reset or conditional.
++  2. A 2x2 unitary becomes Clifford+T by: identity -> nothing; a Pauli -> one x/y/z gate (those
++     are free Pauli-frame updates downstream); another Clifford -> a shortest h/s word; anything
++     else -> ZYZ Euler angles with each Rz synthesised by gridsynth (`pygridsynth`) to `--epsilon`.
++  3. An `if_else` is flattened to leaves "under these bit values, apply this unitary to qubit q".
++     For each qubit the leaves are completed to all 2^k assignments of the k bits involved. Then
++     the *cheapest* assignment's unitary U_ref is applied unconditionally and only the difference
++     V_a = U_a U_ref^dagger is conditioned on the bits. dcsynth's corrections usually differ by a
++     Pauli (or at worst a Clifford), so most of them become free frame updates instead of
++     conditional T gates that the scheduler must wait on.
++
++Anything `transpile` cannot express (a conditional CX, a measurement inside an `if_else`, a
++classical expression as a condition) raises `NotImplementedError` rather than being dropped.
++
++Usage:
++  dcsynth_to_cliffordt.py circuit.qpy -o circuit.cliffordt.qasm [--epsilon 1e-8]
++  # circuit.qpy: qiskit.qpy.dump(qc, open("circuit.qpy", "wb")) on the circuit dcsynth built
++  # (also accepted: OpenQASM 3 `.qasm3`, loaded with qiskit_qasm3_import)
++
++Python:
++  from dcsynth_to_cliffordt import lower
++  text, stats = lower(qc, epsilon=1e-8)
++"""
++from __future__ import annotations
++
++import argparse
++import itertools
++import math
++import sys
++import warnings
++from collections import ChainMap, Counter
++from pathlib import Path
++
++import numpy as np
++
++SQ2 = 1 / math.sqrt(2)
++G = {
++    "h": SQ2 * np.array([[1, 1], [1, -1]], dtype=complex),
++    "x": np.array([[0, 1], [1, 0]], dtype=complex),
++    "y": np.array([[0, -1j], [1j, 0]], dtype=complex),
++    "z": np.array([[1, 0], [0, -1]], dtype=complex),
++    "s": np.array([[1, 0], [0, 1j]], dtype=complex),
++    "sdg": np.array([[1, 0], [0, -1j]], dtype=complex),
++    "t": np.array([[1, 0], [0, np.exp(1j * math.pi / 4)]], dtype=complex),
++    "tdg": np.array([[1, 0], [0, np.exp(-1j * math.pi / 4)]], dtype=complex),
++}
++I2 = np.eye(2, dtype=complex)
++# Rz(k*pi/4) up to global phase, as gates in time order (T^k).
++EXACT_RZ = {0: [], 1: ["t"], 2: ["s"], 3: ["s", "t"], 4: ["z"], 5: ["z", "t"], 6: ["sdg"], 7: ["tdg"]}
++MAX_COND_BITS = 8  # beyond this a single if_else is emitted leaf by leaf instead of completed
++
++
++# ----------------------------------------------------------------------------- matrices
++def seq_matrix(seq: list[str]) -> np.ndarray:
++    """The matrix of gates applied in time order (first gate first)."""
++    m = I2
++    for g in seq:
++        m = G[g] @ m
++    return m
++
++
++def phase_distance(a: np.ndarray, b: np.ndarray) -> float:
++    """min over global phase of the operator-norm distance between two 2x2 unitaries."""
++    alpha = np.angle(np.vdot(b, a))
++    return float(np.linalg.norm(a - np.exp(1j * alpha) * b, 2))
++
++
++def _canon(u: np.ndarray, digits: int = 6) -> tuple:
++    """Hashable form of a 2x2 matrix with its global phase removed."""
++    flat = u.reshape(-1)
++    k = int(np.argmax(np.abs(flat) > 1e-6))
++    v = (u / (flat[k] / abs(flat[k]))).reshape(-1)
++    return tuple(np.round(v, digits).tolist())
++
++
++def _clifford_table() -> dict[tuple, list[str]]:
++    """All 24 single-qubit Cliffords (mod phase) -> shortest word over h, s (time order)."""
++    table: dict[tuple, list[str]] = {_canon(I2): []}
++    frontier = [(I2, [])]
++    while frontier:
++        nxt = []
++        for u, w in frontier:
++            for g in ("h", "s"):
++                v = G[g] @ u
++                key = _canon(v)
++                if key not in table:
++                    table[key] = w + [g]
++                    nxt.append((v, w + [g]))
++        frontier = nxt
++    assert len(table) == 24
++    return table
++
++
++CLIFFORDS = _clifford_table()
++
++
++def _compress_s_runs(word: list[str]) -> list[str]:
++    """s s -> z, s s s -> sdg (runs of s taken mod 4)."""
++    out: list[str] = []
++    run = 0
++
++    def flush() -> None:
++        nonlocal run
++        out.extend([[], ["s"], ["z"], ["sdg"]][run % 4])
++        run = 0
++
++    for g in word:
++        if g == "s":
++            run += 1
++        else:
++            flush()
++            out.append(g)
++    flush()
++    return out
++
++
++def pauli_name(u: np.ndarray, tol: float) -> str | None:
++    for name in ("x", "y", "z"):
++        if phase_distance(u, G[name]) < tol:
++            return name
++    return None
++
++
++def nearest_clifford(u: np.ndarray, tol: float) -> list[str] | None:
++    """The gate word of the Clifford within `tol` of `u` (mod phase), if there is one."""
++    for key, word in CLIFFORDS.items():
++        if phase_distance(u, seq_matrix(word)) < tol:
++            return _compress_s_runs(word)
++    return None
++
++
++# ----------------------------------------------------------------------------- synthesis
++_GS_REVERSED: bool | None = None  # does pygridsynth's string read last-gate-first?
++
++
++def _gridsynth_letters(theta: float, eps: float) -> str:
++    import mpmath
++    from pygridsynth.gridsynth import gridsynth_gates
++
++    with warnings.catch_warnings():
++        warnings.simplefilter("ignore")
++        return gridsynth_gates(theta=mpmath.mpf(theta), epsilon=mpmath.mpf(eps))
++
++
++def _letters_to_gates(s: str, reverse: bool) -> list[str]:
++    names = {"H": "h", "S": "s", "T": "t", "X": "x", "Y": "y", "Z": "z"}
++    letters = [c for c in s if c in names]  # W (global phase) and I are dropped
++    if reverse:
++        letters = letters[::-1]
++    return _compress_s_runs_keep_others(letters, names)
++
++
++def _compress_s_runs_keep_others(letters: list[str], names: dict[str, str]) -> list[str]:
++    return _compress_s_runs([names[c] for c in letters])
++
++
++def rz_matrix(theta: float) -> np.ndarray:
++    return np.array([[np.exp(-0.5j * theta), 0], [0, np.exp(0.5j * theta)]])
++
++
++def _calibrate_gridsynth() -> bool:
++    """Work out, once, whether the gridsynth string lists the last-applied gate first."""
++    theta, eps = 0.3, 1e-3
++    s = _gridsynth_letters(theta, eps)
++    best = []
++    for reverse in (False, True):
++        m = seq_matrix(_letters_to_gates(s, reverse))
++        best.append((phase_distance(m, rz_matrix(theta)), reverse))
++    d, reverse = min(best)
++    if d > 10 * eps:
++        raise RuntimeError(f"cannot interpret pygridsynth output (distance {d:.2e})")
++    return reverse
++
++
++def synth_rz(theta: float, eps: float) -> list[str]:
++    """Rz(theta) = diag(e^{-i theta/2}, e^{i theta/2}) as Clifford+T gates (time order)."""
++    global _GS_REVERSED
++    k = round(theta / (math.pi / 4))
++    if abs(theta - k * math.pi / 4) < 1e-9:
++        return list(EXACT_RZ[k % 8])
++    if _GS_REVERSED is None:
++        _GS_REVERSED = _calibrate_gridsynth()
++    return _letters_to_gates(_gridsynth_letters(theta, eps), _GS_REVERSED)
++
++
++def synth_1q(u: np.ndarray, eps: float, cliff_tol: float = 1e-7) -> list[str]:
++    """Clifford+T gates (time order) equal to `u` up to a global phase.
++
++    Exact for identity, Paulis and Cliffords (within `cliff_tol`); otherwise a ZYZ decomposition
++    with every Rz synthesised to `eps`, so the whole sequence is within about 3*eps of `u`.
++    """
++    if phase_distance(u, I2) < cliff_tol:
++        return []
++    p = pauli_name(u, cliff_tol)
++    if p:
++        return [p]
++    word = nearest_clifford(u, cliff_tol)
++    if word is not None:
++        return word
++    from qiskit.synthesis import OneQubitEulerDecomposer
++
++    theta, phi, lam = OneQubitEulerDecomposer("ZYZ").angles(u)  # u ~ Rz(phi) Ry(theta) Rz(lam)
++    out = synth_rz(lam, eps)
++    if abs(theta) > 1e-12:
++        # Ry(b) = S H Rz(b) H Sdg as a matrix product, so in time order: sdg, h, rz, h, s.
++        out += ["sdg", "h"] + synth_rz(theta, eps) + ["h", "s"]
++    out += synth_rz(phi, eps)
++    out = _compress_s_runs(out)
++    err = phase_distance(seq_matrix(out), u)
++    if err > max(8 * eps, 1e-9):
++        raise RuntimeError(f"synthesised sequence is {err:.2e} from the target (eps={eps:.1e})")
++    return out
++
++
++def t_count(seq: list[str]) -> int:
++    return sum(g in ("t", "tdg") for g in seq)
++
++
++# ----------------------------------------------------------------------------- lowering
++class Lowerer:
++    def __init__(self, qc, eps: float, cliff_tol: float) -> None:
++        self.qc, self.eps, self.cliff_tol = qc, eps, cliff_tol
++        self.lines: list[str] = []
++        self.pending: dict[int, np.ndarray] = {}
++        self.stats: Counter = Counter()
++        self._cache: dict[tuple, list[str]] = {}
++
++    # -- emission ----------------------------------------------------------------------
++    def synth(self, u: np.ndarray) -> list[str]:
++        key = _canon(u, 9)
++        if key not in self._cache:
++            self._cache[key] = synth_1q(u, self.eps, self.cliff_tol)
++        return self._cache[key]
++
++    def emit(self, gate: str, q: int, conds: tuple = ()) -> None:
++        if conds:
++            terms = " && ".join(f"m{b}=={int(v)}" for b, v in conds)
++            self.lines.append(f"if({terms}) {gate} q[{q}];")
++            self.stats["conditional_gates"] += 1
++            self.stats["conditional_t"] += gate in ("t", "tdg")
++        else:
++            self.lines.append(f"{gate} q[{q}];")
++            self.stats["gates"] += 1
++            self.stats["t"] += gate in ("t", "tdg")
++
++    def add_1q(self, u: np.ndarray, q: int) -> None:
++        self.pending[q] = u @ self.pending.get(q, I2)
++
++    def flush(self, q: int) -> None:
++        u = self.pending.pop(q, None)
++        if u is not None:
++            for g in self.synth(u):
++                self.emit(g, q)
++
++    # -- classical conditions -----------------------------------------------------------
++    @staticmethod
++    def _terms(condition, cmap) -> list[tuple[int, bool]]:
++        try:
++            target, value = condition
++        except TypeError:
++            raise NotImplementedError(f"unsupported classical expression condition: {condition}")
++        if hasattr(target, "__iter__"):  # a ClassicalRegister
++            bits = list(target)
++            return [(cmap[b], bool((int(value) >> i) & 1)) for i, b in enumerate(bits)]
++        return [(cmap[target], bool(value))]
++
++    def _flatten(self, circ, qmap, cmap, conds) -> list[tuple[tuple, int, np.ndarray]]:
++        """Leaves `(conds, qubit, 2x2 unitary)` of a (nested) if_else body, in program order."""
++        from qiskit.circuit import IfElseOp
++        from qiskit.quantum_info import Operator
++
++        leaves = []
++        for inst in circ.data:
++            op = inst.operation
++            if op.name in ("barrier", "delay"):
++                continue
++            if isinstance(op, IfElseOp):
++                sub_q = ChainMap(dict(zip(op.blocks[0].qubits, (qmap[b] for b in inst.qubits))), qmap)
++                sub_c = ChainMap(
++                    dict(zip(op.blocks[0].clbits, (cmap[b] for b in inst.clbits))), cmap
++                )
++                terms = self._terms(op.condition, sub_c)
++                leaves += self._flatten(op.blocks[0], sub_q, sub_c, conds + tuple(terms))
++                if len(op.blocks) > 1 and len(op.blocks[1].data):
++                    if len(terms) != 1:
++                        raise NotImplementedError("else-branch of a multi-bit condition")
++                    (b, v), = terms
++                    sub_q1 = ChainMap(
++                        dict(zip(op.blocks[1].qubits, (qmap[x] for x in inst.qubits))), qmap
++                    )
++                    sub_c1 = ChainMap(
++                        dict(zip(op.blocks[1].clbits, (cmap[x] for x in inst.clbits))), cmap
++                    )
++                    leaves += self._flatten(op.blocks[1], sub_q1, sub_c1, conds + ((b, not v),))
++            elif op.num_qubits == 1 and not op.num_clbits:
++                leaves.append((conds, qmap[inst.qubits[0]], Operator(op).data))
++            else:
++                raise NotImplementedError(
++                    f"`{op.name}` inside an if_else cannot be expressed: PureMagic supports only "
++                    "single-qubit conditional gates (use the default per-qubit dcsynth layout)"
++                )
++        return leaves
++
++    @staticmethod
++    def _cost(v: np.ndarray, tol: float) -> float:
++        if phase_distance(v, I2) < tol:
++            return 0.0
++        if pauli_name(v, tol):
++            return 0.1  # a classical frame update
++        if nearest_clifford(v, tol) is not None:
++            return 1.0
++        return 10.0  # a conditional T-type rotation: the expensive case
++
++    def _emit_if(self, inst, qmap, cmap) -> None:
++        op = inst.operation
++        sub_q = ChainMap(dict(zip(op.blocks[0].qubits, (qmap[b] for b in inst.qubits))), qmap)
++        sub_c = ChainMap(dict(zip(op.blocks[0].clbits, (cmap[b] for b in inst.clbits))), cmap)
++        terms = self._terms(op.condition, sub_c)
++        leaves = self._flatten(op.blocks[0], sub_q, sub_c, tuple(terms))
++        if len(op.blocks) > 1 and len(op.blocks[1].data):
++            if len(terms) != 1:
++                raise NotImplementedError("else-branch of a multi-bit condition")
++            (b, v), = terms
++            sub_q1 = ChainMap(dict(zip(op.blocks[1].qubits, (qmap[x] for x in inst.qubits))), qmap)
++            sub_c1 = ChainMap(dict(zip(op.blocks[1].clbits, (cmap[x] for x in inst.clbits))), cmap)
++            leaves += self._flatten(op.blocks[1], sub_q1, sub_c1, ((b, not v),))
++        if not leaves:
++            return
++        bits = sorted({b for conds, _, _ in leaves for b, _ in conds})
++        qubits = sorted({q for _, q, _ in leaves})
++        for q in qubits:
++            self.flush(q)
++        self.stats["if_else"] += 1
++
++        if len(bits) > MAX_COND_BITS:  # too many assignments to complete; emit leaf by leaf
++            for conds, q, u in leaves:
++                for g in self.synth(u):
++                    self.emit(g, q, tuple(sorted(set(conds))))
++            return
++
++        assignments = list(itertools.product((False, True), repeat=len(bits)))
++        for q in qubits:
++            # U_a: the unitary qubit q gets under assignment a (leaves in program order).
++            per_a = []
++            for a in assignments:
++                val = dict(zip(bits, a))
++                u = I2
++                for conds, lq, lu in leaves:
++                    if lq == q and all(val[b] == v for b, v in conds):
++                        u = lu @ u
++                per_a.append(u)
++            best = None
++            for r, u_ref in enumerate(per_a):
++                vs = [u @ u_ref.conj().T for u in per_a]
++                cost = sum(self._cost(v, self.cliff_tol) for v in vs)
++                if best is None or cost < best[0] - 1e-12:
++                    best = (cost, r, vs)
++            _, r, vs = best
++            self.add_1q(per_a[r], q)
++            self.flush(q)  # the reference runs now, unconditionally; only V_a waits for outcomes
++            for a, v in zip(assignments, vs):
++                if phase_distance(v, I2) < self.cliff_tol:
++                    continue
++                conds = tuple(zip(bits, a))
++                for g in self.synth(v):
++                    self.emit(g, q, conds)
++
++    # -- main walk ---------------------------------------------------------------------
++    def run(self) -> str:
++        from qiskit.circuit import IfElseOp
++        from qiskit.quantum_info import Operator
++
++        qc = self.qc
++        qmap = {b: i for i, b in enumerate(qc.qubits)}
++        cmap = {b: i for i, b in enumerate(qc.clbits)}
++        for inst in qc.data:
++            op = inst.operation
++            qs = [qmap[b] for b in inst.qubits]
++            if op.name in ("barrier", "delay", "id"):
++                continue
++            if op.name == "measure":
++                self.flush(qs[0])
++                c = cmap[inst.clbits[0]]
++                self.lines.append(f"measure q[{qs[0]}] -> m{c}[0];")
++                self.stats["measure"] += 1
++            elif op.name == "reset":
++                self.flush(qs[0])
++                self.lines.append(f"reset q[{qs[0]}];")
++                self.stats["reset"] += 1
++            elif isinstance(op, IfElseOp):
++                self._emit_if(inst, qmap, cmap)
++            elif op.num_qubits == 1 and not op.num_clbits:
++                self.add_1q(Operator(op).data, qs[0])
++            elif op.name == "cx":
++                self.flush(qs[0]), self.flush(qs[1])
++                self.lines.append(f"cx q[{qs[0]}], q[{qs[1]}];")
++                self.stats["cx"] += 1
++            elif op.name == "cz":
++                a, b = qs
++                self.flush(a), self.flush(b)
++                self.emit("h", b)
++                self.lines.append(f"cx q[{a}], q[{b}];")
++                self.emit("h", b)
++                self.stats["cx"] += 1
++            elif op.name == "swap":
++                a, b = qs
++                self.flush(a), self.flush(b)
++                for c_, t_ in ((a, b), (b, a), (a, b)):
++                    self.lines.append(f"cx q[{c_}], q[{t_}];")
++                self.stats["cx"] += 3
++            else:
++                raise NotImplementedError(
++                    f"`{op.name}` is not supported; decompose to cx + single-qubit gates first "
++                    "(e.g. qiskit.transpile(qc, basis_gates=['cx','u3'], optimization_level=0))"
++                )
++        for q in sorted(self.pending):
++            self.flush(q)
++
++        head = [
++            "OPENQASM 2.0;",
++            'include "qelib1.inc";',
++            "// lowered from a dcsynth dynamic circuit by dcsynth_to_cliffordt.py",
++            f"qreg q[{qc.num_qubits}];",
++        ]
++        head += [f"creg m{i}[1];" for i in range(qc.num_clbits)]
++        return "\n".join(head + self.lines) + "\n"
++
++
++def lower(qc, epsilon: float = 1e-8, clifford_tol: float = 1e-7) -> tuple[str, Counter]:
++    """Lower a dcsynth circuit; returns (OpenQASM 2 text, statistics)."""
++    lw = Lowerer(qc, epsilon, clifford_tol)
++    text = lw.run()
++    return text, lw.stats
++
++
++def load_circuit(path: Path):
++    if path.suffix == ".qpy":
++        from qiskit import qpy
++
++        with open(path, "rb") as f:
++            circuits = qpy.load(f)
++        return circuits[0]
++    if path.suffix in (".qasm3", ".qasm"):
++        from qiskit import qasm3
++
++        return qasm3.loads(path.read_text())
++    raise SystemExit(f"unrecognised input `{path}`: expected .qpy or .qasm3")
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
++    ap.add_argument("input", type=Path)
++    ap.add_argument("-o", "--output", type=Path, help="default: <input stem>.cliffordt.qasm")
++    ap.add_argument("--epsilon", type=float, default=1e-8, help="gridsynth precision per Rz")
++    ap.add_argument(
++        "--clifford-tol", type=float, default=1e-7,
++        help="a 2x2 unitary this close to a Clifford is snapped to it exactly",
++    )
++    args = ap.parse_args()
++    qc = load_circuit(args.input)
++    text, st = lower(qc, args.epsilon, args.clifford_tol)
++    out = args.output or args.input.with_suffix(".cliffordt.qasm")
++    out.write_text(text)
++    print(
++        f"wrote {out}: {qc.num_qubits} qubits, {qc.num_clbits} classical bits, "
++        f"{st['measure']} measure, {st['reset']} reset, {st['if_else']} if_else, "
++        f"{st['cx']} cx, T count {st['t']} unconditional + {st['conditional_t']} conditional "
++        f"({st['conditional_gates']} conditional gates in all)",
++        file=sys.stderr,
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/data_processing/test_dcsynth_lowering.py b/data_processing/test_dcsynth_lowering.py
+new file mode 100644
+index 0000000..c41f783
+--- /dev/null
++++ b/data_processing/test_dcsynth_lowering.py
+@@ -0,0 +1,429 @@
++#!/usr/bin/env python3
++"""Tests for dcsynth_to_cliffordt.py, and the dcsynth -> transpile -> oracle pipeline.
++
++Run (needs numpy, qiskit, pygridsynth; the `transpile` binary must be built):
++
++  cargo build --release --bin transpile
++  python data_processing/test_dcsynth_lowering.py            # or: pytest data_processing/
++
++What is checked:
++  * synthesis: identity/Pauli/Clifford are exact, a random unitary is within the requested epsilon;
++  * lowering: the exact joint distribution of all measurement outcomes of the original Qiskit
++    circuit (measure / reset / nested if_else / UnitaryGate) equals that of the lowered QASM;
++  * the lowered QASM then goes through `transpile` in every reset mode and width, and
++    validate_dynamic.py's oracle confirms the .trans file + sidecar still match it;
++  * what cannot be expressed is rejected, not silently dropped.
++
++The if_else structures are built with dcsynth's own `_conditional` when DCSYNTH_SRC points at its
++`src/dcsynth` directory (dcsynth needs bqskit, which is stubbed out here); otherwise with a copy
++of that function, so the tests always run.
++"""
++from __future__ import annotations
++
++import importlib
++import math
++import os
++import sys
++import types
++from collections import defaultdict
++from pathlib import Path
++
++import numpy as np
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE))
++import dcsynth_to_cliffordt as lowering  # noqa: E402
++import validate_dynamic as vd  # noqa: E402
++
++from qiskit import ClassicalRegister, QuantumCircuit  # noqa: E402
++from qiskit.circuit.library import UnitaryGate  # noqa: E402
++from qiskit.quantum_info import random_unitary  # noqa: E402
++
++ROOT = HERE.parent
++TRANSPILE = next(
++    (p for p in (ROOT / "target" / "release" / "transpile", ROOT / "target" / "debug" / "transpile")
++     if p.exists()),
++    ROOT / "target" / "release" / "transpile",
++)
++EPS = 1e-7
++
++
++# ----------------------------------------------------------------------------- dcsynth's `_conditional`
++def _load_dcsynth_conditional():
++    src = os.environ.get("DCSYNTH_SRC")
++    if not src or not Path(src).is_dir():
++        return None
++
++    class Stub(types.ModuleType):
++        def __getattr__(self, n):
++            if n.startswith("__"):
++                raise AttributeError(n)
++            return object
++
++    pkg = types.ModuleType("dcsynth")
++    pkg.__path__ = [src]
++    sys.modules["dcsynth"] = pkg
++    for _ in range(10):
++        try:
++            return importlib.import_module("dcsynth.assembly.schedule")._conditional
++        except ModuleNotFoundError as e:
++            sys.modules[e.name] = Stub(e.name)
++    return None
++
++
++def _conditional_copy(qc, bits, bodies, qubits):
++    """A copy of dcsynth.assembly.schedule._conditional: bodies[v] runs when `bits` read v."""
++
++    def with_bits(body):
++        out = QuantumCircuit(len(qubits))
++        out.add_bits(list(bits))
++        out.compose(body, qubits=list(range(len(qubits))), inplace=True)
++        return out
++
++    if len(bits) == 1:
++        qc.if_else((bits[0], False), with_bits(bodies[0]), with_bits(bodies[1]), qubits, list(bits))
++        return
++    half = len(bodies) // 2
++    outer = []
++    for m in (0, 1):
++        body = QuantumCircuit(len(qubits))
++        body.add_bits(list(bits))
++        _conditional_copy(body, list(bits[1:]), bodies[m * half:(m + 1) * half], list(range(len(qubits))))
++        outer.append(body)
++    qc.if_else((bits[0], False), outer[0], outer[1], qubits, list(bits))
++
++
++CONDITIONAL = _load_dcsynth_conditional() or _conditional_copy
++USING_REAL_DCSYNTH = CONDITIONAL is not _conditional_copy
++
++
++# ----------------------------------------------------------------------------- reference simulator
++def _tasks(circ, qmap, cmap):
++    """Flatten a Qiskit circuit to ('u'|'cx'|'measure'|'reset'|'if', ...) tasks."""
++    from qiskit.circuit import IfElseOp
++    from qiskit.quantum_info import Operator
++
++    out = []
++    for inst in circ.data:
++        op = inst.operation
++        qs = [qmap[b] for b in inst.qubits]
++        if op.name == "barrier":
++            continue
++        if op.name == "measure":
++            out.append(("measure", qs[0], cmap[inst.clbits[0]]))
++        elif op.name == "reset":
++            out.append(("reset", qs[0]))
++        elif isinstance(op, IfElseOp):
++            blocks = []
++            for blk in op.blocks:
++                bq = {b: qmap[o] for b, o in zip(blk.qubits, inst.qubits)}
++                bc = {b: cmap[o] for b, o in zip(blk.clbits, inst.clbits)}
++                blocks.append(_tasks(blk, {**qmap, **bq}, {**cmap, **bc}))
++            cond_t, cond_v = op.condition
++            bits = list(cond_t) if hasattr(cond_t, "__iter__") else [cond_t]
++            idx = [cmap[b] if b in cmap else None for b in bits]
++            if any(i is None for i in idx):  # a body-local bit: resolve through the blocks' maps
++                idx = [({**cmap, **bc}).get(b) for b in bits]
++            if hasattr(cond_t, "__iter__"):
++                want = [(int(cond_v) >> k) & 1 for k in range(len(bits))]
++            else:
++                want = [int(bool(cond_v))]
++            out.append(("if", list(zip(idx, want)), blocks[0], blocks[1] if len(blocks) > 1 else []))
++        elif op.name == "cx":
++            out.append(("cx", qs[0], qs[1]))
++        else:
++            out.append(("u", qs[0], Operator(op).data))
++    return out
++
++
++def run_qiskit(qc) -> dict:
++    """Exact joint distribution of all measure/reset outcomes, keyed like validate_dynamic's."""
++    qmap = {b: i for i, b in enumerate(qc.qubits)}
++    cmap = {b: i for i, b in enumerate(qc.clbits)}
++    dist: dict = defaultdict(float)
++
++    def rec(tasks, st, prob, clbits, events, occ):
++        while tasks:
++            t, tasks = tasks[0], tasks[1:]
++            kind = t[0]
++            if kind == "u":
++                st = st.copy()
++                st.apply1(t[2], t[1])
++            elif kind == "cx":
++                st = st.copy()
++                st.apply_cx(t[1], t[2])
++            elif kind == "if":
++                taken = all(clbits.get(i, 0) == w for i, w in t[1])
++                tasks = (t[2] if taken else t[3]) + tasks
++            else:  # measure / reset
++                q = t[1]
++                for bit, p, post in st.measure_pauli({q: "Z"}):
++                    ev = dict(events)
++                    ev[(q, occ.get(q, 0))] = bit
++                    oc = dict(occ)
++                    oc[q] = occ.get(q, 0) + 1
++                    cb = dict(clbits)
++                    if kind == "measure":
++                        cb[t[2]] = bit
++                    elif bit == 1:
++                        post.apply1(vd.G1["x"], q)
++                    rec(tasks, post, prob * p, cb, ev, oc)
++                return
++        dist[tuple(sorted(events.items()))] += prob
++
++    rec(_tasks(qc, qmap, cmap), vd.State(qc.num_qubits), 1.0, {}, {}, {})
++    return dist
++
++
++def run_lowered(text: str, tmp_path: Path, name: str):
++    path = tmp_path / f"{name}.cliffordt.qasm"
++    path.write_text(text)
++    n, ops = vd.parse_qasm(str(path))
++    return path, vd.run_reference(n, ops)
++
++
++# ----------------------------------------------------------------------------- circuits
++def finish(qc: QuantumCircuit) -> QuantumCircuit:
++    """Measure every qubit explicitly so both simulators key the same outcomes."""
++    tail = ClassicalRegister(qc.num_qubits, "fin")
++    qc.add_register(tail)
++    for q in range(qc.num_qubits):
++        qc.measure(q, tail[q])
++    return qc
++
++
++def ancilla_block(qc, data: list[int], anc: int, bits_reg, gates) -> None:
++    """compute onto the ancilla, measure it, reset it: the shape of one dynamic block."""
++    for kind, *a in gates:
++        getattr(qc, kind)(*a)
++    qc.measure(anc, bits_reg)
++    qc.reset(anc)
++
++
++def perqubit_corrections(qc, bits, per_qubit_unitaries: dict[int, list[np.ndarray]]) -> None:
++    """dcsynth's 'perqubit' layout: one `_conditional` per dependent data qubit."""
++    for q, us in per_qubit_unitaries.items():
++        bodies = []
++        for u in us:
++            body = QuantumCircuit(1)
++            body.append(UnitaryGate(u), [0])
++            bodies.append(body)
++        CONDITIONAL(qc, list(bits), bodies, [q])
++
++
++def circ_pauli_corrections() -> QuantumCircuit:
++    """Corrections that differ by a Pauli: must lower to frame updates, no conditional T."""
++    qc = QuantumCircuit(3)
++    c = ClassicalRegister(1, "c0")
++    qc.add_register(c)
++    qc.h(0), qc.t(0), qc.cx(0, 2), qc.h(2), qc.t(2), qc.cx(2, 1)
++    qc.measure(2, c[0]), qc.reset(2)
++    qc.t(1), qc.h(1)
++    perqubit_corrections(
++        qc, [c[0]],
++        {0: [np.eye(2), vd.G1["z"]], 1: [vd.G1["x"] @ vd.G1["h"], vd.G1["h"]]},
++    )
++    qc.t(0)
++    return finish(qc)
++
++
++def circ_clifford_corrections() -> QuantumCircuit:
++    """Figure 1 of the paper: H and S conditioned on mid-circuit outcomes (non-Pauli Cliffords)."""
++    qc = QuantumCircuit(3)  # data 0, 1; ancilla 2
++    m0, m1 = ClassicalRegister(1, "m0"), ClassicalRegister(1, "m1")
++    qc.add_register(m0), qc.add_register(m1)
++    qc.h(0), qc.t(0), qc.cx(0, 1), qc.cx(0, 2), qc.t(1), qc.cx(1, 2), qc.s(2)
++    qc.measure(2, m0[0]), qc.reset(2)
++    with qc.if_test((m0[0], 1)):
++        qc.h(0)
++    qc.h(2), qc.cx(1, 2)
++    qc.measure(2, m1[0]), qc.reset(2)
++    with qc.if_test((m1[0], 1)):
++        qc.x(1)
++        qc.s(0)
++    qc.t(1)
++    return finish(qc)
++
++
++def circ_generic_corrections() -> QuantumCircuit:
++    """Two bits (nested if_else), one correction that is genuinely non-Clifford relative to the rest.
++
++    U_a = base, Z.base, S.base, base.Z: the first three differ from `base` by I, Z, S (free or
++    Clifford), but base.Z.base^dagger is a pi-rotation about a generic axis, so one conditional
++    T-type rotation cannot be avoided.
++    """
++    qc = QuantumCircuit(3)
++    c = ClassicalRegister(2, "c")
++    qc.add_register(c)
++    qc.h(0), qc.cx(0, 2), qc.t(0), qc.cx(2, 1)
++    qc.measure(2, c[0]), qc.reset(2)
++    qc.h(2), qc.t(2), qc.cx(1, 2), qc.cx(0, 2)
++    qc.measure(2, c[1]), qc.reset(2)
++    base = random_unitary(2, seed=3).data
++    perqubit_corrections(
++        qc, [c[0], c[1]],
++        {0: [base, vd.G1["z"] @ base, vd.G1["s"] @ base, base @ vd.G1["z"]]},
++    )
++    qc.cx(0, 1)
++    return finish(qc)
++
++
++def circ_correction_after_block() -> QuantumCircuit:
++    """What dcsynth's corrections look like: U_a = P_a.U, a Pauli (or Clifford) *after* a generic U.
++
++    Every difference U_a U_ref^dagger is then that Pauli/Clifford, so no conditional T is needed
++    however non-Clifford U is.
++    """
++    qc = QuantumCircuit(4)  # data 0..2, ancilla 3
++    c = ClassicalRegister(2, "c")
++    qc.add_register(c)
++    qc.h(0), qc.h(1), qc.t(0), qc.cx(0, 3), qc.cx(1, 3), qc.t(3), qc.cx(2, 3)
++    qc.measure(3, c[0]), qc.reset(3)
++    qc.h(3), qc.cx(0, 3), qc.t(3), qc.cx(2, 3), qc.h(3)
++    qc.measure(3, c[1]), qc.reset(3)
++    u0 = random_unitary(2, seed=11).data
++    u1 = random_unitary(2, seed=12).data
++    z, x, s = vd.G1["z"], vd.G1["x"], vd.G1["s"]
++    perqubit_corrections(qc, [c[0], c[1]], {
++        0: [u0, z @ u0, x @ u0, z @ x @ u0],       # Pauli-after: free frame updates
++        1: [u1, s @ u1, z @ u1, s @ z @ u1],       # Clifford-after: a few physical gates
++    })
++    qc.cx(0, 1), qc.cx(1, 2)
++    return finish(qc)
++
++
++def circ_shared_layout() -> QuantumCircuit:
++    """dcsynth's SHARED layout: one if_else whose leaves touch several data qubits."""
++    qc = QuantumCircuit(3)
++    c = ClassicalRegister(1, "c")
++    qc.add_register(c)
++    qc.h(0), qc.h(1), qc.cx(0, 2), qc.cx(1, 2), qc.t(2)
++    qc.measure(2, c[0]), qc.reset(2)
++    b0, b1 = QuantumCircuit(2), QuantumCircuit(2)
++    b0.append(UnitaryGate(vd.G1["h"]), [0]), b0.append(UnitaryGate(vd.G1["z"]), [1])
++    b1.append(UnitaryGate(vd.G1["h"] @ vd.G1["s"]), [0]), b1.append(UnitaryGate(vd.G1["z"]), [1])
++    CONDITIONAL(qc, [c[0]], [b0, b1], [0, 1])
++    qc.t(0), qc.t(1)
++    return finish(qc)
++
++
++CIRCUITS = {
++    "pauli": circ_pauli_corrections,
++    "fig1_cliffords": circ_clifford_corrections,
++    "generic": circ_generic_corrections,
++    "after_block": circ_correction_after_block,
++    "shared": circ_shared_layout,
++}
++
++
++# ----------------------------------------------------------------------------- tests
++def test_clifford_table_has_24_and_snaps():
++    assert len(lowering.CLIFFORDS) == 24
++    for key, word in lowering.CLIFFORDS.items():
++        u = lowering.seq_matrix(word)
++        assert lowering.phase_distance(u, lowering.seq_matrix(lowering.nearest_clifford(u, 1e-9))) < 1e-9
++
++
++def test_synthesis_is_exact_for_cliffords_and_close_otherwise():
++    for name in ("x", "y", "z", "h", "s", "sdg"):
++        seq = lowering.synth_1q(lowering.G[name], EPS)
++        assert lowering.phase_distance(lowering.seq_matrix(seq), lowering.G[name]) < 1e-12
++        assert lowering.t_count(seq) == 0
++    assert lowering.synth_1q(np.eye(2), EPS) == []
++    assert lowering.synth_1q(lowering.G["z"], EPS) == ["z"]
++    for seed in range(4):
++        u = random_unitary(2, seed=seed).data
++        seq = lowering.synth_1q(u, EPS)
++        assert lowering.phase_distance(lowering.seq_matrix(seq), u) < 8 * EPS, seed
++        assert lowering.t_count(seq) > 0
++
++
++def _lower_and_compare(name: str, tmp_path: Path) -> Path:
++    qc = CIRCUITS[name]()
++    text, stats = lowering.lower(qc, epsilon=EPS)
++    path, got = run_lowered(text, tmp_path, name)
++    want = run_qiskit(qc)
++    tv = vd.tv_distance(want, got)
++    assert tv < 5e-5, f"{name}: lowered QASM differs from the Qiskit circuit (TV {tv:.2e})"
++    return path, stats, text
++
++
++def test_lowering_matches_the_qiskit_circuit(tmp_path: Path):
++    for name in CIRCUITS:
++        _lower_and_compare(name, tmp_path)
++
++
++def test_pauli_and_clifford_corrections_cost_no_conditional_t(tmp_path: Path):
++    for name in ("pauli", "fig1_cliffords", "shared", "after_block"):
++        _, stats, text = _lower_and_compare(name, tmp_path)
++        assert stats["conditional_t"] == 0, f"{name}: a conditional T was emitted\n{text}"
++    _, stats, text = _lower_and_compare("pauli", tmp_path)
++    cond = [l for l in text.splitlines() if l.startswith("if(")]
++    assert cond and all(l.split()[-2] in ("x", "y", "z") for l in cond), cond
++
++
++def test_reference_is_chosen_to_make_the_difference_cheap(tmp_path: Path):
++    # `generic` has one correction (base.Z) that is a generic rotation away from `base`: the
++    # reference must be `base` so that exactly that one assignment pays for T gates, not three.
++    _, stats, text = _lower_and_compare("generic", tmp_path)
++    cond = [l for l in text.splitlines() if l.startswith("if(")]
++    patterns = {l[: l.index(")") + 1] for l in cond if l.split()[-2] in ("t", "tdg", "h")}
++    assert len(patterns) == 1, f"T-type gates under {len(patterns)} different conditions: {patterns}"
++    assert stats["conditional_t"] > 0
++
++
++def test_through_transpile_and_the_oracle(tmp_path: Path):
++    assert TRANSPILE.exists(), f"build it first: cargo build --release --bin transpile ({TRANSPILE})"
++    for name in CIRCUITS:
++        path, _, _ = _lower_and_compare(name, tmp_path)
++        ok = vd.check(path, TRANSPILE, ["frame", "flush", "init"], [0, 1, 2], [False, True],
++                      verbose=False)
++        assert ok, f"{name}: transpile output no longer matches the circuit"
++
++
++def test_unsupported_constructs_raise():
++    qc = QuantumCircuit(2)
++    c = ClassicalRegister(1, "c")
++    qc.add_register(c)
++    qc.h(0), qc.measure(0, c[0])
++    with qc.if_test((c[0], 1)):
++        qc.cx(0, 1)
++    try:
++        lowering.lower(qc)
++    except NotImplementedError as e:
++        assert "single-qubit" in str(e)
++    else:
++        raise AssertionError("a conditional cx must be rejected")
++    qc = QuantumCircuit(2)
++    qc.add_register(c)
++    qc.h(0), qc.measure(0, c[0])
++    with qc.if_test((c[0], 1)):
++        qc.measure(1, c[0])
++    try:
++        lowering.lower(qc)
++    except NotImplementedError:
++        pass
++    else:
++        raise AssertionError("a measurement inside an if_else must be rejected")
++
++
++def main() -> int:
++    import tempfile
++
++    tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
++    failed = 0
++    print(f"if_else built with {'the real dcsynth _conditional' if USING_REAL_DCSYNTH else 'a copy of it'}")
++    for name, fn in tests:
++        with tempfile.TemporaryDirectory() as d:
++            try:
++                fn(Path(d)) if fn.__code__.co_argcount else fn()
++                print(f"  ok   {name}")
++            except Exception as e:  # noqa: BLE001
++                failed += 1
++                print(f"  FAIL {name}: {type(e).__name__}: {e}")
++    print("ALL PASS" if not failed else f"{failed} FAILED")
++    return 1 if failed else 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/data_processing/validate_dynamic.py b/data_processing/validate_dynamic.py
+new file mode 100644
+index 0000000..dc75e3a
+--- /dev/null
++++ b/data_processing/validate_dynamic.py
+@@ -0,0 +1,495 @@
++#!/usr/bin/env python3
++"""Check that `transpile` preserves the semantics of a dynamic Clifford+T circuit.
++
++A dynamic circuit has mid-circuit measurement, `reset`, and classically conditioned Paulis.
++`transpile` turns it into a `.trans` file (what the scheduler consumes) plus a classical sidecar
++`<out>.dyn.json` (what an executor needs). This script is the oracle for that translation. It
++simulates both sides exactly (statevector, branching on every measurement) and compares the joint
++distribution of *all* measurement outcomes.
++
++  reference : the input `.cliffordt.qasm`, run gate by gate.
++  candidate : the `.trans` lines run in file order, with the sidecar's classical bookkeeping:
++
++      T line   rotation exp(-i*s*pi/8*P), s = (+1 or -1 from the line's sign) * (-1)^(XOR of the
++               true outcomes in frame_deps)
++      Cliff    the physical Clifford named on the line
++      M line   measure the unsigned Pauli P, physical outcome p;
++               true outcome = p XOR [sign is '-'] XOR (XOR of true outcomes in frame_deps)
++      R line   physical re-initialisation of one patch to |0> (only `--reset_mode init`)
++
++  Pauli corrections (reset's X fix, `if(c==1) x ...`, even under `c0==1 && c1==0`) are never
++  applied physically; they live in the frame, a Pauli conditioned on several bits using a
++  `derived` AND outcome. If the frame logic is wrong the two distributions differ.
++
++  Any other conditional gate (`if(c==1) h|s|t ...`) is physical. Its `.trans` lines carry a
++  `cond` in the sidecar and run only if every `[outcome, value]` holds; a `fix` event just before
++  it physically applies the Pauli the frame owed that qubit. The `@line,..` suffix of such a line
++  must name exactly the M lines of the outcomes in its `needs`.
++
++Usage:
++  validate_dynamic.py circuit.cliffordt.qasm [--transpile PATH] [--modes frame,flush,init]
++                      [--widths 0,1,2] [--defer-trailing]
++  validate_dynamic.py --random N [--seed S] [--qubits 3] [--gates 14]   # fuzz
++
++Exit status 0 iff every comparison matches (total variation distance < 1e-9).
++Only numpy is required. Circuits are limited to ~10 qubits and ~10 measurements.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import os
++import random
++import re
++import subprocess
++import sys
++import tempfile
++from collections import defaultdict
++from pathlib import Path
++
++import numpy as np
++
++# The simulators recurse once per gate (and branch at every measurement). Circuits that contain
++# synthesised rotations (dcsynth_to_cliffordt.py) have thousands of gates.
++sys.setrecursionlimit(max(sys.getrecursionlimit(), 100_000))
++
++ROOT = Path(__file__).resolve().parent.parent
++DEFAULT_TRANSPILE = ROOT / "target" / "release" / "transpile"
++
++# --------------------------------------------------------------------------- gates
++SQ2 = 1 / math.sqrt(2)
++G1 = {
++    "h": SQ2 * np.array([[1, 1], [1, -1]], dtype=complex),
++    "x": np.array([[0, 1], [1, 0]], dtype=complex),
++    "y": np.array([[0, -1j], [1j, 0]], dtype=complex),
++    "z": np.array([[1, 0], [0, -1]], dtype=complex),
++    "s": np.array([[1, 0], [0, 1j]], dtype=complex),
++    "sdg": np.array([[1, 0], [0, -1j]], dtype=complex),
++    "t": np.array([[1, 0], [0, np.exp(1j * math.pi / 4)]], dtype=complex),
++    "tdg": np.array([[1, 0], [0, np.exp(-1j * math.pi / 4)]], dtype=complex),
++    "sx": 0.5 * np.array([[1 + 1j, 1 - 1j], [1 - 1j, 1 + 1j]], dtype=complex),
++    "sxdg": 0.5 * np.array([[1 - 1j, 1 + 1j], [1 + 1j, 1 - 1j]], dtype=complex),
++}
++PAULI = {"X": G1["x"], "Y": G1["y"], "Z": G1["z"]}
++TRANS_1Q = {"S": "s", "Sdg": "sdg", "SX": "sx", "SXdg": "sxdg"}
++
++
++class State:
++    """n-qubit statevector as a rank-n tensor; axis q is qubit q."""
++
++    def __init__(self, n: int, psi: np.ndarray | None = None):
++        self.n = n
++        if psi is None:
++            psi = np.zeros((2,) * n, dtype=complex)
++            psi[(0,) * n] = 1.0
++        self.psi = psi
++
++    def copy(self) -> "State":
++        return State(self.n, self.psi.copy())
++
++    def apply1(self, u: np.ndarray, q: int) -> None:
++        self.psi = np.moveaxis(np.tensordot(u, self.psi, axes=([1], [q])), 0, q)
++
++    def apply_cx(self, c: int, t: int) -> None:
++        idx = [slice(None)] * self.n
++        idx[c] = 1
++        sub = self.psi[tuple(idx)]
++        # after fixing axis c, the target axis shifts down by one when t > c
++        ax = t - 1 if t > c else t
++        self.psi[tuple(idx)] = np.flip(sub, axis=ax)
++
++    def apply_cz(self, a: int, b: int) -> None:
++        idx = [slice(None)] * self.n
++        idx[a] = 1
++        idx[b] = 1
++        self.psi[tuple(idx)] *= -1
++
++    def apply_pauli_string(self, ops: dict[int, str]) -> "State":
++        out = self.copy()
++        for q, p in ops.items():
++            out.apply1(PAULI[p], q)
++        return out
++
++    def rotate(self, ops: dict[int, str], theta: float) -> None:
++        """psi <- exp(-i theta P) psi = cos(theta) psi - i sin(theta) P psi."""
++        p_psi = self.apply_pauli_string(ops).psi
++        self.psi = math.cos(theta) * self.psi - 1j * math.sin(theta) * p_psi
++
++    def measure_pauli(self, ops: dict[int, str]):
++        """Yield (bit, probability, post-state) for the +1 (bit 0) / -1 (bit 1) outcomes of P."""
++        p_psi = self.apply_pauli_string(ops).psi
++        for bit, sgn in ((0, 1.0), (1, -1.0)):
++            post = 0.5 * (self.psi + sgn * p_psi)
++            prob = float(np.vdot(post, post).real)
++            if prob > 1e-12:
++                yield bit, prob, State(self.n, post / math.sqrt(prob))
++
++
++def _merge(dist: dict, key: tuple, prob: float) -> None:
++    dist[key] += prob
++
++
++# --------------------------------------------------------------------------- reference
++def parse_qasm(path: str):
++    """Parse the dynamic Clifford+T QASM subset into a list of op tuples."""
++    n = 0
++    cregs: dict[str, tuple[int, int]] = {}
++    nclbits = 0
++    ops = []
++    for raw in Path(path).read_text().splitlines():
++        line = raw.split("//")[0].strip()
++        if not line or line.startswith(("OPENQASM", "include", "barrier")):
++            continue
++        if line.startswith("qreg"):
++            n = int(re.search(r"\[(\d+)\]", line).group(1))
++        elif line.startswith("creg"):
++            m = re.match(r"creg\s+(\w+)\[(\d+)\]", line)
++            cregs[m.group(1)] = (nclbits, int(m.group(2)))
++            nclbits += int(m.group(2))
++        elif line.startswith("measure"):
++            m = re.match(r"measure\s+q\[(\d+)\](?:\s*->\s*(\w+)(?:\[(\d+)\])?)?", line)
++            q = int(m.group(1))
++            cb = None
++            if m.group(2):
++                base, size = cregs[m.group(2)]
++                cb = base + (int(m.group(3)) if m.group(3) is not None else 0)
++            ops.append(("measure", q, cb))
++        elif line.startswith("reset"):
++            ops.append(("reset", int(re.search(r"\[(\d+)\]", line).group(1))))
++        elif line.startswith("if"):
++            m = re.match(r"if\s*\(([^)]*)\)\s*(\w+)\s+q\[(\d+)\]", line)
++            terms = []
++            for term in m.group(1).split("&&"):
++                reg, val = (x.strip() for x in term.split("=="))
++                base, size = cregs[reg]
++                assert size == 1, "validator supports 1-bit condition registers only"
++                terms.append((base, int(val)))
++            ops.append(("cond", terms, m.group(2), int(m.group(3))))
++        else:
++            m = re.match(r"(\w+)\s+(.*);", line)
++            name, args = m.group(1), re.findall(r"q\[(\d+)\]", m.group(2))
++            ops.append((name, *map(int, args)))
++    return n, ops
++
++
++def run_reference(n: int, ops) -> dict[tuple, float]:
++    """Exact joint distribution of all measurement outcomes, keyed by (qubit, occurrence)."""
++    ops = list(ops)
++    # Mirror `transpile`: every qubit whose last op is not a measure/reset is measured at the end.
++    ended = [False] * n
++    written: set[int] = set()
++    for op in ops:
++        if op[0] in ("measure", "reset"):
++            ended[op[1]] = True
++            if op[0] == "measure" and op[2] is not None:
++                written.add(op[2])
++        elif op[0] == "cond":
++            _, terms, g, q = op
++            if len(terms) == 1 and g in ("x", "y", "z"):
++                continue  # a single-bit conditional Pauli is a pure frame update
++            # Settle the terms like `resolve_static_conditions`: a bit nothing has written reads
++            # as 0, so a term demanding 1 from it never holds and one demanding 0 always does.
++            keep: dict[int, int] = {}
++            never = False
++            for cb, v in terms:
++                if cb not in written:
++                    never |= bool(v)
++                elif cb in keep:
++                    never |= keep[cb] != v
++                else:
++                    keep[cb] = v
++            if never:
++                continue  # the gate is dropped
++            if keep and g in ("x", "y", "z"):
++                continue  # still a frame update (on a derived AND outcome)
++            ended[q] = False  # a physical gate: unconditional, or conditional non-Pauli
++        else:
++            for q in op[1:]:
++                ended[q] = False
++    for q in range(n):
++        if not ended[q]:
++            ops.append(("measure", q, None))
++
++    dist: dict[tuple, float] = defaultdict(float)
++
++    def rec(i, st, prob, clbits, events, occ):
++        if i == len(ops):
++            _merge(dist, tuple(sorted(events.items())), prob)
++            return
++        op = ops[i]
++        kind = op[0]
++        if kind in ("measure", "reset"):
++            q = op[1]
++            for bit, p, post in st.measure_pauli({q: "Z"}):
++                ev = dict(events)
++                k = (q, occ.get(q, 0))
++                ev[k] = bit
++                oc = dict(occ)
++                oc[q] = occ.get(q, 0) + 1
++                cb = dict(clbits)
++                nxt = post
++                if kind == "measure" and op[2] is not None:
++                    cb[op[2]] = bit
++                if kind == "reset" and bit == 1:
++                    nxt.apply1(G1["x"], q)
++                rec(i + 1, nxt, prob * p, cb, ev, oc)
++            return
++        if kind == "cond":
++            _, terms, g, q = op
++            if all(clbits.get(cb, 0) == val for cb, val in terms):
++                st = st.copy()
++                st.apply1(G1[g], q)
++            rec(i + 1, st, prob, clbits, events, occ)
++            return
++        st = st.copy()
++        if kind == "cx":
++            st.apply_cx(op[1], op[2])
++        elif kind == "cz":
++            st.apply_cz(op[1], op[2])
++        elif kind == "swap":
++            a, b = op[1], op[2]
++            st.apply_cx(a, b), st.apply_cx(b, a), st.apply_cx(a, b)
++        else:
++            st.apply1(G1[kind], op[1])
++        rec(i + 1, st, prob, clbits, events, occ)
++
++    rec(0, State(n), 1.0, {}, {}, {})
++    return dist
++
++
++# --------------------------------------------------------------------------- candidate
++LINE = re.compile(r"^([+-])([_XYZ]+)<(\w+)>(?:@([\d,]+))?$")
++
++
++def run_trans(n: int, trans_path: str, sidecar: dict | None) -> dict[tuple, float]:
++    lines = [l.strip() for l in Path(trans_path).read_text().splitlines() if l.strip()]
++    recs = sidecar["products"] if sidecar else [{} for _ in lines]
++    assert len(recs) == len(lines), "sidecar and .trans disagree on length"
++    derived = {d["id"]: d["terms"] for d in (sidecar or {}).get("derived", [])}
++    events_at: dict[int, list] = defaultdict(list)
++    for e in (sidecar or {}).get("events", []):
++        events_at[e["before"]].append(e)
++
++    # The `@line,..` suffix must name exactly the M lines of the outcomes a line `needs`.
++    line_of_meas = {r["meas_id"]: k for k, r in enumerate(recs) if r.get("meas_id") is not None}
++    for k, text in enumerate(lines):
++        suffix = LINE.match(text).group(4)
++        got = sorted(int(x) for x in suffix.split(",")) if suffix else []
++        want = sorted({line_of_meas[m] for m in recs[k].get("needs", [])})
++        assert got == want, f"line {k} `{text}`: @-suffix {got} but sidecar needs lines {want}"
++        assert all(a < k for a in got), f"line {k}: classical dependency on a later line"
++
++    dist: dict[tuple, float] = defaultdict(float)
++
++    def outcome(true_out, d):
++        """True outcome d, or the AND of its terms if d is a derived outcome."""
++        if d in derived:
++            return int(all(true_out[m] == v for m, v in derived[d]))
++        return true_out[d]
++
++    def fix_events(i, st, true_out):
++        for e in events_at.get(i, []):
++            assert e["op"] == "fix", e
++            x, z = int(e["x_const"]), int(e["z_const"])
++            for d in e["x_deps"]:
++                x ^= outcome(true_out, d)
++            for d in e["z_deps"]:
++                z ^= outcome(true_out, d)
++            if x or z:
++                st = st.copy()
++                if x:
++                    st.apply1(G1["x"], e["qubit"])
++                if z:
++                    st.apply1(G1["z"], e["qubit"])
++        return st
++
++    def rec(i, st, prob, true_out, events, occ):
++        st = fix_events(i, st, true_out)
++        if i == len(lines):
++            _merge(dist, tuple(sorted(events.items())), prob)
++            return
++        m = LINE.match(lines[i])
++        sign, body, label = m.group(1), m.group(2), m.group(3)
++        r = recs[i]
++        ops = {q: c for q, c in enumerate(body) if c != "_"}
++        if r.get("cond") and not all(true_out[mid] == v for mid, v in r["cond"]):
++            rec(i + 1, st, prob, true_out, events, occ)  # conditional line whose condition fails
++            return
++        flip = 0
++        for d in r.get("frame_deps", []):
++            flip ^= outcome(true_out, d)
++        if label == "T":
++            s = (1 if sign == "+" else -1) * (-1 if flip else 1)
++            st = st.copy()
++            st.rotate(ops, s * math.pi / 8)
++            rec(i + 1, st, prob, true_out, events, occ)
++        elif label == "M":
++            mid, q = r["meas_id"], r["logical_qubit"]
++            for p_bit, pr, post in st.measure_pauli(ops):
++                t = p_bit ^ (1 if sign == "-" else 0) ^ flip
++                to = dict(true_out)
++                to[mid] = t
++                ev = dict(events)
++                k = (q, occ.get(q, 0))
++                ev[k] = t
++                oc = dict(occ)
++                oc[q] = occ.get(q, 0) + 1
++                rec(i + 1, post, prob * pr, to, ev, oc)
++        elif label == "R":
++            (q,) = ops
++            st = st.copy()
++            # The qubit was just measured in Z and is unentangled, so this is a deterministic
++            # reset: flip it if it is in |1>.
++            for bit, _, post in st.measure_pauli({q: "Z"}):
++                if bit == 1:
++                    post.apply1(G1["x"], q)
++                st = post
++            rec(i + 1, st, prob, true_out, events, occ)
++        elif label == "CX":
++            (c,) = [q for q, ch in ops.items() if ch == "Z"]
++            (t,) = [q for q, ch in ops.items() if ch == "X"]
++            st = st.copy()
++            st.apply_cx(c, t)
++            rec(i + 1, st, prob, true_out, events, occ)
++        elif label in TRANS_1Q:
++            (q,) = ops
++            st = st.copy()
++            st.apply1(G1[TRANS_1Q[label]], q)
++            rec(i + 1, st, prob, true_out, events, occ)
++        else:
++            raise ValueError(f"unhandled .trans label {label!r}: {lines[i]}")
++
++    rec(0, State(n), 1.0, {}, {}, {})
++    return dist
++
++
++def tv_distance(a: dict, b: dict) -> float:
++    keys = set(a) | set(b)
++    return 0.5 * sum(abs(a.get(k, 0.0) - b.get(k, 0.0)) for k in keys)
++
++
++# --------------------------------------------------------------------------- driver
++def transpile_once(binary: Path, qasm: Path, out: Path, mode: str, width: int, defer: bool,
++                   auto: bool) -> subprocess.CompletedProcess:
++    cmd = [str(binary), "-i", str(qasm), "-o", str(out), "--reset_mode", mode, "--sidecar"]
++    if auto:
++        cmd.append("--auto")
++    else:
++        cmd += ["-m", str(width)]
++        if defer:
++            cmd.append("--defer_trailing")
++    return subprocess.run(cmd, capture_output=True, text=True)
++
++
++def check(qasm: Path, binary: Path, modes, widths, defer_opts, tol=1e-9, verbose=True) -> bool:
++    n, ops = parse_qasm(str(qasm))
++    ref = run_reference(n, ops)
++    ok = True
++    with tempfile.TemporaryDirectory() as td:
++        configs = [(m, w, d, False) for m in modes for w in widths for d in defer_opts]
++        configs += [(m, 0, True, True) for m in modes]  # --auto
++        for mode, width, defer, auto in configs:
++            out = Path(td) / "c.trans"
++            res = transpile_once(binary, qasm, out, mode, width, defer, auto)
++            tag = f"mode={mode} width={'auto' if auto else width} defer={defer or auto}"
++            if res.returncode != 0:
++                print(f"  FAIL {tag}: transpile exited {res.returncode}\n{res.stderr[-400:]}")
++                ok = False
++                continue
++            side = Path(str(out) + ".dyn.json")
++            sidecar = json.loads(side.read_text()) if side.exists() else None
++            cand = run_trans(n, str(out), sidecar)
++            d = tv_distance(ref, cand)
++            if d > tol:
++                ok = False
++                print(f"  FAIL {tag}: TV distance {d:.3e}")
++            elif verbose:
++                print(f"  ok   {tag}: TV distance {d:.1e} over {len(ref)} outcome strings")
++    return ok
++
++
++# --------------------------------------------------------------------------- fuzzing
++def random_circuit(rng: random.Random, n: int, n_gates: int) -> str:
++    """Random dynamic Clifford+T circuit, one 1-bit creg per measurement (as dcsynth emits)."""
++    body: list[str] = []
++    bits: list[str] = []
++    unwritten = "u0"
++    body.append(f"creg {unwritten}[1];")  # declared, never measured into: reads as 0
++    for _ in range(n_gates):
++        r = rng.random()
++        q = rng.randrange(n)
++        if r < 0.40:
++            body.append(f"{rng.choice(['h', 's', 'sdg', 't', 'tdg', 'sx'])} q[{q}];")
++        elif r < 0.55 and n > 1:
++            a, b = rng.sample(range(n), 2)
++            body.append(f"cx q[{a}], q[{b}];")
++        elif r < 0.70 and len(bits) < 6:
++            name = f"m{len(bits)}"
++            bits.append(name)
++            body.append(f"creg {name}[1];")
++            body.append(f"measure q[{q}] -> {name}[0];")
++        elif r < 0.80:
++            body.append(f"reset q[{q}];")
++        elif bits:
++            # one or two terms; a Pauli, a Clifford, or a T; sometimes on a bit nothing wrote
++            pool = bits + ([unwritten] if rng.random() < 0.15 else [])
++            terms = [f"{b}=={rng.randrange(2)}"
++                     for b in rng.sample(pool, min(len(pool), rng.choice([1, 1, 2])))]
++            g = rng.choice(["x", "y", "z", "h", "s", "sdg", "sx", "sxdg", "t", "tdg"])
++            body.append(f"if({' && '.join(terms)}) {g} q[{q}];")
++        else:
++            body.append(f"t q[{q}];")
++    # creg declarations must precede use; hoist them.
++    decls = [l for l in body if l.startswith("creg")]
++    rest = [l for l in body if not l.startswith("creg")]
++    # `if(...) y q[i];` is spelled `y`, and Paulis are spelled in lower case in QASM
++    head = ["OPENQASM 2.0;", 'include "qelib1.inc";', f"qreg q[{n}];"]
++    return "\n".join(head + decls + rest) + "\n"
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
++    ap.add_argument("qasm", nargs="?", help="a .cliffordt.qasm file")
++    ap.add_argument("--transpile", default=str(DEFAULT_TRANSPILE), help="path to the transpile binary")
++    ap.add_argument("--modes", default="frame,flush,init")
++    ap.add_argument("--widths", default="0,1,2")
++    ap.add_argument("--defer-trailing", action="store_true", help="only test with --defer_trailing")
++    ap.add_argument("--random", type=int, default=0, help="fuzz with N random circuits")
++    ap.add_argument("--seed", type=int, default=1)
++    ap.add_argument("--qubits", type=int, default=3)
++    ap.add_argument("--gates", type=int, default=14)
++    a = ap.parse_args()
++
++    binary = Path(a.transpile)
++    if not binary.exists():
++        print(f"transpile binary not found at {binary}; run `cargo build --release` first")
++        return 2
++    modes = a.modes.split(",")
++    widths = [int(w) for w in a.widths.split(",")]
++    defer_opts = [True] if a.defer_trailing else [False, True]
++
++    if a.random:
++        rng = random.Random(a.seed)
++        bad = 0
++        with tempfile.TemporaryDirectory() as td:
++            for k in range(a.random):
++                p = Path(td) / f"fuzz{k}.cliffordt.qasm"
++                p.write_text(random_circuit(rng, a.qubits, a.gates))
++                if not check(p, binary, modes, widths, defer_opts, verbose=False):
++                    bad += 1
++                    keep = Path(os.getcwd()) / f"validate_dynamic_fail_{a.seed}_{k}.cliffordt.qasm"
++                    keep.write_text(p.read_text())
++                    print(f"circuit {k} FAILED; saved to {keep}")
++        print(f"{a.random - bad}/{a.random} random circuits match across all configurations")
++        return 1 if bad else 0
++
++    if not a.qasm:
++        ap.error("give a .cliffordt.qasm file or --random N")
++    ok = check(Path(a.qasm), binary, modes, widths, defer_opts)
++    print("ALL MATCH" if ok else "MISMATCH")
++    return 0 if ok else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/docs/dynamic-circuits.md b/docs/dynamic-circuits.md
+new file mode 100644
+index 0000000..4f11e6b
+--- /dev/null
++++ b/docs/dynamic-circuits.md
+@@ -0,0 +1,136 @@
++# Dynamic circuits: reset, mid-circuit measurement, feed-forward
++
++PureMagic's original input is a static Clifford+T circuit: every measurement is at the end, and
++Cliffords are commuted there too. A *dynamic* circuit (for example the output of the `dcsynth`
++ancilla-reuse compiler) measures a qubit in the middle, resets it, reuses it, and applies gates
++that depend on the measurement outcomes. This document describes how that is supported.
++
++Nothing here changes how a static circuit is transpiled or scheduled. Without `reset`, `if(...)`
++or a mid-circuit `measure`, the outputs are identical to before (the `--sidecar` file is the only
++new artifact and is not written unless asked for).
++
++## Pipeline
++
++```
++dcsynth circuit (Qiskit)        dcsynth_to_cliffordt.py      transpile                    puremagic
++  measure/reset/if_else   --->   Clifford+T QASM2 dialect --->  .trans + .trans.dyn.json ---> schedule
++  UnitaryGate bodies             (1-bit cregs, if(m3==1) g)    (+ `@id` classical deps)      (--reaction-latency L)
++```
++
++```bash
++cargo build --release --bins
++# in dcsynth's environment, on the circuit it assembled (see "What dcsynth emits"):
++#   from qiskit import qpy; qpy.dump(qc, open("circuit.qpy", "wb"))
++python data_processing/dcsynth_to_cliffordt.py circuit.qpy -o circuit.cliffordt.qasm --epsilon 1e-8
++./target/release/transpile -i circuit.cliffordt.qasm -o circuit.trans --defer_trailing   # --reset_mode frame|flush|init
++./target/release/puremagic -c circuit.trans --reaction-latency 0
++```
++
++## What dcsynth emits, and why not plain QASM
++
++`dcsynth.assembly.schedule.build_and_check` (and `assemble`) return a Qiskit `QuantumCircuit`:
++
++* `qc.measure(ancilla, bit)` followed immediately by `qc.reset(ancilla)` ends every dynamic block;
++* the data qubits' corrections are `if_else((bit, False), body0, body1, ...)` where each body is a
++  single-qubit `UnitaryGate` (default "perqubit" layout), nested one level per extra bit;
++* the blocks themselves (`block*_main.qasm`) are BQSKit output: `cx` and `u3`.
++
++OpenQASM 2 can say `measure`, `reset` and `if(creg==n) gate q[i];`, but not nested blocks, and the
++`UnitaryGate`s are arbitrary 2x2 matrices that have to become Clifford+T anyway. OpenQASM 3 has
++`if (c[0] == 1) { ... }` blocks, but still no Clifford+T synthesis, and `compile_cliffordt`'s loader
++only skips `measure` statements; it has no reset or conditional support. So the bridge is a
++Python lowering (`data_processing/dcsynth_to_cliffordt.py`) that writes a restricted dialect:
++
++* one 1-bit register per classical bit (`creg m3[1];`);
++* `measure q[i] -> m3[0];` and `reset q[i];` as written;
++* a gate that depends on outcomes: `if(m3==1 && m5==0) t q[2];`, one single-qubit gate per line,
++  gate in h, s, sdg, sx, sxdg, x, y, z, t, tdg. (`&&` is an extension; with one term the line is
++  plain OpenQASM 2.)
++
++The lowering applies the cheapest reference unitary unconditionally and conditions only the
++difference. dcsynth's corrections are `P_a . U` (a Pauli or Clifford after a block's unitary), so
++the differences are Paulis, which are free frame updates, instead of conditional T rotations.
++
++## The three ideas in `transpile`
++
++**1. Measurement needs nothing special.** In the Heisenberg picture a measurement of `Z_q` after
++Cliffords `C` is the product `C^dagger Z_q C`, emitted in program order, like a final measurement.
++
++**2. Reset is a measurement plus a classical correction.** After `M_Z -> m` the qubit is `|m>`;
++resetting to `|0>` is `X^m`, a Pauli. Pauli corrections are never executed on the lattice. They
++join a classical *Pauli frame*: per qubit, the XOR of outcomes that owe an `X` and a `Z`. A later
++product `P` is measured as `+-P` depending on whether it anticommutes with the frame, so the
++product's sign becomes `sign XOR (XOR of outcomes)`. The scheduler never reads signs, so none of
++this changes the schedule. A conditional Pauli (`if(m==1) x q[i];`) is the same frame update, and
++a Pauli on several bits uses a derived AND outcome so the frame stays linear.
++
++**3. A conditional non-Pauli gate is physical.** `if(m==1) h q[i];` cannot be a frame update. The
++transpiler flushes pending Cliffords, pays off the qubit's owed Pauli (an `Event::Fix`), and emits
++the gate as ordinary products tagged with their condition and a classical dependency `@id,..` on
++the measurement lines whose outcomes decide the condition. The dependency makes a DAG edge
++even though no qubit is shared.
++
++### Reset modes (`transpile --reset_mode`)
++
++| mode | what the reset becomes | cost |
++|------|------------------------|------|
++| `frame` (default) | `<M>` on the qubit, then a frame update | no extra product |
++| `flush` | like `frame`, but flush pending Cliffords first so the measurement is weight 1 and later products start from a clean frame | extra Cliffords possible |
++| `init` | like `flush`, plus an `<R>` product occupying the patch for one lcycle | models a physical re-initialisation |
++
++`frame` is the faithful model if re-preparing a patch is free or overlaps with other work. `init`
++is the conservative one.
++
++## Files in `.trans`
++
++* A line may end in `@3,5`: ids (0-based line numbers) of earlier products whose *outcome* it
++  needs. `<R>` is a one-qubit re-initialisation. Both are parsed in `pauliproduct.rs` and become
++  edges in `Circuit::gen_deps`.
++* `<output>.dyn.json` (written for any dynamic circuit): everything an executor needs to
++  recover true outcomes: per measurement `meas_id`, `clbit`, `is_reset`, `frame_deps`, derived AND
++  outcomes, `fix` events. With `p` the physical outcome of product `k`:
++  `true_outcome(k) = p XOR sign(k) XOR (XOR of true_outcome(j) for j in frame_deps(k))`.
++
++## Scheduling and "real time"
++
++PureMagic is dynamic because magic-state cultivation times are random: every lcycle MINFIT picks
++among ready products and the pool of ready magic states changes. The dependency graph is static.
++Feed-forward adds two things:
++
++* **Edges.** `@` dependencies are ordinary parents, so nothing starts before the outcome it needs.
++  Pauli/Clifford corrections that stay in the frame add no edges at all.
++* **Reaction latency.** A logical outcome is usable only after its syndrome rounds are decoded.
++  `puremagic --reaction-latency L` delays a product with an `@` edge until `L` lcycles after the
++  product it names completes (default 0 = ideal). Qubit-overlap edges are not delayed; if a child
++  has both kinds on the same parent the whole edge is delayed (conservative). The scheduler loop
++  keeps running while delayed releases are outstanding.
++
++Latency is paid only where a measurement is on the critical path. For dcsynth-style circuits the
++corrections are mostly Paulis, so almost nothing depends on an outcome and the latency is hidden;
++`tests/fixtures/dyn_pingpong.cliffordt.qasm` is the opposite case (three hops, so `L` costs `3L`
++lcycles).
++
++## Verifying
++
++```bash
++cargo test                                                     # unit + integration tests
++python data_processing/validate_dynamic.py circuit.cliffordt.qasm            # one circuit
++python data_processing/validate_dynamic.py --random 150 --seed 1             # fuzz
++python data_processing/test_dcsynth_lowering.py                # converter, end to end
++# optional: DCSYNTH_SRC=/path/to/Artifact/src/dcsynth uses dcsynth's own if_else builder
++```
++
++`validate_dynamic.py` is the oracle: it simulates the input QASM and the `.trans` file plus sidecar
++exactly (statevector, branching at every measurement) and compares the joint distribution of all
++outcomes (total variation < 1e-9) in every reset mode and width.
++
++## Limits
++
++* Conditional CX/CZ, a measurement inside an `if`, and classical expressions are rejected, not
++  dropped. dcsynth's default "perqubit" layout never needs them.
++* Rz synthesis is approximate (`--epsilon`, per rotation); Pauli and Clifford corrections are exact.
++* Several conditions on one `if_else` are completed to all `2^k` assignments (k <= 8).
++* `compile_cliffordt` does not handle dynamic circuits; use the converter, which synthesises
++  gates itself with `pygridsynth`.
++* The model has no notion of the ancilla being a different kind of patch: every qubit, ancilla
++  included, is a logical data patch in the layout.
+diff --git a/src/circuit.rs b/src/circuit.rs
+index 5f48f73..b1c0b9a 100644
+--- a/src/circuit.rs
++++ b/src/circuit.rs
+@@ -6,7 +6,7 @@ use rand::Rng;
+ #[cfg(test)]
+ use rand::SeedableRng;
+ use rand::rngs::StdRng;
+-use std::collections::HashMap;
++use std::collections::{HashMap, HashSet};
+ use std::fs::create_dir_all;
+ #[cfg(debug_assertions)]
+ use std::io::{BufWriter, Write};
+@@ -94,6 +94,22 @@ impl Circuit {
+                 current_pps[op.qubit as usize] = pp.id as i32;
+             }
+         }
++        // Classical dependencies (`@id,..` suffix): the product needs the *outcome* of an earlier
++        // product, so it cannot start before that product completes, even with no shared qubit.
++        let existing: HashSet<(i32, i32)> = deps.iter().copied().collect();
++        for pp in self.pps.iter() {
++            for &a in &pp.after {
++                assert!(
++                    a >= 0 && a < pp.id,
++                    "product {} lists classical dependency @{}, which is not an earlier product",
++                    pp.id,
++                    a
++                );
++                if !existing.contains(&(pp.id, a)) {
++                    deps.push((pp.id, a));
++                }
++            }
++        }
+         for (child_id, parent_id) in deps {
+             self.pps[child_id as usize].parents.push(parent_id);
+             self.pps[parent_id as usize].children.push(child_id);
+@@ -396,7 +412,11 @@ impl Circuit {
+         let mut correction_power: HashMap<u16, u8> = HashMap::new();
+ 
+         let mut expanded: Vec<PauliProduct> = Vec::with_capacity(self.pps.len() * 4);
++        // `first_id[k]`: where original product k starts in `expanded` (any S corrections emitted
++        // just before it come first). Classical dependencies attach to these.
++        let mut first_id: Vec<i32> = Vec::with_capacity(self.pps.len());
+         for pp in &self.pps {
++            first_id.push(expanded.len() as i32);
+             if pp.gate_type.is_cx() {
+                 // Before a CX, emit S corrections for any tracked qubits.
+                 for op in &pp.operators {
+@@ -409,6 +429,7 @@ impl Circuit {
+                                 operators: vec![Operator { qubit: op.qubit, basis: op.basis }],
+                                 parents: vec![],
+                                 children: vec![],
++                                after: vec![],
+                                 max_qubit: op.qubit,
+                             };
+                             expanded.push(corr);
+@@ -435,6 +456,7 @@ impl Circuit {
+                                 operators: vec![Operator { qubit: op.qubit, basis: op.basis }],
+                                 parents: vec![],
+                                 children: vec![],
++                                after: vec![],
+                                 max_qubit: op.qubit,
+                             };
+                             expanded.push(corr);
+@@ -498,6 +520,17 @@ impl Circuit {
+                 current_pps[op.qubit as usize] = pp.id;
+             }
+         }
++        // Classical dependencies: the child's first expanded piece waits for the last expanded
++        // piece of the product whose outcome it needs.
++        for pp in &self.pps {
++            for &a in &pp.after {
++                let child = first_id[pp.id as usize];
++                let parent = first_id.get(a as usize + 1).copied().unwrap_or(expanded.len() as i32) - 1;
++                // A duplicate of a qubit-overlap edge is harmless: parents and children stay
++                // consistent, exactly as for a CX whose two qubits share a parent.
++                deps.push((child, parent));
++            }
++        }
+         for (child_id, parent_id) in deps {
+             expanded[child_id as usize].parents.push(parent_id);
+             expanded[parent_id as usize].children.push(child_id);
+@@ -825,6 +858,42 @@ mod tests {
+         assert!(c.product(1).parents.is_empty());
+     }
+ 
++    #[test]
++    fn classical_dependency_links_products_sharing_no_qubit() {
++        // product 2 acts on qubit 1 only, but needs the outcome of product 0 (on qubit 0).
++        let f = make_circuit_file(&["+Z_<M>", "+_Z<T>", "+_Z<S>@0"]);
++        let mut c = Circuit::new(&f.path().to_string_lossy().to_string());
++        c.load_circuit().unwrap();
++        let mut parents = c.product(2).parents.clone();
++        parents.sort();
++        assert_eq!(parents, vec![0, 1], "qubit-overlap parent 1 plus classical parent 0");
++        assert_eq!(c.product(0).children, vec![2]);
++    }
++
++    #[test]
++    #[should_panic(expected = "not an earlier product")]
++    fn classical_dependency_on_a_later_product_panics() {
++        let f = make_circuit_file(&["+Z_<T>@1", "+_Z<M>"]);
++        let mut c = Circuit::new(&f.path().to_string_lossy().to_string());
++        c.load_circuit().unwrap();
++    }
++
++    #[test]
++    fn classical_dependency_lengthens_the_layer_estimate() {
++        // Qubit 0 carries a chain of three products; the T on qubit 1 would sit in layer 1 on its
++        // own, but waiting for the outcome of the chain's last product pushes it to layer 4.
++        let free = make_circuit_file(&["+Z_<T>", "+Z_<T>", "+Z_<T>", "+_Z<T>"]);
++        let dep = make_circuit_file(&["+Z_<T>", "+Z_<T>", "+Z_<T>", "+_Z<T>@2"]);
++        let layers = |f: &NamedTempFile| {
++            let mut c = Circuit::new(&f.path().to_string_lossy().to_string());
++            c.load_circuit().unwrap();
++            let mut rng = StdRng::seed_from_u64(1);
++            (c.compute_layers().len(), c.estimate_num_layers(&mut rng, true))
++        };
++        assert_eq!(layers(&free), (3, 3));
++        assert_eq!(layers(&dep), (4, 4));
++    }
++
+     #[test]
+     fn generate_dependencies_sequential_same_qubit() {
+         let f = make_circuit_file(&["+X_<T>", "+X_<T>"]);
+diff --git a/src/gen_circuit.rs b/src/gen_circuit.rs
+index 28292b7..99d6df4 100644
+--- a/src/gen_circuit.rs
++++ b/src/gen_circuit.rs
+@@ -96,6 +96,7 @@ impl PauliProduct {
+             operators,
+             parents: Vec::new(),
+             children: Vec::new(),
++            after: Vec::new(),
+             max_qubit,
+             id: product_id,
+             gate_type: GateType::T,
+diff --git a/src/pauliproduct.rs b/src/pauliproduct.rs
+index 3c92f55..f425812 100644
+--- a/src/pauliproduct.rs
++++ b/src/pauliproduct.rs
+@@ -9,6 +9,9 @@ pub(crate) enum GateType {
+     SX,
+     CX,
+     M,
++    /// Re-initialization of a single data patch to |0> after a mid-circuit measurement.
++    /// Scheduled like a single-patch `M`: it occupies the patch's node for one lcycle.
++    R,
+     Z,
+     X,
+ }
+@@ -34,6 +37,10 @@ impl GateType {
+         matches!(self, GateType::M)
+     }
+ 
++    pub(crate) fn is_r(&self) -> bool {
++        matches!(self, GateType::R)
++    }
++
+     pub(crate) fn is_x(&self) -> bool {
+         matches!(self, GateType::X)
+     }
+@@ -76,6 +83,11 @@ pub(crate) struct PauliProduct {
+     pub operators: Vec<Operator>,
+     pub parents: Vec<i32>,
+     pub children: Vec<i32>,
++    /// Extra classical dependencies, parsed from an `@a,b,..` suffix on the product's line: ids of
++    /// earlier products (normally `<M>`) whose *outcome* this product needs before it can start,
++    /// e.g. a gate conditioned on a mid-circuit measurement. They become DAG edges in
++    /// `Circuit::gen_deps` even though the products share no qubit.
++    pub after: Vec<i32>,
+     pub max_qubit: u16,
+     pub id: i32,
+     pub gate_type: GateType,
+@@ -88,6 +100,7 @@ impl Default for PauliProduct {
+             max_qubit: 0,
+             parents: Vec::new(),
+             children: Vec::new(),
++            after: Vec::new(),
+             id: -1,
+             gate_type: GateType::T,
+         }
+@@ -99,9 +112,28 @@ impl PauliProduct {
+         Self::default()
+     }
+ 
+-    /// Parses a circuit format string: `[±][X/Y/Z/_...][<gate_type>]`.
++    /// Parses a circuit format string: `[±][X/Y/Z/_...][<gate_type>][@id,id,..]`.
++    ///
++    /// The optional `@` suffix lists the ids of earlier products this one classically depends
++    /// on (see [`PauliProduct::after`]). Ids count the products kept by `Circuit::load_circuit`,
++    /// which for `transpile` output is simply the 0-based line number.
+     pub(crate) fn set_from_str(&mut self, product_id: i32, s: &str) -> Result<(), Box<dyn Error>> {
+         self.id = product_id;
++        let full = s;
++        let (s, after) = match s.split_once('@') {
++            Some((body, ids)) => {
++                let mut v = Vec::new();
++                for tok in ids.split(',') {
++                    let id: i32 = tok.trim().parse().map_err(|_| {
++                        format!("Bad classical dependency `{}` in product {}", tok, full)
++                    })?;
++                    v.push(id);
++                }
++                (body, v)
++            }
++            None => (s, Vec::new()),
++        };
++        self.after = after;
+ 
+         for (i, c) in s.char_indices() {
+             if i == 0 {
+@@ -117,6 +149,7 @@ impl PauliProduct {
+                     let gate_type = &s[i..];
+                     match gate_type {
+                         "<M>" => self.gate_type = GateType::M,
++                        "<R>" => self.gate_type = GateType::R,
+                         "<T>" => self.gate_type = GateType::T,
+                         "<CX>" => self.gate_type = GateType::CX,
+                         "<S>" | "<Sdg>" => self.gate_type = GateType::S,
+@@ -142,6 +175,8 @@ impl PauliProduct {
+             assert_eq!(self.operators.len(), 2);
+         } else if self.gate_type.is_s() || self.gate_type.is_sx() {
+             assert_eq!(self.operators.len(), 1, "Should have max 1 qubit: {}", self);
++        } else if self.gate_type.is_r() {
++            assert_eq!(self.operators.len(), 1, "Reset must act on exactly 1 qubit: {}", self);
+         }
+         self.max_qubit = self.operators.iter().map(|op| op.qubit).max().unwrap_or(0);
+         Ok(())
+@@ -301,6 +336,44 @@ mod tests {
+         assert_eq!(pp.operators[0].qubit, 0);
+     }
+ 
++    #[test]
++    fn set_from_str_r_gate() {
++        let mut pp = PauliProduct::new();
++        pp.set_from_str(0, "+_Z_<R>").unwrap();
++        assert!(pp.gate_type.is_r());
++        assert!(!pp.gate_type.is_m());
++        assert!(!pp.gate_type.is_clifford());
++        assert_eq!(pp.operators.len(), 1);
++        assert_eq!(pp.operators[0].qubit, 1);
++    }
++
++    #[test]
++    #[should_panic(expected = "Reset must act on exactly 1 qubit")]
++    fn set_from_str_r_gate_multi_qubit_panics() {
++        let mut pp = PauliProduct::new();
++        let _ = pp.set_from_str(0, "+ZZ<R>");
++    }
++
++    #[test]
++    fn set_from_str_classical_dependency_suffix() {
++        let mut pp = PauliProduct::new();
++        pp.set_from_str(7, "+_Z_<T>@3,5").unwrap();
++        assert!(pp.gate_type.is_t());
++        assert_eq!(pp.after, vec![3, 5]);
++        assert_eq!(pp.operators.len(), 1);
++        assert_eq!(pp.operators[0].qubit, 1);
++        let mut plain = PauliProduct::new();
++        plain.set_from_str(0, "+_Z_<T>").unwrap();
++        assert!(plain.after.is_empty());
++    }
++
++    #[test]
++    fn set_from_str_rejects_bad_classical_dependency() {
++        let mut pp = PauliProduct::new();
++        assert!(pp.set_from_str(1, "+Z<T>@x").is_err());
++        assert!(pp.set_from_str(1, "+Z<T>@").is_err());
++    }
++
+     #[test]
+     fn set_from_str_s_gate() {
+         let mut pp = PauliProduct::new();
+diff --git a/src/puremagic.rs b/src/puremagic.rs
+index 1967869..1d72b9a 100644
+--- a/src/puremagic.rs
++++ b/src/puremagic.rs
+@@ -62,6 +62,11 @@ struct Args {
+     /// Record normalized cultivation-time distribution to <CIRCUIT_FNAME>.cultivation_dist
+     #[arg(short = 'C', long)]
+     record_cultivation_dist: bool,
++    /// Classical reaction latency in lcycles, for dynamic circuits: a product whose `.trans` line
++    /// has an `@id,..` suffix starts this many lcycles after the products it names complete,
++    /// modelling the time to decode a logical measurement before acting on its outcome. 0 = ideal.
++    #[arg(long = "reaction-latency", default_value_t = 0)]
++    reaction_latency: usize,
+     #[arg(
+         short,
+         long,
+@@ -137,6 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+         args.common.no_t_failures,
+         args.record_cultivation_dist,
+     );
++    sched.set_reaction_latency(args.reaction_latency);
+ 
+     let (tot_lcycles, n_scheduled) = sched.sched_circuit()?;
+     assert!(n_scheduled >= n_products);
+diff --git a/src/scheduler.rs b/src/scheduler.rs
+index 1e2c935..204eb5e 100644
+--- a/src/scheduler.rs
++++ b/src/scheduler.rs
+@@ -226,6 +226,15 @@ pub(crate) struct Scheduler {
+     /// `advance_clifford_state`/`check_clifford_repetitions` to treat these as complete,
+     /// single-lcycle, zero-node events instead of ordinary 3-lcycle S/SX Cliffords.
+     free_merged_products: HashSet<i32>,
++    /// Classical reaction latency, in lcycles. A product with a classical dependency (`after`, the
++    /// `@id,..` suffix of a `.trans` line) may start only this many lcycles later than it would
++    /// from the dependency's completion alone: the outcome of a logical measurement is not
++    /// usable until its syndrome rounds have been decoded. 0 (the default) keeps the scheduler
++    /// exactly as it was.
++    reaction_latency: usize,
++    /// `(due_lcycle, child_id)`: parent completions on classical edges whose release is held back
++    /// by `reaction_latency`. Released at the start of the first lcycle after `due_lcycle`.
++    delayed_unlocks: Vec<(usize, i32)>,
+ }
+ 
+ impl Scheduler {
+@@ -292,9 +301,38 @@ impl Scheduler {
+             t_conjugated_bases: HashMap::new(),
+             conjugated_t_products: HashSet::new(),
+             free_merged_products: HashSet::new(),
++            reaction_latency: 0,
++            delayed_unlocks: Vec::new(),
+         }
+     }
+ 
++    /// Sets the classical reaction latency (lcycles) applied to `@`-dependency edges.
++    pub(crate) fn set_reaction_latency(&mut self, lcycles: usize) {
++        self.reaction_latency = lcycles;
++    }
++
++    /// Releases every delayed classical unlock whose latency has elapsed, making children whose
++    /// last outstanding parent it was available to the scheduler this lcycle.
++    fn release_delayed_unlocks(&mut self) {
++        if self.delayed_unlocks.is_empty() {
++            return;
++        }
++        let now = self.current_lcycle;
++        let mut still_waiting = Vec::with_capacity(self.delayed_unlocks.len());
++        for (due, child_id) in std::mem::take(&mut self.delayed_unlocks) {
++            if due >= now {
++                still_waiting.push((due, child_id));
++                continue;
++            }
++            self.remaining_parents[child_id as usize] -= 1;
++            if self.remaining_parents[child_id as usize] == 0 {
++                let child = self.input.circuit.product(child_id).clone();
++                self.pps_pending.push(child);
++            }
++        }
++        self.delayed_unlocks = still_waiting;
++    }
++
+     pub(crate) fn count_t_products(&self) -> usize {
+         (0..self.input.circuit.n_products())
+             .filter(|&id| self.input.circuit.product(id as i32).gate_type.is_t())
+@@ -332,9 +370,13 @@ impl Scheduler {
+         let mut prev_pct_complete = 0usize;
+         self.current_lcycle = 0;
+         self.pp_paths = Vec::new();
+-        while !self.pps_pending.is_empty() || !self.clifford_paths.is_empty() {
++        while !self.pps_pending.is_empty()
++            || !self.clifford_paths.is_empty()
++            || !self.delayed_unlocks.is_empty()
++        {
+             self.timers.start(self.loop_timer);
+             self.current_lcycle += 1;
++            self.release_delayed_unlocks();
+             info_sched!(
+                 "{}",
+                 format!(
+@@ -894,6 +936,7 @@ impl Scheduler {
+             operators: vec![Operator { qubit, basis }],
+             parents: vec![],
+             children: vec![],
++            after: Vec::new(),
+             max_qubit: qubit,
+         };
+         self.input.circuit.pps.push(s_pp);
+@@ -1089,7 +1132,9 @@ impl Scheduler {
+                         pp_id
+                     );
+                     PathResult::NoPath
+-                } else if self.terminals_buf.len() == 1 && gate_type.is_m() {
++                } else if self.terminals_buf.len() == 1 && (gate_type.is_m() || gate_type.is_r()) {
++                    // A single-patch measurement and a patch re-initialization (`R`) both
++                    // occupy just the data patch's node for one lcycle.
+                     self.sched_measurement(pp_id, plotting)
+                 } else if gate_type.is_s() || gate_type.is_sx() {
+                     self.sched_s_sx(pp_id, plotting)
+@@ -1340,6 +1385,14 @@ impl Scheduler {
+             // zero-node events - fall straight through to unlocking their children.
+             let children: Vec<i32> = self.input.circuit.product(pp_id).children.clone();
+             for child_id in children {
++                // A classical edge (the child's `@` list names this product) is held back by the
++                // reaction latency; ordinary qubit-overlap edges are not.
++                if self.reaction_latency > 0
++                    && self.input.circuit.product(child_id).after.contains(&pp_id)
++                {
++                    self.delayed_unlocks.push((self.current_lcycle + self.reaction_latency, child_id));
++                    continue;
++                }
+                 self.remaining_parents[child_id as usize] -= 1;
+                 if self.remaining_parents[child_id as usize] == 0
+                     && !self.children_buf.contains(&child_id)
+@@ -1968,4 +2021,66 @@ mod tests {
+         let tot_entries: usize = sched.lcycle_scheduled.iter().map(|(_, ids)| ids.len()).sum();
+         assert_eq!(tot_entries, 6, "3 lcycles for the injected correction + 3 for the SX gate");
+     }
++
++    /// The lcycle in which product `id` was scheduled.
++    fn lcycle_of(sched: &Scheduler, id: i32) -> usize {
++        sched
++            .lcycle_scheduled
++            .iter()
++            .find(|(_, ids)| ids.contains(&id))
++            .map(|(l, _)| *l)
++            .unwrap_or_else(|| panic!("product {} was never scheduled", id))
++    }
++
++    #[test]
++    fn classical_dependency_without_latency_costs_one_lcycle() {
++        // Product 1 shares no qubit with product 0 but needs its outcome: it runs the lcycle after.
++        let mut sched = build_scheduler(&["+Z___<M>", "+_Z__<M>@0"], 0);
++        sched.sched_circuit().expect("sched_circuit failed");
++        assert_eq!(lcycle_of(&sched, 0), 1);
++        assert_eq!(lcycle_of(&sched, 1), 2);
++    }
++
++    #[test]
++    fn reaction_latency_delays_classically_dependent_products_exactly() {
++        for latency in [1usize, 3, 7] {
++            let mut sched = build_scheduler(&["+Z___<M>", "+_Z__<M>@0"], 0);
++            sched.set_reaction_latency(latency);
++            sched.sched_circuit().expect("sched_circuit failed");
++            assert_eq!(lcycle_of(&sched, 0), 1);
++            assert_eq!(lcycle_of(&sched, 1), 2 + latency, "latency {}", latency);
++        }
++    }
++
++    #[test]
++    fn reaction_latency_leaves_independent_products_alone() {
++        // Product 1 has no `@`: the latency must not touch it, nor a plain qubit-overlap edge.
++        let mut sched = build_scheduler(&["+Z___<M>", "+_Z__<M>", "+Z___<M>"], 0);
++        sched.set_reaction_latency(5);
++        sched.sched_circuit().expect("sched_circuit failed");
++        assert_eq!(lcycle_of(&sched, 0), 1);
++        assert_eq!(lcycle_of(&sched, 1), 1, "independent product runs in the first lcycle");
++        assert_eq!(lcycle_of(&sched, 2), 2, "qubit-overlap edge is not delayed");
++    }
++
++    #[test]
++    fn reaction_latency_waits_for_the_slowest_of_several_classical_parents() {
++        // Product 2 needs products 0 and 1; 1 is itself delayed behind 0.
++        let mut sched = build_scheduler(&["+Z___<M>", "+_Z__<M>@0", "+__Z_<M>@0,1"], 0);
++        sched.set_reaction_latency(2);
++        sched.sched_circuit().expect("sched_circuit failed");
++        assert_eq!(lcycle_of(&sched, 0), 1);
++        assert_eq!(lcycle_of(&sched, 1), 4);
++        assert_eq!(lcycle_of(&sched, 2), 7);
++    }
++
++    #[test]
++    fn reaction_latency_scheduler_still_terminates_when_only_delayed_work_remains() {
++        // After product 0 nothing is ready until the latency elapses; the loop must keep ticking.
++        let mut sched = build_scheduler(&["+Z___<M>", "+_Z__<R>@0"], 0);
++        sched.set_reaction_latency(10);
++        let (tot, n) = sched.sched_circuit().expect("sched_circuit failed");
++        assert_eq!(n, 2);
++        assert_eq!(tot, 12);
++    }
+ }
+diff --git a/src/transpile.rs b/src/transpile.rs
+index b6bbbed..66414af 100644
+--- a/src/transpile.rs
++++ b/src/transpile.rs
+@@ -5,6 +5,7 @@
+ //! compilers in `data_processing/`.
+ 
+ use clap::Parser;
++use std::collections::{BTreeSet, HashMap, HashSet};
+ use std::fmt;
+ use std::fs::File;
+ use std::io::{self, BufRead, BufReader, BufWriter, Write};
+@@ -43,6 +44,26 @@ struct Args {
+     /// weight threshold; always on under --auto.
+     #[arg(long = "defer_trailing", default_value_t = false)]
+     defer_trailing: bool,
++
++    /// How a mid-circuit `reset` is compiled (see docs/dynamic-circuits.md).
++    ///   frame: measure, then fix the state with a classical Pauli-frame update. No extra gates.
++    ///   flush: like `frame`, but first flush the pending Cliffords so the reset's measurement
++    ///          is weight 1 and later products on that qubit start from a clean frame.
++    ///   init:  like `flush`, plus an `<R>` product that models re-initializing the patch.
++    #[arg(long = "reset_mode", value_enum, default_value_t = ResetMode::Frame)]
++    reset_mode: ResetMode,
++
++    /// Write the classical sidecar `<output>.dyn.json` even for a circuit with no reset or
++    /// feed-forward (it is written automatically for dynamic circuits).
++    #[arg(long = "sidecar", default_value_t = false)]
++    sidecar: bool,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
++enum ResetMode {
++    Frame,
++    Flush,
++    Init,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -51,7 +72,20 @@ enum QasmGate {
+     Clifford2Q { gate: Gate2Q, control: usize, target: usize },
+     T { qubit: usize },
+     Tdg { qubit: usize },
+-    Measure { qubit: usize },
++    /// Z-basis measurement. `clbit` is the global classical-bit index it writes, if any.
++    Measure { qubit: usize, clbit: Option<usize> },
++    /// `reset q[i];` -- Z measurement followed by a classical X correction (Pauli frame).
++    Reset { qubit: usize },
++    /// A Pauli gate applied only when classical bit `clbit` equals `value`, i.e. the OpenQASM 2
++    /// statement `if(c==value) x q[i];` on a 1-bit register. It never touches the layout: it is a
++    /// classical Pauli-frame update that depends on an earlier measurement outcome.
++    CondPauli { gate: Gate1Q, qubit: usize, clbit: usize, value: bool },
++    /// Any other single-qubit gate (Clifford or T) applied only when *every* `(clbit, value)` term
++    /// holds, i.e. `if(c0==1 && c1==0) h q[i];` (the `&&` form is a PureMagic extension of
++    /// OpenQASM 2; each register is 1 bit wide). A Pauli under a single term is a
++    /// [`QasmGate::CondPauli`] instead. Unlike that, this gate is a *physical* operation whose
++    /// execution depends on outcomes, so it cannot live in the Pauli frame.
++    CondGate { inner: Box<QasmGate>, terms: Vec<(usize, bool)> },
+     Barrier,
+ }
+ 
+@@ -66,10 +100,23 @@ impl QasmGate {
+             }
+             QasmGate::T { qubit } => vec![*qubit],
+             QasmGate::Tdg { qubit } => vec![*qubit],
+-            QasmGate::Measure { qubit } => vec![*qubit],
++            QasmGate::Measure { qubit, .. } => vec![*qubit],
++            QasmGate::Reset { qubit } => vec![*qubit],
++            QasmGate::CondPauli { qubit, .. } => vec![*qubit],
++            QasmGate::CondGate { inner, .. } => inner.qubits(),
+             QasmGate::Barrier => vec![],
+         }
+     }
++
++    /// The classical bits this gate writes (`Measure`) or reads (`CondPauli`, `CondGate`).
++    fn clbits(&self) -> Vec<usize> {
++        match self {
++            QasmGate::Measure { clbit, .. } => clbit.iter().copied().collect(),
++            QasmGate::CondPauli { clbit, .. } => vec![*clbit],
++            QasmGate::CondGate { terms, .. } => terms.iter().map(|&(c, _)| c).collect(),
++            _ => vec![],
++        }
++    }
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq)]
+@@ -92,15 +139,176 @@ struct TransPauli {
+     sign: Sign,
+     /// One char per qubit: 'I', 'X', 'Y', 'Z'.
+     ops: Vec<char>,
+-    /// "T" or "M".
++    /// "T", "M" or "R".
+     label: String,
++    /// Dynamic-circuit bookkeeping. Not part of the `.trans` line; written to the sidecar.
++    meta: PauliMeta,
++}
++
++/// Classical information attached to a product, for circuits with mid-circuit measurement.
++///
++/// The scheduler only reads the product's support and basis, never its sign, so none of this
++/// changes the schedule. It lets a downstream executor (or `validate_dynamic.py`) recover the
++/// true outcome of every measurement: with `p` the physical outcome of product `k`,
++///
++/// ```text
++/// true_outcome(k) = p  XOR  sign(k)  XOR  (XOR of true_outcome(j) for j in frame_deps(k))
++/// ```
++#[derive(Debug, Clone, Default)]
++struct PauliMeta {
++    /// Index of the outcome this `M` product produces (counted over all `M` products).
++    meas_id: Option<usize>,
++    /// Circuit-level qubit that was measured (the product itself is in the physical frame).
++    logical_qubit: Option<usize>,
++    /// Global classical-bit index the outcome was stored in, if the circuit named one.
++    clbit: Option<usize>,
++    /// True when this `M` is the measurement half of a `reset`.
++    is_reset: bool,
++    /// Earlier outcomes whose XOR flips this product's sign.
++    frame_deps: Vec<usize>,
++    /// For a *conditional* product: it executes only if every `(outcome id, value)` holds, where
++    /// outcome ids are true outcomes as defined above. Empty for an unconditional product.
++    cond: Vec<(usize, bool)>,
++    /// Outcomes this product needs before it can start (its conditions, plus any owed Pauli that
++    /// was paid for physically just before it). Written to the `.trans` line as `@line,..` so the
++    /// scheduler orders it after the measurements that decide it.
++    needs: Vec<usize>,
+ }
+ 
+ impl TransPauli {
++    /// Attach the frame's dependencies to this product: constants flip the printed sign, the
++    /// outcome-dependent rest goes to `meta.frame_deps`.
++    fn apply_frame(&mut self, mut deps: Vec<usize>) {
++        if take_const(&mut deps) {
++            self.sign = match self.sign {
++                Sign::Plus => Sign::Minus,
++                Sign::Minus => Sign::Plus,
++            };
++        }
++        self.meta.frame_deps = deps;
++    }
++
+     fn from_pauli_string(ps: &PauliString, label: &str) -> Self {
+         let sign = if ps.sign { Sign::Minus } else { Sign::Plus };
+         let ops: Vec<char> = (0..ps.n).map(|q| ps.pauli_at(q)).collect();
+-        TransPauli { sign, ops, label: label.to_string() }
++        TransPauli { sign, ops, label: label.to_string(), meta: PauliMeta::default() }
++    }
++}
++
++/// Pseudo outcome id for frame terms that are *always* owed, i.e. XOR-ed with the constant 1.
++///
++/// The emitted Cliffords equal the true ones only up to a Pauli (X/Y/Z are never emitted; see
++/// [`dropped_pauli`]). That constant Pauli joins the frame under this id, and is folded into the
++/// printed sign of every later product instead of appearing in `frame_deps`.
++const CONST_OUTCOME: usize = usize::MAX;
++
++/// Removes [`CONST_OUTCOME`] from `deps`, returning whether it was present (an odd number of
++/// constant terms flips the sign).
++fn take_const(deps: &mut Vec<usize>) -> bool {
++    let before = deps.len();
++    deps.retain(|&d| d != CONST_OUTCOME);
++    deps.len() != before
++}
++
++/// A classical Pauli frame: the Pauli correction `prod_q X_q^{a_q} Z_q^{b_q}` that has been
++/// owed to the physical state, where each exponent is the XOR of a set of measurement outcomes.
++///
++/// `dx[q]` is the set of outcomes in `a_q`, `dz[q]` the set in `b_q`. A later Pauli product `P`
++/// measures `+-P` instead of `P` exactly when it anticommutes with the frame, so its sign
++/// depends on the XOR of the outcomes returned by [`PauliFrame::deps`]. Cliffords the transpiler
++/// emits physically are pushed through the frame with [`PauliFrame::conj_gate`]; Cliffords it
++/// keeps pending need no update because the frame is stored in the same (physical) coordinates
++/// as the products.
++#[derive(Debug, Clone)]
++struct PauliFrame {
++    dx: Vec<BTreeSet<usize>>,
++    dz: Vec<BTreeSet<usize>>,
++}
++
++fn toggle(set: &mut BTreeSet<usize>, v: usize) {
++    if !set.remove(&v) {
++        set.insert(v);
++    }
++}
++
++fn xor_into(dst: &mut BTreeSet<usize>, src: &BTreeSet<usize>) {
++    for &v in src {
++        toggle(dst, v);
++    }
++}
++
++impl PauliFrame {
++    fn new(n: usize) -> Self {
++        PauliFrame { dx: vec![BTreeSet::new(); n], dz: vec![BTreeSet::new(); n] }
++    }
++
++    /// Owe the physical state the Pauli `p` whenever `outcome` is 1. The sign of `p` is ignored.
++    fn add(&mut self, p: &PauliString, outcome: usize) {
++        for q in 0..p.n {
++            if p.x_bits[q] {
++                toggle(&mut self.dx[q], outcome);
++            }
++            if p.z_bits[q] {
++                toggle(&mut self.dz[q], outcome);
++            }
++        }
++    }
++
++    /// The outcomes whose XOR decides whether `p` anticommutes with the frame (sorted).
++    fn deps(&self, p: &PauliString) -> Vec<usize> {
++        let mut acc = BTreeSet::new();
++        for q in 0..p.n.min(self.dx.len()) {
++            if p.x_bits[q] {
++                xor_into(&mut acc, &self.dz[q]); // X anticommutes with the Z part of the frame
++            }
++            if p.z_bits[q] {
++                xor_into(&mut acc, &self.dx[q]); // Z anticommutes with the X part
++            }
++        }
++        acc.into_iter().collect()
++    }
++
++    /// Push the frame forward through a Clifford `g` that was applied to the physical state.
++    /// Pauli signs are irrelevant here, so `S`/`Sdg` and `SX`/`SXdg` act identically.
++    fn conj_gate(&mut self, g: &QasmGate) {
++        match g {
++            QasmGate::Clifford1Q { gate, qubit } => {
++                let q = *qubit;
++                match gate {
++                    Gate1Q::H => std::mem::swap(&mut self.dx[q], &mut self.dz[q]),
++                    Gate1Q::S | Gate1Q::Sdg => {
++                        let dx = self.dx[q].clone();
++                        xor_into(&mut self.dz[q], &dx);
++                    }
++                    Gate1Q::SX | Gate1Q::SXdg => {
++                        let dz = self.dz[q].clone();
++                        xor_into(&mut self.dx[q], &dz);
++                    }
++                    Gate1Q::X | Gate1Q::Y | Gate1Q::Z => {}
++                }
++            }
++            QasmGate::Clifford2Q { gate, control, target } => {
++                let (c, t) = (*control, *target);
++                match gate {
++                    Gate2Q::CX => {
++                        let dxc = self.dx[c].clone();
++                        xor_into(&mut self.dx[t], &dxc);
++                        let dzt = self.dz[t].clone();
++                        xor_into(&mut self.dz[c], &dzt);
++                    }
++                    Gate2Q::CZ => {
++                        let (dxc, dxt) = (self.dx[c].clone(), self.dx[t].clone());
++                        xor_into(&mut self.dz[t], &dxc);
++                        xor_into(&mut self.dz[c], &dxt);
++                    }
++                    Gate2Q::Swap => {
++                        self.dx.swap(c, t);
++                        self.dz.swap(c, t);
++                    }
++                }
++            }
++            _ => {}
++        }
+     }
+ }
+ 
+@@ -124,6 +332,8 @@ struct TransClifford {
+     ops: Vec<char>,
+     /// Gate name: "CX", "S", "Sdg", "SX", "SXdg".
+     name: String,
++    /// Only `cond` and `needs` are used: set for the physical Cliffords of a conditional gate.
++    meta: PauliMeta,
+ }
+ 
+ impl TransClifford {
+@@ -154,7 +364,7 @@ impl TransClifford {
+             }
+             _ => return None,
+         };
+-        Some(TransClifford { ops, name })
++        Some(TransClifford { ops, name, meta: PauliMeta::default() })
+     }
+ }
+ 
+@@ -168,10 +378,29 @@ impl fmt::Display for TransClifford {
+     }
+ }
+ 
++/// Classical bookkeeping that is not a scheduled operation: it has no `.trans` line and costs no
++/// logical cycles. It goes to the sidecar, anchored to the number of `.trans` lines before it.
++#[derive(Debug, Clone)]
++enum Event {
++    /// Physically apply `X^(xor of x_deps, plus 1 if x_const) Z^(...)` to `qubit`. This pays off
++    /// the Pauli the frame owes that qubit, so that a following *conditional* physical gate sees
++    /// a clean frame (a conditional Clifford would otherwise make the frame nonlinear in the
++    /// outcomes). A Pauli on a surface-code patch is a transversal/software operation, so it is
++    /// not scheduled.
++    Fix { qubit: usize, x_deps: Vec<usize>, x_const: bool, z_deps: Vec<usize>, z_const: bool },
++    /// Defines the pseudo-outcome `id` as the AND of its `(outcome, value)` terms, so that a
++    /// Pauli conditioned on several bits is still a *linear* frame term.
++    Derived { id: usize, terms: Vec<(usize, bool)> },
++}
++
++/// Ids of derived (AND) outcomes start here, far above any real measurement id.
++const DERIVED_BASE: usize = 1 << 40;
++
+ #[derive(Debug, Clone)]
+ enum TransItem {
+     Pauli(TransPauli),
+     Clifford(TransClifford),
++    Event(Event),
+ }
+ 
+ impl fmt::Display for TransItem {
+@@ -179,27 +408,177 @@ impl fmt::Display for TransItem {
+         match self {
+             TransItem::Pauli(p) => write!(f, "{}", p),
+             TransItem::Clifford(c) => write!(f, "{}", c),
++            TransItem::Event(_) => Ok(()),
++        }
++    }
++}
++
++/// Classical registers declared so far: name -> (global index of bit 0, size).
++type Cregs = HashMap<String, (usize, usize)>;
++
++fn invalid(line_no: usize, msg: String) -> io::Error {
++    io::Error::new(io::ErrorKind::InvalidData, format!("line {}: {}", line_no, msg))
++}
++
++/// `creg name[size];` -> declares `size` global classical bits.
++fn parse_creg(line: &str, cregs: &mut Cregs, n_clbits: &mut usize) {
++    let body = line["creg".len()..].trim().trim_end_matches(';');
++    if let (Some(open), Some(close)) = (body.find('['), body.find(']')) {
++        if let Ok(size) = body[open + 1..close].parse::<usize>() {
++            cregs.insert(body[..open].trim().to_string(), (*n_clbits, size));
++            *n_clbits += size;
+         }
+     }
+ }
+ 
++/// Resolve `name[idx]` (or a bare `name` for a 1-bit register) to a global classical-bit index.
++fn resolve_clbit(text: &str, cregs: &Cregs, line_no: usize) -> io::Result<usize> {
++    let text = text.trim().trim_end_matches(';').trim();
++    let (name, idx) = match (text.find('['), text.find(']')) {
++        (Some(open), Some(close)) => {
++            let idx = text[open + 1..close]
++                .trim()
++                .parse::<usize>()
++                .map_err(|_| invalid(line_no, format!("bad classical bit index in `{}`", text)))?;
++            (text[..open].trim(), Some(idx))
++        }
++        _ => (text, None),
++    };
++    let &(base, size) = cregs
++        .get(name)
++        .ok_or_else(|| invalid(line_no, format!("unknown classical register `{}`", name)))?;
++    match idx {
++        Some(i) if i < size => Ok(base + i),
++        Some(i) => Err(invalid(line_no, format!("bit {} out of range for `{}[{}]`", i, name, size))),
++        None if size == 1 => Ok(base),
++        None => Err(invalid(
++            line_no,
++            format!("`{}` has {} bits; index it explicitly (e.g. {}[0])", name, size, name),
++        )),
++    }
++}
++
++/// `if(c==1) <gate> q[i];` -> a conditional gate.
++///
++/// The condition is one or more `reg==0|1` terms joined by `&&`, each on a 1-bit register (so a
++/// block that measures several ancillas into one register each can be conditioned on a
++/// combination). A Pauli under a single term is a classical frame update ([`QasmGate::CondPauli`]);
++/// every other single-qubit gate becomes a [`QasmGate::CondGate`]. Anything else conditioned on a
++/// classical bit is rejected rather than silently dropped, because dropping it would change the
++/// circuit.
++fn parse_conditional(line: &str, cregs: &Cregs, line_no: usize) -> io::Result<QasmGate> {
++    let unsupported = |why: &str| {
++        invalid(
++            line_no,
++            format!(
++                "unsupported conditional `{}`: {}. Supported: `if(r==0|1 [&& r2==0|1 ...]) g q[i];` \
++                 with 1-bit registers and a single-qubit gate g in h,s,sdg,sx,sxdg,x,y,z,t,tdg",
++                line, why
++            ),
++        )
++    };
++    let open = line.find('(').ok_or_else(|| unsupported("missing `(`"))?;
++    let close = line.find(')').ok_or_else(|| unsupported("missing `)`"))?;
++    let mut terms: Vec<(usize, bool)> = Vec::new();
++    for term in line[open + 1..close].split("&&") {
++        let (reg, val) =
++            term.split_once("==").ok_or_else(|| unsupported("expected `creg==value`"))?;
++        let value = match val.trim() {
++            "0" => false,
++            "1" => true,
++            other => return Err(unsupported(&format!("condition value `{}` is not 0 or 1", other))),
++        };
++        let reg_name = reg.trim();
++        let &(_, size) = cregs
++            .get(reg_name)
++            .ok_or_else(|| invalid(line_no, format!("unknown classical register `{}`", reg_name)))?;
++        if size != 1 {
++            return Err(unsupported("the register has more than one bit"));
++        }
++        terms.push((resolve_clbit(reg_name, cregs, line_no)?, value));
++    }
++    let rest = line[close + 1..].trim();
++    let inner = try_parse_1q(rest).ok_or_else(|| unsupported("the conditioned gate is not a supported single-qubit gate"))?;
++    match (&inner, terms.as_slice()) {
++        (QasmGate::Clifford1Q { gate, qubit }, &[(clbit, value)])
++            if matches!(gate, Gate1Q::X | Gate1Q::Y | Gate1Q::Z) =>
++        {
++            Ok(QasmGate::CondPauli { gate: *gate, qubit: *qubit, clbit, value })
++        }
++        _ => Ok(QasmGate::CondGate { inner: Box::new(inner), terms }),
++    }
++}
++
++/// Settles conditions that are known without running the circuit.
++///
++/// A classical bit no measurement has written yet reads as 0, so a term demanding 1 from it can
++/// never hold (the gate is dropped) and a term demanding 0 always holds (the term is dropped); a
++/// gate left with no terms is unconditional and becomes the plain gate. Two terms that demand
++/// different values of one bit also drop the gate. After this, every remaining term refers to a
++/// bit that an earlier measurement wrote, so the transpiler can name the outcome it reads.
++fn resolve_static_conditions(gates: &[QasmGate]) -> Vec<QasmGate> {
++    let mut written: HashSet<usize> = HashSet::new();
++    let mut out = Vec::with_capacity(gates.len());
++    for g in gates {
++        match g {
++            QasmGate::Measure { clbit: Some(c), .. } => {
++                written.insert(*c);
++                out.push(g.clone());
++            }
++            QasmGate::CondGate { inner, terms } => {
++                let mut keep: Vec<(usize, bool)> = Vec::new();
++                let mut never = false;
++                for &(cb, v) in terms {
++                    if !written.contains(&cb) {
++                        never |= v;
++                    } else if let Some(&(_, prev)) = keep.iter().find(|(k, _)| *k == cb) {
++                        never |= prev != v;
++                    } else {
++                        keep.push((cb, v));
++                    }
++                }
++                if never {
++                    continue;
++                }
++                if keep.is_empty() {
++                    out.push((**inner).clone());
++                } else {
++                    out.push(QasmGate::CondGate { inner: inner.clone(), terms: keep });
++                }
++            }
++            _ => out.push(g.clone()),
++        }
++    }
++    out
++}
++
+ /// Parse a `.cliffordt.qasm` file into a gate list and qubit count.
+-/// Unrecognised lines (headers, custom gate defs, creg, etc.) are silently skipped.
++///
++/// Unrecognised lines (headers, custom gate defs, etc.) are silently skipped, with one exception:
++/// a statement starting with `if` must be a supported conditional gate (see
++/// [`parse_conditional`]), otherwise parsing fails.
+ fn parse_qasm(path: &str) -> io::Result<(usize, Vec<QasmGate>)> {
+     let file = File::open(path)?;
+     let reader = BufReader::new(file);
+     let mut n_qubits = 0usize;
+     let mut gates = Vec::new();
++    let mut cregs = Cregs::new();
++    let mut n_clbits = 0usize;
+ 
+-    for line in reader.lines() {
++    for (line_idx, line) in reader.lines().enumerate() {
++        let line_no = line_idx + 1;
+         let line = line?;
+         let line = line.trim();
+ 
++        if line.starts_with("creg") {
++            parse_creg(line, &mut cregs, &mut n_clbits);
++            continue;
++        }
++
+         if line.is_empty()
+             || line.starts_with("//")
+             || line.starts_with("OPENQASM")
+             || line.starts_with("include")
+-            || line.starts_with("creg")
+             || line.starts_with("gate ")
+             || line.starts_with('{')
+             || line.starts_with('}')
+@@ -221,12 +600,33 @@ fn parse_qasm(path: &str) -> io::Result<(usize, Vec<QasmGate>)> {
+         }
+ 
+         if line.starts_with("measure") {
++            // `measure q[i];` or `measure q[i] -> c[j];`
++            let (lhs, rhs) = match line.split_once("->") {
++                Some((l, r)) => (l, Some(r)),
++                None => (line, None),
++            };
++            if let Some(q) = parse_single_qubit_index(lhs) {
++                let clbit = match rhs {
++                    Some(r) => Some(resolve_clbit(r, &cregs, line_no)?),
++                    None => None,
++                };
++                gates.push(QasmGate::Measure { qubit: q, clbit });
++            }
++            continue;
++        }
++
++        if line.starts_with("reset") {
+             if let Some(q) = parse_single_qubit_index(line) {
+-                gates.push(QasmGate::Measure { qubit: q });
++                gates.push(QasmGate::Reset { qubit: q });
+             }
+             continue;
+         }
+ 
++        if line.starts_with("if") && line[2..].trim_start().starts_with('(') {
++            gates.push(parse_conditional(line, &cregs, line_no)?);
++            continue;
++        }
++
+         if let Some(g) = try_parse_2q(line) {
+             gates.push(g);
+             continue;
+@@ -237,39 +637,47 @@ fn parse_qasm(path: &str) -> io::Result<(usize, Vec<QasmGate>)> {
+         }
+     }
+ 
+-    let gates = reorder_by_cycles(gates, n_qubits);
++    let gates = reorder_by_cycles(gates, n_qubits, n_clbits);
+     Ok((n_qubits, gates))
+ }
+ 
+ /// Reorder gates into cycle-based order: pack each gate into the earliest
+-/// cycle where all its qubits are free, then sort within each cycle by
+-/// minimum qubit index.  This is a semantics-preserving reordering of
+-/// independent (commuting) gates.
+-fn reorder_by_cycles(gates: Vec<QasmGate>, n_qubits: usize) -> Vec<QasmGate> {
++/// cycle where all its qubits (and its classical bit, if any) are free, then sort within each
++/// cycle by minimum qubit index.  This is a semantics-preserving reordering of independent
++/// (commuting) gates. A classical bit is a resource like a qubit, so a conditional gate can
++/// never move before the measurement that writes its bit, nor a re-measurement before a read.
++fn reorder_by_cycles(gates: Vec<QasmGate>, n_qubits: usize, n_clbits: usize) -> Vec<QasmGate> {
+     if n_qubits == 0 {
+         return gates;
+     }
+ 
+     let mut next_cycle = vec![0usize; n_qubits];
++    let mut next_cycle_c = vec![0usize; n_clbits];
+     let mut cycles: Vec<Vec<(usize, QasmGate)>> = Vec::new();
+ 
+     for gate in gates {
+         if matches!(gate, QasmGate::Barrier) {
+             // Advance all qubits to the same cycle, place barrier, then advance past it.
+-            let sync = next_cycle.iter().copied().max().unwrap_or(0);
++            let sync = next_cycle.iter().chain(next_cycle_c.iter()).copied().max().unwrap_or(0);
+             if sync >= cycles.len() {
+                 cycles.resize_with(sync + 1, Vec::new);
+             }
+             cycles[sync].push((usize::MAX, gate));
+             let after = sync + 1;
+-            for q in next_cycle.iter_mut() {
++            for q in next_cycle.iter_mut().chain(next_cycle_c.iter_mut()) {
+                 *q = after;
+             }
+             continue;
+         }
+ 
+         let qubits = gate.qubits();
+-        let cycle = qubits.iter().map(|&q| next_cycle[q]).max().unwrap_or(0);
++        let clbits = gate.clbits();
++        let cycle = qubits
++            .iter()
++            .map(|&q| next_cycle[q])
++            .chain(clbits.iter().map(|&c| next_cycle_c[c]))
++            .max()
++            .unwrap_or(0);
+         if cycle >= cycles.len() {
+             cycles.resize_with(cycle + 1, Vec::new);
+         }
+@@ -278,6 +686,9 @@ fn reorder_by_cycles(gates: Vec<QasmGate>, n_qubits: usize) -> Vec<QasmGate> {
+         for &q in &qubits {
+             next_cycle[q] = cycle + 1;
+         }
++        for &c in &clbits {
++            next_cycle_c[c] = cycle + 1;
++        }
+     }
+ 
+     let mut result = Vec::new();
+@@ -390,13 +801,13 @@ fn apply_1q_to_state(gate: Gate1Q, x_img: u8, z_img: u8) -> (u8, u8) {
+             },
+             Gate1Q::SX => match pauli {
+                 0 => (0, false), // X→X
+-                1 => (2, true),  // Y→-Z
++                1 => (2, false), // Y→Z   (Y = iXZ → i·X·(-Y) = Z)
+                 2 => (1, true),  // Z→-Y
+                 _ => unreachable!(),
+             },
+             Gate1Q::SXdg => match pauli {
+                 0 => (0, false), // X→X
+-                1 => (2, false), // Y→Z
++                1 => (2, true),  // Y→-Z
+                 2 => (1, false), // Z→Y
+                 _ => unreachable!(),
+             },
+@@ -548,21 +959,96 @@ fn split_trailing_1q(gates: &[QasmGate], n_qubits: usize) -> (Vec<QasmGate>, Vec
+     (emitted, residual)
+ }
+ 
++/// The inverse of a single-qubit Clifford (S and SX are the only non-Hermitian ones).
++fn inverse_1q(g: Gate1Q) -> Gate1Q {
++    match g {
++        Gate1Q::S => Gate1Q::Sdg,
++        Gate1Q::Sdg => Gate1Q::S,
++        Gate1Q::SX => Gate1Q::SXdg,
++        Gate1Q::SXdg => Gate1Q::SX,
++        other => other, // H, X, Y, Z are their own inverses
++    }
++}
++
++/// Adds the next gate of a pending Clifford sequence to its tableau.
++///
++/// A rotation or measurement placed after Cliffords `C` is written `C^dagger P C` (the
++/// Heisenberg pull-back), so that it can run before `C`. `Tableau::conjugate` computes
++/// `U P U^dagger`, and its `prepend` composes gates in reverse, so pulling back through `C` means
++/// feeding it the *inverse* gates. For H, CX and the Paulis that is a no-op; for S and SX it
++/// matters, and omitting it flips the sign of any product that passes through one (the unsigned
++/// Pauli, which is all the scheduler reads, is unaffected).
++fn push_clifford(tableau: &mut Tableau, gate: &QasmGate) {
++    match gate {
++        QasmGate::Clifford1Q { gate: g, qubit } => tableau.prepend_1q_correct(inverse_1q(*g), *qubit),
++        QasmGate::Clifford2Q { gate: g, control, target } => {
++            tableau.prepend_2q(*g, *control, *target)
++        }
++        _ => {}
++    }
++}
++
+ /// Rebuilds the tableau for a pending Clifford sequence.
+ fn tableau_of(gates: &[QasmGate], n_qubits: usize) -> Tableau {
+     let mut tableau = Tableau::new(n_qubits);
+     for gate in gates {
+-        match gate {
+-            QasmGate::Clifford1Q { gate: g, qubit } => tableau.prepend_1q_correct(*g, *qubit),
+-            QasmGate::Clifford2Q { gate: g, control, target } => {
+-                tableau.prepend_2q(*g, *control, *target)
+-            }
+-            _ => {}
+-        }
++        push_clifford(&mut tableau, gate);
+     }
+     tableau
+ }
+ 
++/// Inverse of [`TransClifford::from_qasm_gate`], for the gates the `.trans` format can express.
++fn trans_to_qasm(c: &TransClifford) -> QasmGate {
++    let at = |ch: char| c.ops.iter().position(|&o| o == ch);
++    match c.name.as_str() {
++        "CX" => QasmGate::Clifford2Q {
++            gate: Gate2Q::CX,
++            control: at('Z').expect("CX line has a Z"),
++            target: at('X').expect("CX line has an X"),
++        },
++        name => {
++            let gate = match name {
++                "S" => Gate1Q::S,
++                "Sdg" => Gate1Q::Sdg,
++                "SX" => Gate1Q::SX,
++                "SXdg" => Gate1Q::SXdg,
++                other => unreachable!("unknown .trans Clifford {}", other),
++            };
++            let qubit = c.ops.iter().position(|&o| o != '_').expect("1Q line has an operator");
++            QasmGate::Clifford1Q { gate, qubit }
++        }
++    }
++}
++
++/// The Pauli `G` by which the emitted `.trans` Cliffords differ from the true gates.
++///
++/// X, Y and Z are never emitted (they are Pauli-frame corrections), and the single-qubit
++/// lookup realises some Cliffords only with such gates, so the physical unitary is
++/// `U_emit = G^-1 U_true` for a Pauli `G`. Both tableaus agree on every unsigned image
++/// (`same_up_to_sign`); they differ only in signs. With `conjugate(P) = U^dagger P U`, `G`
++/// anticommutes with a basis Pauli exactly when the two signs differ, which fixes `G` up to
++/// its own (irrelevant) sign. The physical state is then `G` times the ideal state: a constant
++/// frame term, owed from this point on.
++fn dropped_pauli(true_gates: &[QasmGate], n_qubits: usize) -> PauliString {
++    let emitted: Vec<QasmGate> =
++        to_trans_cliffords(true_gates, n_qubits).iter().map(trans_to_qasm).collect();
++    let (t_true, t_emit) = (tableau_of(true_gates, n_qubits), tableau_of(&emitted, n_qubits));
++    let mut g = PauliString::identity(n_qubits);
++    for q in 0..n_qubits {
++        let mut px = PauliString::identity(n_qubits);
++        px.x_bits[q] = true;
++        if t_true.conjugate(&px).sign != t_emit.conjugate(&px).sign {
++            g.z_bits[q] = true; // anticommutes with X_q  <=>  has a Z component
++        }
++        let mut pz = PauliString::identity(n_qubits);
++        pz.z_bits[q] = true;
++        if t_true.conjugate(&pz).sign != t_emit.conjugate(&pz).sign {
++            g.x_bits[q] = true; // anticommutes with Z_q  <=>  has an X component
++        }
++    }
++    g
++}
++
+ fn to_trans_cliffords(gates: &[QasmGate], n_qubits: usize) -> Vec<TransClifford> {
+     gates.iter().filter_map(|g| TransClifford::from_qasm_gate(g, n_qubits)).collect()
+ }
+@@ -658,11 +1144,89 @@ fn transpile(n_qubits: usize, gates: &[QasmGate], max_weight: i32) -> Vec<TransI
+ /// `defer_trailing` holds back each qubit's trailing single-qubit Clifford run at every flush.
+ /// It is orthogonal to the weight threshold and reduces predicted depth by up to 32%, since
+ /// S/SX gates span 3 logical cycles apiece and buy no width.
++#[cfg(test)]
+ fn transpile_full(
+     n_qubits: usize, gates: &[QasmGate], max_weight: i32, defer_trailing: bool,
++) -> Vec<TransItem> {
++    transpile_opts(n_qubits, gates, max_weight, defer_trailing, ResetMode::Frame)
++}
++
++/// Pays off the Pauli the frame owes physical qubit `q`, returning it as an [`Event::Fix`].
++///
++/// After this, `q` carries no frame, which is what lets a *conditional* gate on `q` be a plain
++/// physical operation: a conditional Clifford would otherwise conjugate the owed Pauli only when
++/// its condition holds, and that makes the frame depend on outcomes through an AND.
++fn pay_frame(frame: &mut PauliFrame, q: usize) -> Option<Event> {
++    let mut x: Vec<usize> = std::mem::take(&mut frame.dx[q]).into_iter().collect();
++    let mut z: Vec<usize> = std::mem::take(&mut frame.dz[q]).into_iter().collect();
++    let x_const = take_const(&mut x);
++    let z_const = take_const(&mut z);
++    if x.is_empty() && z.is_empty() && !x_const && !z_const {
++        return None;
++    }
++    Some(Event::Fix { qubit: q, x_deps: x, x_const, z_deps: z, z_const })
++}
++
++/// The outcome id that stands for "every term of `cond` holds".
++///
++/// A single positive term is just that measurement's outcome. Otherwise a fresh derived
++/// outcome is defined (an [`Event::Derived`]), so a Pauli under this condition remains a linear
++/// frame term: `P^(AND of terms)` is `P` owed whenever the derived bit is 1.
++fn derived_outcome(
++    cond: &[(usize, bool)], next: &mut usize, defs: &mut HashMap<usize, Vec<(usize, bool)>>,
++    ops: &mut Vec<TransItem>,
++) -> usize {
++    if let [(m, true)] = cond {
++        return *m;
++    }
++    let id = DERIVED_BASE + *next;
++    *next += 1;
++    defs.insert(id, cond.to_vec());
++    ops.push(TransItem::Event(Event::Derived { id, terms: cond.to_vec() }));
++    id
++}
++
++/// The real measurement ids behind `ids`: derived outcomes expand to their terms' measurements,
++/// and the constant pseudo-outcome is dropped.
++fn real_outcomes(ids: &[usize], defs: &HashMap<usize, Vec<(usize, bool)>>) -> BTreeSet<usize> {
++    let mut out = BTreeSet::new();
++    for &id in ids {
++        if id == CONST_OUTCOME {
++            continue;
++        }
++        match defs.get(&id) {
++            Some(terms) => out.extend(terms.iter().map(|&(m, _)| m)),
++            None => {
++                out.insert(id);
++            }
++        }
++    }
++    out
++}
++
++/// [`transpile_full`] with an explicit [`ResetMode`] for mid-circuit `reset`s.
++///
++/// Mid-circuit measurement needs no special treatment in the Heisenberg picture used here: a
++/// measurement of `Z_q` is the product `C^dagger Z_q C` emitted in program order, exactly like a
++/// final measurement. What dynamic circuits add is classical bookkeeping:
++///   * every `M` product gets an outcome id (`PauliMeta::meas_id`);
++///   * a `reset` is that measurement plus the correction `X_q^outcome`, which is owed to the
++///     physical state and so enters the classical [`PauliFrame`] instead of the schedule;
++///   * a conditional Pauli (`if(c==v) x q[i];`) is the same kind of frame update;
++///   * each later `T`/`M` product records which outcomes flip its sign (`frame_deps`);
++///   * a Pauli conditioned on several bits is still a frame term, on a *derived* AND outcome;
++///   * any other conditional gate (`if(c==1) h|s|sx|t ...`) is physical: pending Cliffords are
++///     flushed, the qubit's owed Pauli is paid ([`Event::Fix`]), and the gate is emitted as
++///     ordinary products tagged with their condition and the measurements they wait for.
++fn transpile_opts(
++    n_qubits: usize, gates: &[QasmGate], max_weight: i32, defer_trailing: bool,
++    reset_mode: ResetMode,
+ ) -> Vec<TransItem> {
+     let effective_max_weight = if max_weight <= 0 { n_qubits + 1 } else { max_weight as usize };
+ 
++    let resolved = resolve_static_conditions(gates);
++    let gates = &resolved[..];
++
+     let mut tableau = Tableau::new(n_qubits);
+     let mut ops: Vec<TransItem> = Vec::new();
+     let mut clifford_queue: Vec<QasmGate> = Vec::new();
+@@ -672,23 +1236,46 @@ fn transpile_full(
+         eprintln!("Warning: circuit has no T gates");
+     }
+ 
+-    // Append Z-basis measurements for any qubit not already measured.
++    // Append a final Z-basis measurement to every qubit whose last operation is not already a
++    // measurement or a reset. (A qubit measured mid-circuit and then reused still needs one; a
++    // qubit left in |0> by a trailing reset does not.)
+     let mut gates_with_measurements = gates.to_vec();
+-    let measured: Vec<bool> = {
+-        let mut m = vec![false; n_qubits];
+-        for g in gates {
+-            if let QasmGate::Measure { qubit } = g {
+-                m[*qubit] = true;
++    let mut ends_measured = vec![false; n_qubits];
++    for g in gates {
++        match g {
++            QasmGate::Measure { qubit, .. } | QasmGate::Reset { qubit } => {
++                ends_measured[*qubit] = true
++            }
++            // A conditional Pauli is a frame update, not a physical gate: it neither needs a final
++            // measurement after it nor cancels one that already happened.
++            QasmGate::CondPauli { .. } => {}
++            // ... and neither is a Pauli conditioned on several bits.
++            QasmGate::CondGate { inner, .. }
++                if matches!(
++                    inner.as_ref(),
++                    QasmGate::Clifford1Q { gate: Gate1Q::X | Gate1Q::Y | Gate1Q::Z, .. }
++                ) => {}
++            other => {
++                for q in other.qubits() {
++                    ends_measured[q] = false;
++                }
+             }
+         }
+-        m
+-    };
+-    for (q, &has_m) in measured.iter().enumerate() {
+-        if !has_m {
+-            gates_with_measurements.push(QasmGate::Measure { qubit: q });
++    }
++    for (q, &done) in ends_measured.iter().enumerate() {
++        if !done {
++            gates_with_measurements.push(QasmGate::Measure { qubit: q, clbit: None });
+         }
+     }
+ 
++    let mut frame = PauliFrame::new(n_qubits);
++    let mut next_meas_id = 0usize;
++    // Latest outcome stored in each classical bit.
++    let mut clbit_meas: HashMap<usize, usize> = HashMap::new();
++    // Derived (AND) outcomes: next index, and each one's terms.
++    let mut next_derived = 0usize;
++    let mut derived_defs: HashMap<usize, Vec<(usize, bool)>> = HashMap::new();
++
+     let mut last_weight: Option<usize> = None;
+     let mut layers = LayerModel::new(n_qubits);
+ 
+@@ -701,13 +1288,20 @@ fn transpile_full(
+     /// `optimize_single_qubit_sequence` can collapse the combined run.
+     fn flush_clifford_queue(
+         clifford_queue: &mut Vec<QasmGate>, ops: &mut Vec<TransItem>, tableau: &mut Tableau,
+-        layers: &mut LayerModel, n_qubits: usize, defer_trailing: bool,
++        layers: &mut LayerModel, frame: &mut PauliFrame, n_qubits: usize, defer_trailing: bool,
+     ) {
+         let (emitted, residual) = split_trailing_1q(clifford_queue, n_qubits);
+         let mut to_emit = emitted;
+         if !defer_trailing {
+             to_emit.extend(residual.iter().cloned());
+         }
++        // The emitted gates become physical, which changes the coordinates products are written
++        // in, so the classical frame (kept in those coordinates) is pushed through them.
++        for g in &to_emit {
++            frame.conj_gate(g);
++        }
++        // ...and the Pauli the emitted gates are missing joins it as a constant term.
++        frame.add(&dropped_pauli(&to_emit, n_qubits), CONST_OUTCOME);
+         for c in to_trans_cliffords(&to_emit, n_qubits) {
+             let (qubits, cost) = clifford_support(&c);
+             layers.place(&qubits, cost);
+@@ -719,13 +1313,9 @@ fn transpile_full(
+ 
+     for gate in &gates_with_measurements {
+         match gate {
+-            QasmGate::Clifford1Q { gate: g, qubit } => {
+-                clifford_queue.push(gate.clone());
+-                tableau.prepend_1q_correct(*g, *qubit);
+-            }
+-            QasmGate::Clifford2Q { gate: g, control, target } => {
++            QasmGate::Clifford1Q { .. } | QasmGate::Clifford2Q { .. } => {
+                 clifford_queue.push(gate.clone());
+-                tableau.prepend_2q(*g, *control, *target);
++                push_clifford(&mut tableau, gate);
+             }
+             QasmGate::T { qubit } | QasmGate::Tdg { qubit } => {
+                 // Tdg uses a negative-sign Z Pauli (−Z rotation).
+@@ -735,25 +1325,28 @@ fn transpile_full(
+                 let weight = conjugated.weight();
+                 last_weight = Some(weight);
+                 let flush = weight > effective_max_weight;
+-                let emitted = if flush {
++                let ps = if flush {
+                     flush_clifford_queue(
+                         &mut clifford_queue,
+                         &mut ops,
+                         &mut tableau,
+                         &mut layers,
++                        &mut frame,
+                         n_qubits,
+                         defer_trailing,
+                     );
+-                    let conjugated = tableau.conjugate(&make_z_pauli(n_qubits, *qubit, negative));
+-                    TransPauli::from_pauli_string(&conjugated, "T")
++                    tableau.conjugate(&make_z_pauli(n_qubits, *qubit, negative))
+                 } else {
+-                    TransPauli::from_pauli_string(&conjugated, "T")
++                    conjugated
+                 };
++                let mut emitted = TransPauli::from_pauli_string(&ps, "T");
++                emitted.apply_frame(frame.deps(&ps));
+                 layers.place(&pauli_support(&emitted), LAYER_COST_T);
+                 ops.push(TransItem::Pauli(emitted));
+             }
+-            QasmGate::Measure { qubit } => {
+-                if last_weight.is_none() {
++            QasmGate::Measure { qubit, .. } | QasmGate::Reset { qubit } => {
++                let is_reset = matches!(gate, QasmGate::Reset { .. });
++                if last_weight.is_none() && !is_reset {
+                     eprintln!("Warning: measurement on qubit {} before any T gate", qubit);
+                 }
+                 let pre_pauli = make_z_pauli(n_qubits, *qubit, false);
+@@ -764,23 +1357,166 @@ fn transpile_full(
+                 // either, and that is sound because every qubit gets an appended measurement
+                 // whose Pauli is conjugated through the tableau, so the queued Cliffords' effect
+                 // is already captured in the measurement basis.
+-                let should_flush = last_weight.map_or(false, |w| w > effective_max_weight);
+-                let emitted = if should_flush {
++                // `--reset_mode flush|init` additionally flushes at every reset, which makes the
++                // measurement weight 1 and leaves the qubit with an identity tableau row.
++                let force_flush = is_reset && reset_mode != ResetMode::Frame;
++                let should_flush =
++                    force_flush || last_weight.map_or(false, |w| w > effective_max_weight);
++                let ps = if should_flush {
+                     flush_clifford_queue(
+                         &mut clifford_queue,
+                         &mut ops,
+                         &mut tableau,
+                         &mut layers,
++                        &mut frame,
+                         n_qubits,
+                         false,
+                     );
+-                    let fresh_pauli = make_z_pauli(n_qubits, *qubit, false);
+-                    TransPauli::from_pauli_string(&fresh_pauli, "M")
++                    make_z_pauli(n_qubits, *qubit, false)
+                 } else {
+-                    TransPauli::from_pauli_string(&conjugated, "M")
++                    conjugated
+                 };
++                let mut emitted = TransPauli::from_pauli_string(&ps, "M");
++                emitted.apply_frame(frame.deps(&ps));
++                let id = next_meas_id;
++                next_meas_id += 1;
++                emitted.meta.meas_id = Some(id);
++                emitted.meta.logical_qubit = Some(*qubit);
++                emitted.meta.is_reset = is_reset;
++                if let QasmGate::Measure { clbit: Some(c), .. } = gate {
++                    emitted.meta.clbit = Some(*c);
++                    clbit_meas.insert(*c, id);
++                }
+                 layers.place(&pauli_support(&emitted), LAYER_COST_M);
+                 ops.push(TransItem::Pauli(emitted));
++
++                if is_reset {
++                    // The qubit now holds |outcome>; to make it |0> the state is owed X_q^outcome.
++                    // That is a classical correction, so it joins the frame (written in the
++                    // physical coordinates the tableau currently defines).
++                    if reset_mode != ResetMode::Init {
++                        let mut x_q = PauliString::identity(n_qubits);
++                        x_q.x_bits[*qubit] = true;
++                        frame.add(&tableau.conjugate(&x_q), id);
++                    } else {
++                        // Physically re-initialising the patch replaces the frame's correction:
++                        // the flush made this patch exactly qubit `q`, so whatever Pauli was owed
++                        // to it is gone along with the old state.
++                        frame.dx[*qubit].clear();
++                        frame.dz[*qubit].clear();
++                    }
++                    if reset_mode == ResetMode::Init {
++                        // The flush above made the tableau the identity, so the patch holds
++                        // this qubit alone and can be re-initialized without touching others.
++                        let r = TransPauli::from_pauli_string(
++                            &make_z_pauli(n_qubits, *qubit, false),
++                            "R",
++                        );
++                        layers.place(&pauli_support(&r), LAYER_COST_M);
++                        ops.push(TransItem::Pauli(r));
++                    }
++                }
++            }
++            QasmGate::CondPauli { gate: g, qubit, clbit, value } => {
++                // An outcome of 1 owes the state the Pauli; an outcome of 0 owes it nothing.
++                // `if(c==0)` is therefore the unconditional Pauli followed by `if(c==1)`.
++                // A bit no measurement has written yet reads as 0.
++                let m = clbit_meas.get(clbit).copied();
++                if !*value {
++                    let pauli = QasmGate::Clifford1Q { gate: *g, qubit: *qubit };
++                    push_clifford(&mut tableau, &pauli);
++                    clifford_queue.push(pauli);
++                }
++                if let Some(m) = m {
++                    let mut p = PauliString::identity(n_qubits);
++                    p.x_bits[*qubit] = matches!(g, Gate1Q::X | Gate1Q::Y);
++                    p.z_bits[*qubit] = matches!(g, Gate1Q::Z | Gate1Q::Y);
++                    frame.add(&tableau.conjugate(&p), m);
++                }
++            }
++            QasmGate::CondGate { inner, terms } => {
++                // `resolve_static_conditions` left only terms whose bit an earlier measurement
++                // wrote, so each names a real outcome.
++                let mut cond: Vec<(usize, bool)> = terms
++                    .iter()
++                    .map(|(cb, v)| (clbit_meas[cb], *v))
++                    .collect();
++                cond.sort_unstable();
++                cond.dedup();
++                let q = inner.qubits()[0];
++                match inner.as_ref() {
++                    QasmGate::Clifford1Q { gate: g, .. }
++                        if matches!(g, Gate1Q::X | Gate1Q::Y | Gate1Q::Z) =>
++                    {
++                        // A Pauli under an AND of outcomes: a linear frame term on a derived bit.
++                        let id = derived_outcome(&cond, &mut next_derived, &mut derived_defs, &mut ops);
++                        let mut p = PauliString::identity(n_qubits);
++                        p.x_bits[q] = matches!(g, Gate1Q::X | Gate1Q::Y);
++                        p.z_bits[q] = matches!(g, Gate1Q::Z | Gate1Q::Y);
++                        frame.add(&tableau.conjugate(&p), id);
++                    }
++                    _ => {
++                        // A physical conditional gate. Flush so logical qubit q is exactly one
++                        // physical patch, then settle the frame on q so that the gate sees none.
++                        flush_clifford_queue(
++                            &mut clifford_queue,
++                            &mut ops,
++                            &mut tableau,
++                            &mut layers,
++                            &mut frame,
++                            n_qubits,
++                            false,
++                        );
++                        let mut needs: BTreeSet<usize> = cond.iter().map(|&(m, _)| m).collect();
++                        if let Some(fix) = pay_frame(&mut frame, q) {
++                            if let Event::Fix { x_deps, z_deps, .. } = &fix {
++                                let all: Vec<usize> =
++                                    x_deps.iter().chain(z_deps.iter()).copied().collect();
++                                needs.extend(real_outcomes(&all, &derived_defs));
++                            }
++                            ops.push(TransItem::Event(fix));
++                        }
++                        let needs: Vec<usize> = needs.into_iter().collect();
++                        match inner.as_ref() {
++                            QasmGate::T { .. } | QasmGate::Tdg { .. } => {
++                                let negative = matches!(inner.as_ref(), QasmGate::Tdg { .. });
++                                let ps = make_z_pauli(n_qubits, q, negative);
++                                let mut emitted = TransPauli::from_pauli_string(&ps, "T");
++                                emitted.apply_frame(frame.deps(&ps));
++                                emitted.meta.cond = cond.clone();
++                                emitted.meta.needs = needs;
++                                layers.place(&pauli_support(&emitted), LAYER_COST_T);
++                                ops.push(TransItem::Pauli(emitted));
++                            }
++                            QasmGate::Clifford1Q { gate: g, qubit } => {
++                                // The lookup may realise the gate with X/Z, which are never
++                                // emitted; whatever Pauli is missing is owed only if the gate ran.
++                                let seq: Vec<QasmGate> = optimize_single_qubit_sequence(&[*g])
++                                    .into_iter()
++                                    .map(|gg| QasmGate::Clifford1Q { gate: gg, qubit: *qubit })
++                                    .collect();
++                                let owed = dropped_pauli(&seq, n_qubits);
++                                for mut c in to_trans_cliffords(&seq, n_qubits) {
++                                    c.meta.cond = cond.clone();
++                                    c.meta.needs = needs.clone();
++                                    let (qubits, cost) = clifford_support(&c);
++                                    layers.place(&qubits, cost);
++                                    ops.push(TransItem::Clifford(c));
++                                }
++                                if owed.weight() > 0 {
++                                    let id = derived_outcome(
++                                        &cond,
++                                        &mut next_derived,
++                                        &mut derived_defs,
++                                        &mut ops,
++                                    );
++                                    frame.add(&owed, id);
++                                }
++                            }
++                            other => unreachable!("conditional {:?} is not a single-qubit gate", other),
++                        }
++                    }
++                }
+             }
+             QasmGate::Barrier => {}
+         }
+@@ -806,6 +1542,7 @@ fn predicted_depth(items: &[TransItem], n_qubits: usize) -> usize {
+                 (pauli_support(p), if p.label == "M" { LAYER_COST_M } else { LAYER_COST_T })
+             }
+             TransItem::Clifford(c) => clifford_support(c),
++            TransItem::Event(_) => continue,
+         };
+         layers.place(&qubits, cost);
+     }
+@@ -824,10 +1561,12 @@ const CANDIDATE_WEIGHTS: [i32; 2] = [0, 1];
+ /// Predicted depth is cheap to evaluate in-process and tracks scheduling well, so selecting
+ /// between whole transpilations replaces the external `max_width` sweep and the hand-maintained
+ /// table of per-circuit best weights.
+-fn transpile_best(n_qubits: usize, gates: &[QasmGate]) -> (Vec<TransItem>, i32) {
++fn transpile_best(
++    n_qubits: usize, gates: &[QasmGate], reset_mode: ResetMode,
++) -> (Vec<TransItem>, i32) {
+     let mut best: Option<(Vec<TransItem>, i32, usize)> = None;
+     for max_weight in CANDIDATE_WEIGHTS {
+-        let items = transpile_full(n_qubits, gates, max_weight, true);
++        let items = transpile_opts(n_qubits, gates, max_weight, true, reset_mode);
+         let depth = predicted_depth(&items, n_qubits);
+         println!("  candidate max_width {:<3} predicted depth {}", max_weight, depth);
+         if best.as_ref().is_none_or(|(_, _, d)| depth < *d) {
+@@ -845,24 +1584,163 @@ fn write_trans(output_path: &str, items: &[TransItem]) -> io::Result<(usize, usi
+     let mut n_ts = 0usize;
+     let mut n_cliffords = 0usize;
+ 
++    // Line index of each measurement product: a product that needs an outcome lists that line as
++    // `@line`, which the scheduler turns into a DAG edge. (Events have no line.)
++    let mut meas_line: HashMap<usize, usize> = HashMap::new();
++    let mut line = 0usize;
+     for item in items {
+         match item {
+             TransItem::Pauli(p) => {
+-                writeln!(writer, "{}", p)?;
++                if let Some(id) = p.meta.meas_id {
++                    meas_line.insert(id, line);
++                }
++                line += 1;
++            }
++            TransItem::Clifford(_) => line += 1,
++            TransItem::Event(_) => {}
++        }
++    }
++
++    for item in items {
++        let needs = match item {
++            TransItem::Pauli(p) => {
+                 if p.label == "T" {
+                     n_ts += 1;
+                 }
++                &p.meta.needs
+             }
+             TransItem::Clifford(c) => {
+-                writeln!(writer, "{}", c)?;
+                 n_cliffords += 1;
++                &c.meta.needs
+             }
++            TransItem::Event(_) => continue,
++        };
++        write!(writer, "{}", item)?;
++        if !needs.is_empty() {
++            let mut lines: Vec<usize> = needs
++                .iter()
++                .map(|m| *meas_line.get(m).expect("a needed outcome comes from an emitted M"))
++                .collect();
++            lines.sort_unstable();
++            lines.dedup();
++            let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
++            write!(writer, "@{}", lines.join(","))?;
+         }
++        writeln!(writer)?;
+     }
+ 
+     Ok((n_ts, n_cliffords))
+ }
+ 
++/// True when the circuit has any classical dependence: a reset, a conditional Pauli, or a
++/// measurement that stores its outcome.
++fn is_dynamic(gates: &[QasmGate]) -> bool {
++    gates.iter().any(|g| {
++        matches!(
++            g,
++            QasmGate::Reset { .. }
++                | QasmGate::CondPauli { .. }
++                | QasmGate::CondGate { .. }
++                | QasmGate::Measure { clbit: Some(_), .. }
++        )
++    })
++}
++
++fn json_usize_list(v: &[usize]) -> String {
++    let parts: Vec<String> = v.iter().map(|x| x.to_string()).collect();
++    format!("[{}]", parts.join(","))
++}
++
++fn json_terms(t: &[(usize, bool)]) -> String {
++    let parts: Vec<String> = t.iter().map(|&(m, v)| format!("[{},{}]", m, v as u8)).collect();
++    format!("[{}]", parts.join(","))
++}
++
++/// Writes the classical sidecar (version 2). Everything a downstream executor needs beyond the
++/// `.trans` lines themselves:
++///
++///   * `products`: one record per `.trans` line, in file order (the line index is the product id
++///     the scheduler assigns, because the transpiler never emits X/Z lines). T/M/R records carry
++///     the sign and `frame_deps`; M records also `meas_id`, `logical_qubit`, `clbit`,
++///     `is_reset`. A record of a *conditional* product also has `cond` (it runs only if every
++///     `[outcome, value]` holds) and `needs` (the outcomes it waits for, i.e. its `@` edges).
++///   * `events`: software-only actions with no line, each `before` the line of that index.
++///     `fix` physically applies the Pauli the frame owed a qubit.
++///   * `derived`: pseudo-outcomes, each the AND of `terms`, usable in any `frame_deps`.
++///
++/// Hand-rolled JSON keeps the crate free of a serde dependency.
++fn write_sidecar(
++    path: &str, n_qubits: usize, mode: ResetMode, items: &[TransItem],
++) -> io::Result<()> {
++    let mut w = BufWriter::new(File::create(path)?);
++    let mode = match mode {
++        ResetMode::Frame => "frame",
++        ResetMode::Flush => "flush",
++        ResetMode::Init => "init",
++    };
++    let cond_fields = |m: &PauliMeta| -> String {
++        if m.cond.is_empty() {
++            String::new()
++        } else {
++            format!(",\"cond\":{},\"needs\":{}", json_terms(&m.cond), json_usize_list(&m.needs))
++        }
++    };
++    let (mut products, mut events, mut derived) = (Vec::new(), Vec::new(), Vec::new());
++    let mut line = 0usize;
++    for item in items {
++        match item {
++            TransItem::Clifford(c) => {
++                products
++                    .push(format!("{{\"i\":{},\"label\":\"C\"{}}}", line, cond_fields(&c.meta)));
++                line += 1;
++            }
++            TransItem::Pauli(p) => {
++                let m = &p.meta;
++                let opt = |o: Option<usize>| o.map_or("null".to_string(), |v| v.to_string());
++                products.push(format!(
++                    "{{\"i\":{},\"label\":\"{}\",\"sign\":\"{}\",\"frame_deps\":{},\"meas_id\":{},\
++                     \"logical_qubit\":{},\"clbit\":{},\"is_reset\":{}{}}}",
++                    line,
++                    p.label,
++                    p.sign,
++                    json_usize_list(&m.frame_deps),
++                    opt(m.meas_id),
++                    opt(m.logical_qubit),
++                    opt(m.clbit),
++                    m.is_reset,
++                    cond_fields(m)
++                ));
++                line += 1;
++            }
++            TransItem::Event(Event::Fix { qubit, x_deps, x_const, z_deps, z_const }) => {
++                events.push(format!(
++                    "{{\"before\":{},\"op\":\"fix\",\"qubit\":{},\"x_deps\":{},\"x_const\":{},\
++                     \"z_deps\":{},\"z_const\":{}}}",
++                    line,
++                    qubit,
++                    json_usize_list(x_deps),
++                    x_const,
++                    json_usize_list(z_deps),
++                    z_const
++                ));
++            }
++            TransItem::Event(Event::Derived { id, terms }) => {
++                derived.push(format!("{{\"id\":{},\"terms\":{}}}", id, json_terms(terms)));
++            }
++        }
++    }
++    writeln!(
++        w,
++        "{{\"version\":2,\"n_qubits\":{},\"reset_mode\":\"{}\",\"products\":[\n{}\n],\"events\":[\n{}\n],\"derived\":[\n{}\n]}}",
++        n_qubits,
++        mode,
++        products.join(",\n"),
++        events.join(",\n"),
++        derived.join(",\n")
++    )?;
++    Ok(())
++}
++
+ fn count_stats(items: &[TransItem]) -> (usize, usize, usize, f64) {
+     let n_cliffords = items.iter().filter(|i| matches!(i, TransItem::Clifford(_))).count();
+     let pps: Vec<&TransPauli> = items
+@@ -883,7 +1761,8 @@ fn count_stats(items: &[TransItem]) -> (usize, usize, usize, f64) {
+     } else {
+         0.0
+     };
+-    (n_cliffords, n_pps, items.len(), avg_weight)
++    let n_lines = items.iter().filter(|i| !matches!(i, TransItem::Event(_))).count();
++    (n_cliffords, n_pps, n_lines, avg_weight)
+ }
+ 
+ fn main() -> Result<(), Box<dyn std::error::Error>> {
+@@ -921,6 +1800,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+             QasmGate::T { .. } => "T".to_string(),
+             QasmGate::Tdg { .. } => "Tdg".to_string(),
+             QasmGate::Measure { .. } => "Measure".to_string(),
++            QasmGate::Reset { .. } => "Reset".to_string(),
++            QasmGate::CondPauli { gate, .. } => format!("if-{:?}", gate),
++            QasmGate::CondGate { inner, .. } => match inner.as_ref() {
++                QasmGate::Clifford1Q { gate, .. } => format!("if-{:?}", gate),
++                QasmGate::T { .. } => "if-T".to_string(),
++                QasmGate::Tdg { .. } => "if-Tdg".to_string(),
++                _ => "if-?".to_string(),
++            },
+             QasmGate::Barrier => continue,
+         };
+         gate_names.insert(name);
+@@ -935,9 +1822,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+ 
+     let _tableau_timer = Timer::new("tableau");
+     let items = if args.auto {
+-        transpile_best(n_qubits, &gates).0
++        transpile_best(n_qubits, &gates, args.reset_mode).0
+     } else {
+-        transpile_full(n_qubits, &gates, args.max_width, args.defer_trailing)
++        transpile_opts(n_qubits, &gates, args.max_width, args.defer_trailing, args.reset_mode)
+     };
+     drop(_tableau_timer);
+ 
+@@ -998,6 +1885,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+     println!("Wrote transpiled circuit to {}", output_path);
+     println!("Wrote {} T gates and {} Cliffords", n_ts, n_cliffords_written);
+ 
++    // Dynamic circuits (reset / classical feed-forward) also get the classical sidecar. The
++    // scheduler never reads it; it exists so an executor or `validate_dynamic.py` can recover the
++    // true measurement outcomes and the sign of every rotation.
++    if args.sidecar || is_dynamic(&gates) {
++        let sidecar_path = format!("{}.dyn.json", output_path);
++        write_sidecar(&sidecar_path, n_qubits, args.reset_mode, &items)?;
++        let n_meas = items
++            .iter()
++            .filter(|i| matches!(i, TransItem::Pauli(p) if p.meta.meas_id.is_some()))
++            .count();
++        println!("Wrote classical sidecar ({} measurement outcomes) to {}", n_meas, sidecar_path);
++    }
++
+     Ok(())
+ }
+ 
+@@ -1167,13 +2067,15 @@ mod tests {
+                 sign: Sign::Plus,
+                 ops: vec!['Z', 'I'],
+                 label: "T".to_string(),
++                meta: PauliMeta::default(),
+             }),
+             TransItem::Pauli(TransPauli {
+                 sign: Sign::Plus,
+                 ops: vec!['Z', 'Z'],
+                 label: "T".to_string(),
++                meta: PauliMeta::default(),
+             }),
+-            TransItem::Clifford(TransClifford { ops: vec!['Z', '_'], name: "S".to_string() }),
++            TransItem::Clifford(TransClifford { ops: vec!['Z', '_'], name: "S".to_string(), meta: PauliMeta::default() }),
+         ];
+         let (n_cliffords, n_paulis, tot, avg_weight) = count_stats(&items);
+         assert_eq!(n_cliffords, 1);
+@@ -1185,8 +2087,8 @@ mod tests {
+     #[test]
+     fn count_stats_all_cliffords() {
+         let items = vec![
+-            TransItem::Clifford(TransClifford { ops: vec!['X', '_'], name: "CX".to_string() }),
+-            TransItem::Clifford(TransClifford { ops: vec!['Z', '_'], name: "S".to_string() }),
++            TransItem::Clifford(TransClifford { ops: vec!['X', '_'], name: "CX".to_string(), meta: PauliMeta::default() }),
++            TransItem::Clifford(TransClifford { ops: vec!['Z', '_'], name: "S".to_string(), meta: PauliMeta::default() }),
+         ];
+         let (n_cliffords, n_paulis, tot, _avg_weight) = count_stats(&items);
+         assert_eq!(n_cliffords, 2);
+@@ -1287,11 +2189,15 @@ mod tests {
+     /// Reference layer count: rebuilds the qubit-overlap DAG over the emitted stream and runs
+     /// Kahn's algorithm, exactly as `Circuit::gen_deps` + `Circuit::compute_layers` do.
+     fn layers_via_kahn(items: &[TransItem], n_qubits: usize) -> usize {
++        // Events are not scheduled products, so they have no place in the DAG.
++        let items: Vec<&TransItem> =
++            items.iter().filter(|i| !matches!(i, TransItem::Event(_))).collect();
+         let supports: Vec<Vec<usize>> = items
+             .iter()
+             .map(|i| match i {
+                 TransItem::Pauli(p) => pauli_support(p),
+                 TransItem::Clifford(c) => clifford_support(c).0,
++                TransItem::Event(_) => unreachable!(),
+             })
+             .collect();
+         let mut parents: Vec<Vec<usize>> = vec![Vec::new(); items.len()];
+@@ -1333,6 +2239,7 @@ mod tests {
+             let support = match item {
+                 TransItem::Pauli(p) => pauli_support(p),
+                 TransItem::Clifford(c) => clifford_support(c).0,
++                TransItem::Event(_) => continue,
+             };
+             max_layer = max_layer.max(lm.place(&support, 1));
+         }
+@@ -1434,6 +2341,46 @@ mod tests {
+         })
+     }
+ 
++    /// The single-qubit lookup (`apply_1q_to_state`) and the tableau must agree on every gate's
++    /// action on X, Y and Z, signs included. The lookup once had the Y rows of SX/SXdg flipped,
++    /// which only changed signs (invisible to the scheduler) but corrupted outcome bits.
++    #[test]
++    fn single_qubit_lookup_rules_agree_with_tableau() {
++        let code = |ps: &PauliString| pauli_code(
++            match (ps.x_bits[0], ps.z_bits[0]) {
++                (true, false) => 0,
++                (true, true) => 1,
++                _ => 2,
++            },
++            ps.sign,
++        );
++        for g in [Gate1Q::H, Gate1Q::S, Gate1Q::Sdg, Gate1Q::SX, Gate1Q::SXdg,
++                  Gate1Q::X, Gate1Q::Y, Gate1Q::Z] {
++            let mut t = Tableau::new(1);
++            t.prepend_1q_correct(g, 0);
++            let mut x = PauliString::identity(1);
++            x.x_bits[0] = true;
++            let mut z = PauliString::identity(1);
++            z.z_bits[0] = true;
++            let mut y = PauliString::identity(1);
++            y.x_bits[0] = true;
++            y.z_bits[0] = true;
++            // The lookup is applied to arbitrary signed Paulis, so feed it each one in turn.
++            let from_table = |p: u8| apply_1q_to_state(g, p, p).0;
++            assert_eq!(from_table(pauli_code(0, false)), code(&t.conjugate(&x)), "{:?} on X", g);
++            assert_eq!(from_table(pauli_code(2, false)), code(&t.conjugate(&z)), "{:?} on Z", g);
++            let y_img = t.conjugate(&y);
++            // Y carries a sign convention of its own (Y = iXZ), so compare the unsigned part and
++            // the sign through the group law: image(Y) = i * image(X) * image(Z).
++            let (ix, iz) = (t.conjugate(&x), t.conjugate(&z));
++            let prod = PauliString::identity(1).mul_with_y_phase(&ix, &iz);
++            assert_eq!(y_img.x_bits, prod.x_bits, "{:?} on Y (support)", g);
++            assert_eq!(y_img.z_bits, prod.z_bits, "{:?} on Y (support)", g);
++            assert_eq!(y_img.sign, prod.sign, "{:?} on Y (group law)", g);
++            assert_eq!(from_table(pauli_code(1, false)), code(&y_img), "{:?} on Y", g);
++        }
++    }
++
+     #[test]
+     fn predicted_depth_matches_kahn_when_every_product_spans_one_layer() {
+         // T and M products span a single layer each, so with no Cliffords emitted the scorer must
+@@ -1467,7 +2414,7 @@ mod tests {
+         for _ in 0..8 {
+             gates.push(QasmGate::T { qubit: 1 });
+         }
+-        let (best, _) = transpile_best(2, &gates);
++        let (best, _) = transpile_best(2, &gates, ResetMode::Frame);
+         let best_depth = predicted_depth(&best, 2);
+         for w in CANDIDATE_WEIGHTS {
+             let candidate = transpile_full(2, &gates, w, true);
+@@ -1475,6 +2422,181 @@ mod tests {
+         }
+     }
+ 
++    // ---- conditional gates -------------------------------------------------------------
++
++    fn parse_lines(lines: &[&str]) -> (usize, Vec<QasmGate>) {
++        let f = write_qasm(lines);
++        parse_qasm(&f.path().to_string_lossy()).unwrap()
++    }
++
++    fn items_text(items: &[TransItem]) -> String {
++        let f = tempfile::NamedTempFile::new().unwrap();
++        let path = f.path().to_string_lossy().to_string();
++        write_trans(&path, items).unwrap();
++        std::fs::read_to_string(path).unwrap()
++    }
++
++    #[test]
++    fn parse_conditionals_classify_by_gate_and_term_count() {
++        let (_, gates) = parse_lines(&[
++            "qreg q[2];",
++            "creg a[1];",
++            "creg b[1];",
++            "measure q[0] -> a[0];",
++            "measure q[1] -> b[0];",
++            "if(a==1) h q[0];",
++            "if(a==1 && b==0) t q[1];",
++            "if(a==1 && b==1) x q[0];",
++            "if(a==1) z q[0];",
++        ]);
++        let cond_h = gates.iter().filter(|g| matches!(g,
++            QasmGate::CondGate { inner, terms } if terms.len() == 1
++                && matches!(**inner, QasmGate::Clifford1Q { gate: Gate1Q::H, .. }))).count();
++        let cond_t2 = gates.iter().filter(|g| matches!(g,
++            QasmGate::CondGate { inner, terms } if terms.len() == 2
++                && matches!(**inner, QasmGate::T { .. }))).count();
++        let cond_x2 = gates.iter().filter(|g| matches!(g,
++            QasmGate::CondGate { inner, terms } if terms.len() == 2
++                && matches!(**inner, QasmGate::Clifford1Q { gate: Gate1Q::X, .. }))).count();
++        let cond_z1 = gates.iter().filter(|g| matches!(g,
++            QasmGate::CondPauli { gate: Gate1Q::Z, value: true, .. })).count();
++        assert_eq!((cond_h, cond_t2, cond_x2, cond_z1), (1, 1, 1, 1));
++    }
++
++    #[test]
++    fn parse_conditional_rejects_what_it_cannot_express() {
++        for (bad, why) in [
++            ("if(c==1) cx q[0], q[1];", "single-qubit"),
++            ("if(c==2) h q[0];", "not 0 or 1"),
++            ("if(w==1) h q[0];", "more than one bit"),
++            ("if(c) h q[0];", "creg==value"),
++        ] {
++            let f = write_qasm(&["qreg q[2];", "creg c[1];", "creg w[2];", bad]);
++            let err = parse_qasm(&f.path().to_string_lossy()).unwrap_err().to_string();
++            assert!(err.contains(why), "`{}` should fail with `{}`, got: {}", bad, why, err);
++        }
++    }
++
++    #[test]
++    fn static_resolution_settles_conditions_on_unwritten_bits() {
++        let h = Box::new(QasmGate::Clifford1Q { gate: Gate1Q::H, qubit: 0 });
++        let cond = |terms: Vec<(usize, bool)>| QasmGate::CondGate { inner: h.clone(), terms };
++        let gates = vec![
++            cond(vec![(0, true)]),             // bit 0 unwritten: reads 0, so never runs
++            cond(vec![(0, false)]),            // ...and `==0` always holds: plain H
++            QasmGate::Measure { qubit: 1, clbit: Some(1) },
++            cond(vec![(1, true), (0, false)]), // the unwritten term drops out
++            cond(vec![(1, true), (1, false)]), // contradictory: never runs
++        ];
++        let out = resolve_static_conditions(&gates);
++        assert_eq!(out.len(), 3, "{:?}", out);
++        assert!(matches!(out[0], QasmGate::Clifford1Q { gate: Gate1Q::H, .. }));
++        assert!(matches!(out[1], QasmGate::Measure { .. }));
++        assert!(matches!(&out[2], QasmGate::CondGate { terms, .. } if terms == &vec![(1, true)]));
++    }
++
++    #[test]
++    fn conditional_clifford_is_physical_and_waits_for_its_measurement() {
++        let (n, gates) = parse_lines(&[
++            "qreg q[2];",
++            "creg m[1];",
++            "h q[1];",
++            "t q[1];",
++            "measure q[1] -> m[0];",
++            "if(m==1) s q[0];",
++            "t q[0];",
++        ]);
++        let items = transpile_opts(n, &gates, 0, false, ResetMode::Frame);
++        let conds: Vec<&TransClifford> = items
++            .iter()
++            .filter_map(|i| if let TransItem::Clifford(c) = i { Some(c) } else { None })
++            .filter(|c| !c.meta.cond.is_empty())
++            .collect();
++        assert_eq!(conds.len(), 1, "one conditional S line");
++        assert_eq!(conds[0].name, "S");
++        assert_eq!(conds[0].meta.cond, vec![(0, true)]);
++        assert_eq!(conds[0].meta.needs, vec![0]);
++        // The measurement is the first `<M>` line; the conditional S names exactly that line.
++        let text = items_text(&items);
++        let lines: Vec<&str> = text.lines().collect();
++        let m_line = lines.iter().position(|l| l.ends_with("<M>")).unwrap();
++        // An unconditional `<S>` may precede it (a flushed H), so pick the line with an edge.
++        let s_line = lines.iter().find(|l| l.contains("<S>@")).expect("a conditional S line");
++        assert!(s_line.ends_with(&format!("<S>@{}", m_line)), "{} vs M at {}", s_line, m_line);
++    }
++
++    #[test]
++    fn conditional_t_keeps_its_sign_and_condition() {
++        let (n, gates) = parse_lines(&[
++            "qreg q[2];",
++            "creg m[1];",
++            "t q[1];",
++            "measure q[1] -> m[0];",
++            "if(m==0) tdg q[0];",
++        ]);
++        let items = transpile_opts(n, &gates, 0, false, ResetMode::Frame);
++        let t: Vec<&TransPauli> = items
++            .iter()
++            .filter_map(|i| if let TransItem::Pauli(p) = i { Some(p) } else { None })
++            .filter(|p| p.label == "T" && !p.meta.cond.is_empty())
++            .collect();
++        assert_eq!(t.len(), 1);
++        assert_eq!(t[0].sign, Sign::Minus, "tdg is a negative rotation");
++        assert_eq!(t[0].meta.cond, vec![(0, false)], "`m==0` is a condition on the outcome being 0");
++    }
++
++    #[test]
++    fn pauli_on_two_bits_is_a_derived_frame_term_not_a_line() {
++        let base = &["qreg q[2];", "creg a[1];", "creg b[1];", "t q[0];", "measure q[0] -> a[0];",
++                     "t q[1];", "measure q[1] -> b[0];"];
++        let mut with = base.to_vec();
++        with.push("if(a==1 && b==0) x q[0];");
++        with.push("t q[0];");
++        let mut without = base.to_vec();
++        without.push("t q[0];");
++        let (n, g1) = parse_lines(&with);
++        let (_, g0) = parse_lines(&without);
++        let a = transpile_opts(n, &g1, 0, false, ResetMode::Frame);
++        let b = transpile_opts(n, &g0, 0, false, ResetMode::Frame);
++        let lines = |v: &[TransItem]| v.iter().filter(|i| !matches!(i, TransItem::Event(_))).count();
++        assert_eq!(lines(&a), lines(&b), "a conditional Pauli adds no scheduled product");
++        let derived: Vec<usize> = a
++            .iter()
++            .filter_map(|i| if let TransItem::Event(Event::Derived { id, .. }) = i { Some(*id) } else { None })
++            .collect();
++        assert_eq!(derived.len(), 1);
++        let used = a.iter().any(|i| matches!(i, TransItem::Pauli(p)
++            if p.meta.frame_deps.contains(&derived[0])));
++        assert!(used, "a later product's sign depends on the derived outcome");
++    }
++
++    #[test]
++    fn conditional_gate_pays_the_owed_frame_first() {
++        let (n, gates) = parse_lines(&[
++            "qreg q[1];",
++            "creg m[1];",
++            "h q[0];",
++            "t q[0];",
++            "measure q[0] -> m[0];",
++            "reset q[0];",
++            "if(m==1) s q[0];",
++            "t q[0];",
++        ]);
++        let items = transpile_opts(n, &gates, 0, false, ResetMode::Frame);
++        // The reset owes q0 an X (its measurement is outcome 1); the conditional S would turn
++        // that into a Y only if it runs, so the owed X is paid physically before it.
++        let fix = items.iter().find_map(|i| match i {
++            TransItem::Event(Event::Fix { qubit, x_deps, .. }) => Some((*qubit, x_deps.clone())),
++            _ => None,
++        });
++        assert_eq!(fix, Some((0, vec![1])));
++        let text = items_text(&items);
++        let lines: Vec<&str> = text.lines().collect();
++        let s_line = lines.iter().find(|l| l.contains("<S>@")).expect("a conditional S line");
++        // needs both the condition's measurement (line of outcome 0) and the fix's (outcome 1)
++        assert!(s_line.contains('@') && s_line.split('@').nth(1).unwrap().contains(','), "{}", s_line);
++    }
++
+     #[test]
+     fn trailing_deferral_does_not_change_product_count() {
+         // Deferring the trailing single-qubit layer changes which Cliffords are emitted, never
+diff --git a/tests/fixtures/dyn_ancilla.cliffordt.qasm b/tests/fixtures/dyn_ancilla.cliffordt.qasm
+new file mode 100644
+index 0000000..97d5118
+--- /dev/null
++++ b/tests/fixtures/dyn_ancilla.cliffordt.qasm
+@@ -0,0 +1,27 @@
++OPENQASM 2.0;
++include "qelib1.inc";
++// Two data qubits (0,1) and one reusable ancilla (2), in the shape dcsynth emits:
++// compute onto the ancilla, measure it, fix the data with Paulis, reset, reuse.
++qreg q[3];
++creg m0[1];
++creg m1[1];
++h q[0];
++t q[0];
++cx q[0], q[2];
++h q[2];
++t q[2];
++cx q[2], q[1];
++measure q[2] -> m0[0];
++if(m0==1) z q[0];
++if(m0==1) z q[1];
++reset q[2];
++h q[2];
++t q[2];
++cx q[2], q[0];
++h q[2];
++measure q[2] -> m1[0];
++if(m1==1) x q[1];
++reset q[2];
++t q[1];
++h q[1];
++t q[0];
+diff --git a/tests/fixtures/dyn_pingpong.cliffordt.qasm b/tests/fixtures/dyn_pingpong.cliffordt.qasm
+new file mode 100644
+index 0000000..5bfcf81
+--- /dev/null
++++ b/tests/fixtures/dyn_pingpong.cliffordt.qasm
+@@ -0,0 +1,29 @@
++OPENQASM 2.0;
++include "qelib1.inc";
++// Feed-forward on the critical path: each measurement immediately gates a Clifford on the other
++// qubit, whose own T gates then feed the next measurement. Reaction latency is paid at every hop.
++qreg q[2];
++creg a[1];
++creg b[1];
++creg c[1];
++creg d[1];
++h q[0];
++t q[0];
++h q[0];
++t q[0];
++measure q[0] -> a[0];
++if(a==1) h q[1];
++t q[1];
++h q[1];
++t q[1];
++measure q[1] -> b[0];
++if(b==1) h q[0];
++t q[0];
++h q[0];
++t q[0];
++measure q[0] -> c[0];
++if(c==1) h q[1];
++t q[1];
++h q[1];
++t q[1];
++measure q[1] -> d[0];
+diff --git a/tests/integration_test.rs b/tests/integration_test.rs
+index 7943371..122fd5d 100644
+--- a/tests/integration_test.rs
++++ b/tests/integration_test.rs
+@@ -1151,3 +1151,99 @@ fn puremagic_all_products_scheduled_despite_t_gate_failures() {
+         stdout
+     );
+ }
++
++// ── dynamic circuits: reset, mid-circuit measurement, classical dependencies ─────
++
++/// Run `transpile -i qasm -o workdir/out` (a thin wrapper over the same binary), writing `<workdir>/<out>`; returns whether it succeeded.
++fn transpile_to(qasm: &Path, out: &str, extra_args: &[&str], workdir: &Path) -> (bool, String) {
++    build_binaries();
++    let output = Command::new(bin_path("transpile"))
++        .args(["-i", qasm.to_str().unwrap(), "-o", workdir.join(out).to_str().unwrap()])
++        .args(extra_args)
++        .current_dir(workdir)
++        .output()
++        .expect("failed to spawn transpile");
++    let text = format!(
++        "{}{}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++    (output.status.success(), text)
++}
++
++/// `(products, logical cycles)` from puremagic's "Scheduled N in M logical cycles" line.
++fn scheduled_counts(stdout: &str) -> (usize, usize) {
++    let line = stdout
++        .lines()
++        .find(|l| l.contains("Scheduled") && l.contains("logical cycles"))
++        .unwrap_or_else(|| panic!("no 'Scheduled N in M logical cycles' line in:\n{}", stdout));
++    let words: Vec<&str> = line.split_whitespace().collect();
++    (words[1].parse().unwrap(), words[3].parse().unwrap())
++}
++
++#[test]
++fn dynamic_fixture_transpiles_and_schedules_in_every_reset_mode() {
++    let qasm = fixture("dyn_ancilla.cliffordt.qasm");
++    for mode in ["frame", "flush", "init"] {
++        let tmp = TempDir::new().unwrap();
++        let (ok, log) = transpile_to(&qasm, "d.trans", &["--reset_mode", mode], tmp.path());
++        assert!(ok, "transpile --reset_mode {} failed:\n{}", mode, log);
++        let sidecar = tmp.path().join("d.trans.dyn.json");
++        assert!(sidecar.exists(), "{}: dynamic circuit must write the classical sidecar", mode);
++        let trans = std::fs::read_to_string(tmp.path().join("d.trans")).unwrap();
++        // Only `init` re-initialises a patch, so only it emits <R> lines.
++        assert_eq!(trans.contains("<R>"), mode == "init", "{}: unexpected <R> presence", mode);
++        let (ok, stdout, stderr) = run_puremagic(
++            &["--circuit", tmp.path().join("d.trans").to_str().unwrap(), "-F"],
++            tmp.path(),
++        );
++        assert!(ok, "puremagic failed on {} output; stderr:\n{}", mode, stderr);
++        let n_lines = trans.lines().filter(|l| !l.trim().is_empty()).count();
++        assert!(scheduled_counts(&stdout).0 >= n_lines, "{}: not every product was scheduled", mode);
++    }
++}
++
++#[test]
++fn static_circuit_writes_no_sidecar_unless_asked() {
++    let tmp = TempDir::new().unwrap();
++    let qasm = fixture("tiny.cliffordt.qasm");
++    let (ok, log) = transpile_to(&qasm, "s.trans", &[], tmp.path());
++    assert!(ok, "{}", log);
++    assert!(!tmp.path().join("s.trans.dyn.json").exists());
++    let (ok, log) = transpile_to(&qasm, "s2.trans", &["--sidecar"], tmp.path());
++    assert!(ok, "{}", log);
++    assert!(tmp.path().join("s2.trans.dyn.json").exists());
++}
++
++#[test]
++fn reaction_latency_default_is_a_no_op_and_larger_latency_costs_cycles_per_hop() {
++    // dyn_pingpong has three feed-forward hops on its critical path, so latency L adds 3*L lcycles.
++    let tmp = TempDir::new().unwrap();
++    let (ok, log) =
++        transpile_to(&fixture("dyn_pingpong.cliffordt.qasm"), "pp.trans", &[], tmp.path());
++    assert!(ok, "{}", log);
++    let circuit = tmp.path().join("pp.trans");
++    let cycles = |extra: &[&str]| {
++        let mut args = vec!["--circuit", circuit.to_str().unwrap(), "-F"];
++        args.extend_from_slice(extra);
++        let (ok, stdout, stderr) = run_puremagic(&args, tmp.path());
++        assert!(ok, "puremagic failed; stderr:\n{}", stderr);
++        scheduled_counts(&stdout).1
++    };
++    let ideal = cycles(&[]);
++    assert_eq!(cycles(&["--reaction-latency", "0"]), ideal, "latency 0 must equal the default");
++    assert_eq!(cycles(&["--reaction-latency", "4"]), ideal + 3 * 4);
++    assert_eq!(cycles(&["--reaction-latency", "10"]), ideal + 3 * 10);
++}
++
++#[test]
++fn reaction_latency_leaves_a_static_circuit_unchanged() {
++    let tmp = TempDir::new().unwrap();
++    let circuit = fixture("tiny.trans");
++    let run = |extra: &[&str]| {
++        let mut args = vec!["--circuit", circuit.to_str().unwrap(), "-F"];
++        args.extend_from_slice(extra);
++        scheduled_counts(&run_puremagic(&args, tmp.path()).1)
++    };
++    assert_eq!(run(&[]), run(&["--reaction-latency", "25"]));
++}

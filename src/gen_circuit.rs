@@ -96,6 +96,7 @@ impl PauliProduct {
             operators,
             parents: Vec::new(),
             children: Vec::new(),
+            after: Vec::new(),
             max_qubit,
             id: product_id,
             gate_type: GateType::T,

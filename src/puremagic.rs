@@ -62,6 +62,11 @@ struct Args {
     /// Record normalized cultivation-time distribution to <CIRCUIT_FNAME>.cultivation_dist
     #[arg(short = 'C', long)]
     record_cultivation_dist: bool,
+    /// Classical reaction latency in lcycles, for dynamic circuits: a product whose `.trans` line
+    /// has an `@id,..` suffix starts this many lcycles after the products it names complete,
+    /// modelling the time to decode a logical measurement before acting on its outcome. 0 = ideal.
+    #[arg(long = "reaction-latency", default_value_t = 0)]
+    reaction_latency: usize,
     #[arg(
         short,
         long,
@@ -137,6 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.common.no_t_failures,
         args.record_cultivation_dist,
     );
+    sched.set_reaction_latency(args.reaction_latency);
 
     let (tot_lcycles, n_scheduled) = sched.sched_circuit()?;
     assert!(n_scheduled >= n_products);
