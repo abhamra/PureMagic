@@ -59,6 +59,7 @@ Run with `-h` to see all options.
 | `-r, --rseed <N>` | `29` | Random seed for reproducible results |
 | `-R, --randomize-data-qubits` | off | Randomize data qubit numbering |
 | `-u, --use-magic-routing` | off | Use magic qubits for routing in addition to bus qubits |
+| `--ancilla-qubits <LIST>` | *(none)* | Host these logical qubits (e.g. `3,4`) on injection patches; needs `-u`. See [Hosted ancilla qubits](#hosted-ancilla-qubits) |
 | `-S, --sides_only` | off | Use only side edges of data patches (not top/bottom) |
 | `-F, --no-t-failures` | off | Disable T gate failures (every T gate succeeds on first attempt) |
 | `-C, --record-cultivation-dist` | off | Record normalized cultivation-time distribution to `<name>.cultivation_dist` |
@@ -79,6 +80,24 @@ Run with `-h` to see all options.
 # Generate plots of topology, circuit layers, and scheduling paths
 ./target/release/puremagic --circuit circuit.trans --plot topo,circuit,cstats,paths
 ```
+
+### Hosted ancilla qubits
+
+`--ancilla-qubits 3,4` (pure-magic mode, `-u`, only) puts those logical qubits on patches that
+double as magic-state cultivators. A hosted qubit is *live* from the lcycle its first product is
+ready until its last product completes; its patch is then a data patch. Before and after that it
+is *dormant*: the patch cultivates magic states and can be routed through. A listed qubit that
+no product touches stays dormant for the whole run.
+
+- One patch is one cultivator. A data qubit's patch is split into an X and a Z half-node; while
+  dormant the X half cultivates and the Z half only routes.
+- Going live discards any cultivation in progress on the patch; going dormant starts a fresh one.
+- Hosted nodes are never used as root candidates or in the precomputed Clifford trees, since
+  either could go stale when the qubit goes live.
+- The layout is the stock one (same patch count and volume formula); hosting changes only what an
+  idle qubit's patch does. Without `--ancilla-qubits` the output is identical to before.
+
+The end of the run reports, per hosted qubit, how many lcycles it was live.
 
 ## Circuit Format
 

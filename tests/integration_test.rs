@@ -1151,3 +1151,37 @@ fn puremagic_all_products_scheduled_despite_t_gate_failures() {
         stdout
     );
 }
+
+// ── puremagic: hosted ancilla qubits (--ancilla-qubits) ──────────────────────────
+
+#[test]
+fn puremagic_ancilla_qubits_requires_magic_routing() {
+    let tmp = TempDir::new().unwrap();
+    let circuit = fixture("tiny.trans");
+    let (ok, stdout, stderr) = run_puremagic(
+        &["--circuit", circuit.to_str().unwrap(), "--ancilla-qubits", "3"],
+        tmp.path(),
+    );
+    assert!(!ok, "--ancilla-qubits without -u should fail");
+    assert!(format!("{}{}", stdout, stderr).contains("pure-magic"));
+}
+
+#[test]
+fn puremagic_ancilla_qubits_out_of_range_fails() {
+    let tmp = TempDir::new().unwrap();
+    let circuit = fixture("tiny.trans");
+    let args = ["--circuit", circuit.to_str().unwrap(), "-u", "--ancilla-qubits", "9"];
+    let (ok, _stdout, _stderr) = run_puremagic(&args, tmp.path());
+    assert!(!ok, "hosting a qubit outside the circuit should fail");
+}
+
+#[test]
+fn puremagic_ancilla_qubits_schedules_and_reports() {
+    let tmp = TempDir::new().unwrap();
+    let circuit = fixture("small_4q.trans");
+    let args = ["--circuit", circuit.to_str().unwrap(), "-u", "--ancilla-qubits", "2,3"];
+    let (ok, stdout, stderr) = run_puremagic(&args, tmp.path());
+    assert!(ok, "hosted run failed; stderr:\n{}", stderr);
+    assert!(stdout.contains("Hosted ancilla q2: live"), "no q2 report:\n{}", stdout);
+    assert!(stdout.contains("Hosted ancilla q3: live"), "no q3 report:\n{}", stdout);
+}

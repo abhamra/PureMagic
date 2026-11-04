@@ -1,7 +1,7 @@
 use crate::accum_start;
 use crate::astar::{AStar, PathResult};
 use crate::circuit::Circuit;
-use crate::cultivation::CultivationManager;
+use crate::cultivation::{CultivationManager, NOT_CULTIVATING};
 use crate::debug_sched;
 use crate::fn_timer;
 use crate::info_sched;
@@ -226,6 +226,24 @@ pub(crate) struct Scheduler {
     /// `advance_clifford_state`/`check_clifford_repetitions` to treat these as complete,
     /// single-lcycle, zero-node events instead of ordinary 3-lcycle S/SX Cliffords.
     free_merged_products: HashSet<i32>,
+    /// Hosted-ancilla state (`--ancilla-qubits`), indexed by logical qubit; empty when
+    /// nothing is hosted. A hosted qubit is live from the lcycle its first product becomes
+    /// ready until its last product completes, and dormant (cultivating) otherwise.
+    hosted: HostedAncillas,
+}
+
+/// Bookkeeping for qubits hosted on injection patches.
+#[derive(Default)]
+pub(crate) struct HostedAncillas {
+    /// Products of the input circuit not yet completed, per hosted qubit.
+    remaining: Vec<usize>,
+    pub(crate) live: Vec<bool>,
+    /// Lcycles each hosted qubit spent live, and how often it went live.
+    pub(crate) live_lcycles: Vec<usize>,
+    pub(crate) activations: Vec<usize>,
+    /// Products completed in the current lcycle (filled by `unlock_children`).
+    completed_buf: Vec<i32>,
+    n_initial_products: usize,
 }
 
 impl Scheduler {
@@ -292,7 +310,161 @@ impl Scheduler {
             t_conjugated_bases: HashMap::new(),
             conjugated_t_products: HashSet::new(),
             free_merged_products: HashSet::new(),
+            hosted: HostedAncillas::default(),
         }
+    }
+
+    pub(crate) fn hosted_live_lcycles(&self, q: u16) -> usize {
+        self.hosted.live_lcycles.get(q as usize).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn hosted_activations(&self, q: u16) -> usize {
+        self.hosted.activations.get(q as usize).copied().unwrap_or(0)
+    }
+
+    /// Debug check of one lcycle: a product on a hosted qubit runs only while it is live,
+    /// and a live hosted patch is used only by products on that qubit (scheduled, carried
+    /// forward, or blocked and holding its terminals).
+    #[cfg(debug_assertions)]
+    fn check_hosted_lcycle(&self) -> io::Result<()> {
+        let err = |m: String| Err(io::Error::new(io::ErrorKind::Other, m));
+        let touches = |pp: &PauliProduct, q: u16| pp.operators.iter().any(|op| op.qubit == q);
+        for &q in &self.input.topo.hosted_qubits {
+            let live = self.hosted.live[q as usize];
+            let scheduled_on_q =
+                self.pp_paths.iter().any(|(id, _)| touches(self.input.circuit.product(*id), q));
+            if scheduled_on_q && !live {
+                return err(format!(
+                    "lcycle {}: product on hosted q{} scheduled while dormant",
+                    self.current_lcycle, q
+                ));
+            }
+            let [x_id, z_id] = self.input.topo.data_ids[q as usize];
+            if live && (self.used[x_id as usize] || self.used[z_id as usize]) {
+                let pending_on_q = self.pps_pending.iter().any(|pp| touches(pp, q));
+                if !scheduled_on_q && !pending_on_q {
+                    return err(format!(
+                        "lcycle {}: live hosted q{}'s patch used by another product",
+                        self.current_lcycle, q
+                    ));
+                }
+            }
+            if live
+                && self.cultivation.ready_magic_positions.contains(&self.input.topo.node(x_id).pos)
+            {
+                return err(format!(
+                    "lcycle {}: live hosted q{} counted as a ready magic state",
+                    self.current_lcycle, q
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn hosting(&self) -> bool {
+        !self.input.topo.hosted_qubits.is_empty()
+    }
+
+    /// Counts each hosted qubit's products and makes every hosted qubit dormant. Runs after
+    /// the terminal/root/Clifford-tree precomputation, which therefore saw hosted nodes as
+    /// Data: no precomputed tree or root ever relies on a hosted node.
+    fn init_hosted(&mut self) {
+        let n_products = self.input.circuit.n_products();
+        let hosted_qubits = self.input.topo.hosted_qubits.clone();
+        // A hosted qubit no product touches can lie past the circuit's highest used qubit.
+        let n_qubits = hosted_qubits
+            .iter()
+            .map(|&q| q as usize + 1)
+            .fold(self.input.circuit.n_qubits, usize::max);
+        let h = &mut self.hosted;
+        h.n_initial_products = n_products;
+        h.remaining = vec![0; n_qubits];
+        h.live = vec![false; n_qubits];
+        h.live_lcycles = vec![0; n_qubits];
+        h.activations = vec![0; n_qubits];
+        for id in 0..n_products {
+            for op in &self.input.circuit.product(id as i32).operators {
+                if hosted_qubits.contains(&op.qubit) {
+                    h.remaining[op.qubit as usize] += 1;
+                }
+            }
+        }
+        for &q in &hosted_qubits {
+            self.input.topo.set_hosted_live(q, false);
+        }
+    }
+
+    /// Route-only halves never cultivate. Called after `init_magic_nodes`.
+    fn mark_route_only_nodes(&mut self) {
+        for &q in &self.input.topo.hosted_qubits.clone() {
+            let z_id = self.input.topo.data_ids[q as usize][1];
+            self.input.topo.cultivation_times[z_id as usize] = NOT_CULTIVATING;
+            self.input.topo.busy_counts[z_id as usize] = 0;
+        }
+    }
+
+    /// Makes dormant hosted qubits touched by products `ids` live: their nodes become
+    /// Data and any cultivation in progress on them is discarded. Runs between lcycles,
+    /// as soon as such a product is ready, so a hosted node is Data whenever a product
+    /// could use it as a terminal.
+    fn activate_hosted_for(&mut self, ids: &[i32]) {
+        for &id in ids {
+            let qubits: Vec<u16> =
+                self.input.circuit.product(id).operators.iter().map(|op| op.qubit).collect();
+            for q in qubits {
+                if !self.input.topo.is_hosted(self.input.topo.data_ids[q as usize][0])
+                    || self.hosted.live[q as usize]
+                {
+                    continue;
+                }
+                self.hosted.live[q as usize] = true;
+                self.hosted.activations[q as usize] += 1;
+                self.input.topo.set_hosted_live(q, true);
+                for node_id in self.input.topo.data_ids[q as usize] {
+                    self.input.topo.cultivation_times[node_id as usize] = NOT_CULTIVATING;
+                    self.input.topo.busy_counts[node_id as usize] = 0;
+                }
+                info_sched!("  hosted ancilla q{} live", q);
+            }
+        }
+    }
+
+    /// Makes hosted qubits whose last product completed this lcycle dormant again: their
+    /// nodes become Magic and the X node starts a fresh cultivation.
+    fn retire_hosted(&mut self) {
+        let completed = std::mem::take(&mut self.hosted.completed_buf);
+        for &id in &completed {
+            if id as usize >= self.hosted.n_initial_products {
+                continue; // a scheduler-added S correction, not counted in `remaining`
+            }
+            let qubits: Vec<u16> =
+                self.input.circuit.product(id).operators.iter().map(|op| op.qubit).collect();
+            for q in qubits {
+                let qi = q as usize;
+                if !self.hosted.live.get(qi).copied().unwrap_or(false) {
+                    continue;
+                }
+                self.hosted.remaining[qi] -= 1;
+                if self.hosted.remaining[qi] > 0 {
+                    continue;
+                }
+                let [x_id, z_id] = self.input.topo.data_ids[qi];
+                debug_assert!(
+                    self.clifford_paths.values().all(|(_, _, nodes, _)| {
+                        !nodes.contains(&x_id) && !nodes.contains(&z_id)
+                    }),
+                    "hosted q{} retired while a Clifford still holds its patch",
+                    q
+                );
+                self.hosted.live[qi] = false;
+                self.input.topo.set_hosted_live(q, false);
+                self.cultivation.restart(&mut self.input.topo, x_id);
+                self.input.topo.cultivation_times[z_id as usize] = NOT_CULTIVATING;
+                info_sched!("  hosted ancilla q{} dormant", q);
+            }
+        }
+        self.hosted.completed_buf = completed;
+        self.hosted.completed_buf.clear();
     }
 
     pub(crate) fn count_t_products(&self) -> usize {
@@ -307,14 +479,31 @@ impl Scheduler {
         self.cultivation
             .set_lambda(self.magic_state_lambda)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let hosting = self.hosting();
+        if hosting {
+            // Precompute while hosted nodes are still Data, then make them dormant (Magic)
+            // so `init_magic_nodes` picks up their cultivators.
+            self.precompute_terminals_and_roots();
+            self.precompute_multi_term_clifford_trees();
+            self.init_hosted();
+        }
         self.init_magic_nodes();
+        if hosting {
+            self.mark_route_only_nodes();
+        }
         let n_t_products = self.count_t_products();
         self.cultivation.t_products_remaining = n_t_products;
         // Pre-generate a large pool: ~120 samples per T gate plus one per topology node.
         self.cultivation.fill_pool(120 * n_t_products.max(1) + self.input.topo.n_nodes);
-        self.precompute_terminals_and_roots();
-        self.precompute_multi_term_clifford_trees();
+        if !hosting {
+            self.precompute_terminals_and_roots();
+            self.precompute_multi_term_clifford_trees();
+        }
         self.pps_pending = self.input.circuit.initial_products().cloned().collect();
+        if hosting {
+            let initial: Vec<i32> = self.pps_pending.iter().map(|pp| pp.id).collect();
+            self.activate_hosted_for(&initial);
+        }
         self.remaining_parents = (0..self.input.circuit.n_products())
             .map(|id| self.input.circuit.product(id as i32).parents.len())
             .collect();
@@ -335,6 +524,11 @@ impl Scheduler {
         while !self.pps_pending.is_empty() || !self.clifford_paths.is_empty() {
             self.timers.start(self.loop_timer);
             self.current_lcycle += 1;
+            for (q, &live) in self.hosted.live.iter().enumerate() {
+                if live {
+                    self.hosted.live_lcycles[q] += 1;
+                }
+            }
             info_sched!(
                 "{}",
                 format!(
@@ -580,7 +774,8 @@ impl Scheduler {
                 let is_x = topo.label(term_id).contains('X');
                 for &nb_id in node.nbs_slice() {
                     let nb = topo.node(nb_id);
-                    if !nb.is_routing() {
+                    // A dormant hosted node routes, but can go live at any time: never a root.
+                    if !nb.is_routing() || topo.is_hosted(nb_id) {
                         continue;
                     }
                     if (is_x && nb.pos.1 < node.pos.1) || (!is_x && nb.pos.1 > node.pos.1) {
@@ -592,7 +787,11 @@ impl Scheduler {
             } else {
                 for &nb_id in node.nbs_slice() {
                     let nb = topo.node(nb_id);
-                    if nb.is_routing() && nb.pos.0 != node.pos.0 && nb.pos.1 == node.pos.1 {
+                    if nb.is_routing()
+                        && !topo.is_hosted(nb_id)
+                        && nb.pos.0 != node.pos.0
+                        && nb.pos.1 == node.pos.1
+                    {
                         preferred.push(nb_id);
                     }
                 }
@@ -692,7 +891,7 @@ impl Scheduler {
                     let is_x = self.input.topo.label(term_id).contains('X');
                     for &nb_id in node.nbs_slice() {
                         let nb = self.input.topo.node(nb_id);
-                        if !nb.is_routing() {
+                        if !nb.is_routing() || self.input.topo.is_hosted(nb_id) {
                             continue;
                         }
                         if (is_x && nb.pos.1 < node.pos.1) || (!is_x && nb.pos.1 > node.pos.1) {
@@ -705,7 +904,11 @@ impl Scheduler {
                     // Unpaired terminal: only same-row side nbs are valid roots.
                     for &nb_id in node.nbs_slice() {
                         let nb = self.input.topo.node(nb_id);
-                        if nb.is_routing() && nb.pos.0 != node.pos.0 && nb.pos.1 == node.pos.1 {
+                        if nb.is_routing()
+                            && !self.input.topo.is_hosted(nb_id)
+                            && nb.pos.0 != node.pos.0
+                            && nb.pos.1 == node.pos.1
+                        {
                             preferred.push(nb_id);
                         }
                     }
@@ -1238,6 +1441,10 @@ impl Scheduler {
     /// advance Clifford state, and process T-gate coin-flip outcomes.
     fn complete_lcycle(&mut self) -> io::Result<()> {
         let _timer = accum_start!(self.timers);
+        #[cfg(debug_assertions)]
+        if self.hosting() {
+            self.check_hosted_lcycle()?;
+        }
         self.scheduled_ids_buf.clear();
         self.scheduled_ids_buf.extend(self.pp_paths.iter().map(|(id, _)| *id));
         self.pps_pending.retain(|pp| !self.scheduled_ids_buf.contains(&pp.id));
@@ -1258,6 +1465,13 @@ impl Scheduler {
         );
         self.pps_pending
             .extend(self.children_buf.iter().map(|&id| self.input.circuit.product(id).clone()));
+        if self.hosting() {
+            // advance_clifford_state has released finished Cliffords' paths, so a hosted
+            // patch whose last product just completed is free to go dormant.
+            self.retire_hosted();
+            let children = self.children_buf.clone();
+            self.activate_hosted_for(&children);
+        }
         debug_sched!(
             "After adding {} children, pps_to_sched len {}",
             self.children_buf.len(),
@@ -1338,6 +1552,9 @@ impl Scheduler {
             }
             // Free-merged S products (see try_merge_s_correction) are single-lcycle,
             // zero-node events - fall straight through to unlocking their children.
+            if !self.hosted.live.is_empty() {
+                self.hosted.completed_buf.push(pp_id); // pp_id completes this lcycle
+            }
             let children: Vec<i32> = self.input.circuit.product(pp_id).children.clone();
             for child_id in children {
                 self.remaining_parents[child_id as usize] -= 1;
@@ -1967,5 +2184,161 @@ mod tests {
         assert!(sched.scheduled_products.contains(&1), "injected correction (id=1) scheduled");
         let tot_entries: usize = sched.lcycle_scheduled.iter().map(|(_, ids)| ids.len()).sum();
         assert_eq!(tot_entries, 6, "3 lcycles for the injected correction + 3 for the SX gate");
+    }
+
+    // ── hosted ancillas (--ancilla-qubits) ────────────────────────────────────────
+
+    fn hosted_scheduler(lines: &[&str], hosted: &[u16], rseed: u32) -> Scheduler {
+        Node::set_magic_routing(true);
+        let mut f = NamedTempFile::new().unwrap();
+        for line in lines {
+            writeln!(f, "{}", line).unwrap();
+        }
+        let fname = f.path().to_string_lossy().to_string();
+        let mut circuit = Circuit::new(&fname);
+        circuit.load_circuit().expect("circuit load failed");
+        let mut topo = TopoGraph::new();
+        topo.set_topo(4, &"dummy".to_string(), &"".to_string(), &0, true, 1, false);
+        topo.host_qubits(hosted).expect("host_qubits failed");
+        Scheduler::new(circuit, topo, 0.0387396, "none", String::new(), rseed, false, false)
+    }
+
+    /// The first steps of `sched_circuit` with hosting on, without the scheduling loop.
+    fn init_hosting_only(sched: &mut Scheduler) {
+        sched.cultivation.set_lambda(sched.magic_state_lambda).unwrap();
+        sched.precompute_terminals_and_roots();
+        sched.precompute_multi_term_clifford_trees();
+        sched.init_hosted();
+        sched.init_magic_nodes();
+        sched.mark_route_only_nodes();
+        sched.cultivation.t_products_remaining = sched.count_t_products();
+        sched.cultivation.fill_pool(1000);
+    }
+
+    const HOSTED_LINES: &[&str] = &[
+        "+X___<T>",
+        "-___X<T>",
+        "+_X__<T>",
+        "+XX__<CX>",
+        "-__X_<T>",
+        "+___Z<T>",
+        "+_X_X<T>",
+        "+X___<T>",
+        "-_Z__<S>",
+        "+__XX<CX>",
+        "+X___<T>",
+        "-_X__<T>",
+        "+__Y_<T>",
+    ];
+
+    #[test]
+    fn hosting_nothing_matches_stock_schedule() {
+        let lines = HOSTED_LINES;
+        for rseed in [0u32, 7, 29] {
+            let stock = run_scheduler(lines, rseed);
+            let mut empty = hosted_scheduler(lines, &[], rseed);
+            empty.sched_circuit().unwrap();
+            assert_eq!(stock.lcycle_scheduled, empty.lcycle_scheduled, "rseed {}", rseed);
+        }
+    }
+
+    #[test]
+    fn dormant_hosted_qubit_cultivates_with_one_node() {
+        // q3 has no products: hosted, it is a cultivator for the whole run.
+        let lines = &["+X___<T>", "-_X__<T>", "+XX__<CX>", "+__X_<T>", "-X___<T>"];
+        let mut sched = hosted_scheduler(lines, &[3], 1);
+        sched.sched_circuit().unwrap();
+        let [x_id, z_id] = sched.input.topo.data_ids[3];
+        assert!(sched.cultivation.magic_node_ids.contains(&x_id), "X half must cultivate");
+        assert!(!sched.cultivation.magic_node_ids.contains(&z_id), "Z half only routes");
+        assert_eq!(sched.input.topo.node(x_id).node_type, NodeType::Magic);
+        assert_eq!(sched.input.topo.node(z_id).node_type, NodeType::Magic);
+        assert_eq!(sched.input.topo.cultivation_times[z_id as usize], NOT_CULTIVATING);
+        assert_eq!(sched.hosted_activations(3), 0);
+        assert_eq!(sched.hosted_live_lcycles(3), 0);
+    }
+
+    #[test]
+    fn live_hosted_qubit_is_never_a_ready_magic_state() {
+        let mut sched = hosted_scheduler(HOSTED_LINES, &[3], 2);
+        init_hosting_only(&mut sched);
+        let [x_id, z_id] = sched.input.topo.data_ids[3];
+        // Let q3's cultivator become ready while dormant, then make q3 live.
+        sched.input.topo.cultivation_times[x_id as usize] = 0;
+        let n_ready_dormant = sched.update_cultivators();
+        let x_pos = sched.input.topo.node(x_id).pos;
+        assert!(sched.cultivation.ready_magic_positions.contains(&x_pos));
+        sched.activate_hosted_for(&[1]); // product 1 is on q3
+        assert!(sched.hosted.live[3]);
+        assert_eq!(sched.input.topo.node(x_id).node_type, NodeType::Data);
+        assert_eq!(sched.input.topo.node(z_id).node_type, NodeType::Data);
+        for _ in 0..50 {
+            let n_ready = sched.update_cultivators();
+            assert!(!sched.cultivation.ready_magic_positions.contains(&x_pos));
+            assert!(n_ready < sched.cultivation.magic_node_ids.len());
+        }
+        assert!(n_ready_dormant >= 1);
+        assert!(!sched.input.topo.is_cultivating(x_id) && !sched.input.topo.is_cultivating(z_id));
+    }
+
+    #[test]
+    fn retiring_hosted_qubit_restarts_cultivation() {
+        let mut sched = hosted_scheduler(HOSTED_LINES, &[3], 3);
+        init_hosting_only(&mut sched);
+        let [x_id, z_id] = sched.input.topo.data_ids[3];
+        sched.activate_hosted_for(&[1]);
+        // Complete every product on q3 except the last: still live.
+        let on_q3: Vec<i32> = (0..HOSTED_LINES.len() as i32)
+            .filter(|&id| sched.input.circuit.product(id).operators.iter().any(|op| op.qubit == 3))
+            .collect();
+        sched.hosted.completed_buf.extend_from_slice(&on_q3[..on_q3.len() - 1]);
+        sched.retire_hosted();
+        assert!(sched.hosted.live[3]);
+        sched.hosted.completed_buf.push(*on_q3.last().unwrap());
+        sched.retire_hosted();
+        assert!(!sched.hosted.live[3]);
+        assert_eq!(sched.input.topo.node(x_id).node_type, NodeType::Magic);
+        assert_eq!(sched.input.topo.busy_counts[x_id as usize], 0);
+        assert!(sched.input.topo.cultivation_times[x_id as usize] >= 0, "fresh draw on X");
+        assert_eq!(sched.input.topo.cultivation_times[z_id as usize], NOT_CULTIVATING);
+    }
+
+    #[test]
+    fn hosted_schedules_satisfy_invariants() {
+        // check_lcycle, check_schedule and check_hosted_lcycle all run in debug builds.
+        for hosted in [&[0u16][..], &[3], &[1, 3], &[0, 1, 2, 3]] {
+            for rseed in 0u32..6 {
+                let mut sched = hosted_scheduler(HOSTED_LINES, hosted, rseed);
+                let (lcycles, n) = sched.sched_circuit().expect("hosted schedule failed");
+                assert!(n >= HOSTED_LINES.len());
+                for &q in hosted {
+                    assert!(!sched.hosted.live[q as usize], "q{} still live at the end", q);
+                    assert_eq!(sched.hosted.remaining[q as usize], 0);
+                    assert_eq!(sched.hosted_activations(q), 1, "static circuit: one live window");
+                    assert!(sched.hosted_live_lcycles(q) <= lcycles);
+                }
+                let mut seen = std::collections::HashSet::new();
+                for (_, ids) in &sched.lcycle_scheduled {
+                    for &id in ids {
+                        if (id as usize) < HOSTED_LINES.len()
+                            && !sched.input.circuit.product(id).gate_type.is_clifford()
+                        {
+                            assert!(seen.insert(id), "product {} scheduled twice", id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hosted_qubit_goes_dormant_after_its_last_product() {
+        // q3 is used only at the start; the rest of the circuit runs long after.
+        let mut lines = vec!["+___X<T>", "-___Z<T>"];
+        lines.extend(std::iter::repeat("+X___<T>").take(30));
+        let mut sched = hosted_scheduler(&lines, &[3], 4);
+        let (lcycles, _) = sched.sched_circuit().unwrap();
+        let live = sched.hosted_live_lcycles(3);
+        assert!(live > 0 && live < lcycles / 2, "live {} of {} lcycles", live, lcycles);
     }
 }
