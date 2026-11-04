@@ -85,11 +85,19 @@ Run with `-h` to see all options.
 ### Hosted ancilla qubits
 
 `--ancilla-qubits 3,4` (pure-magic mode, `-u`, only) puts those logical qubits on patches that
-double as magic-state cultivators. A hosted qubit is *live* from the lcycle its first product is
-ready until its last product completes; its patch is then a data patch. Before and after that it
-is *dormant*: the patch cultivates magic states and can be routed through. A listed qubit that
-no product touches stays dormant for the whole run.
+double as magic-state cultivators. A hosted patch is *live* (a data patch) while it holds state
+that matters, and *dormant* otherwise: it cultivates magic states and can be routed through.
 
+- It is dormant until one of its products is ready, and again after its last product.
+- It is also dormant **between uses**: after a product that leaves the patch in a known
+  single-patch state (a weight-1 X or Z `<M>`, or an `<R>`) until its next product is ready.
+  This is what a reused ancilla does after its reset. Re-preparing the patch when it goes live
+  again is taken as free, like every patch's initial |0>. Use `transpile --reset_mode flush` or
+  `init` so a reset's measurement is weight 1 on the ancilla's own patch; in `frame` mode it is
+  often spread over several patches and releases nothing.
+- A Y measurement does not release the patch (preparing a Y eigenstate needs an S gate).
+- A pending S correction on a released patch is dropped: the state it belonged to is gone.
+- A listed qubit that no product touches stays dormant for the whole run.
 - One patch is one cultivator. A data qubit's patch is split into an X and a Z half-node; while
   dormant the X half cultivates and the Z half only routes.
 - Going live discards any cultivation in progress on the patch; going dormant starts a fresh one.
@@ -98,7 +106,8 @@ no product touches stays dormant for the whole run.
 - The layout is the stock one (same patch count and volume formula); hosting changes only what an
   idle qubit's patch does. Without `--ancilla-qubits` the output is identical to before.
 
-The end of the run reports, per hosted qubit, how many lcycles it was live.
+The end of the run reports, per hosted qubit, how many lcycles it was live and in how many
+separate windows.
 
 ## Circuit Format
 

@@ -236,8 +236,9 @@ pub(crate) struct Scheduler {
     /// by `reaction_latency`. Released at the start of the first lcycle after `due_lcycle`.
     delayed_unlocks: Vec<(usize, i32)>,
     /// Hosted-ancilla state (`--ancilla-qubits`), indexed by logical qubit; empty when
-    /// nothing is hosted. A hosted qubit is live from the lcycle its first product becomes
-    /// ready until its last product completes, and dormant (cultivating) otherwise.
+    /// nothing is hosted. A hosted patch is dormant (cultivating) until one of its products
+    /// is ready, and again after a product that leaves it in a known single-patch state
+    /// (see `releases_patch`) until its next product is ready, and after its last product.
     hosted: HostedAncillas,
 }
 
@@ -246,6 +247,10 @@ pub(crate) struct Scheduler {
 pub(crate) struct HostedAncillas {
     /// Products of the input circuit not yet completed, per hosted qubit.
     remaining: Vec<usize>,
+    /// Products on each hosted qubit, in program order (a chain: each depends on the
+    /// previous one on the same qubit), and how many of them have completed.
+    chain: Vec<Vec<i32>>,
+    done: Vec<usize>,
     pub(crate) live: Vec<bool>,
     /// Lcycles each hosted qubit spent live, and how often it went live.
     pub(crate) live_lcycles: Vec<usize>,
@@ -347,6 +352,9 @@ impl Scheduler {
             if self.remaining_parents[child_id as usize] == 0 {
                 let child = self.input.circuit.product(child_id).clone();
                 self.pps_pending.push(child);
+                if self.hosting() {
+                    self.activate_hosted_for(&[child_id]);
+                }
             }
         }
         self.delayed_unlocks = still_waiting;
@@ -417,6 +425,8 @@ impl Scheduler {
         let h = &mut self.hosted;
         h.n_initial_products = n_products;
         h.remaining = vec![0; n_qubits];
+        h.chain = vec![Vec::new(); n_qubits];
+        h.done = vec![0; n_qubits];
         h.live = vec![false; n_qubits];
         h.live_lcycles = vec![0; n_qubits];
         h.activations = vec![0; n_qubits];
@@ -424,6 +434,7 @@ impl Scheduler {
             for op in &self.input.circuit.product(id as i32).operators {
                 if hosted_qubits.contains(&op.qubit) {
                     h.remaining[op.qubit as usize] += 1;
+                    h.chain[op.qubit as usize].push(id as i32);
                 }
             }
         }
@@ -467,13 +478,29 @@ impl Scheduler {
         }
     }
 
-    /// Makes hosted qubits whose last product completed this lcycle dormant again: their
-    /// nodes become Magic and the X node starts a fresh cultivation.
+    /// True if product `pp`, once complete, leaves patch `q` in a known state that a fresh
+    /// patch can reproduce: a single-patch X or Z measurement (re-prepare the measured
+    /// eigenstate; the outcome goes to the Pauli frame) or a re-initialization `<R>`.
+    /// A Y measurement does not count: preparing a Y eigenstate needs an S gate.
+    fn releases_patch(pp: &PauliProduct, q: u16) -> bool {
+        match pp.operators.as_slice() {
+            [op] if op.qubit == q => {
+                pp.gate_type.is_r() || (pp.gate_type.is_m() && matches!(op.basis, 'X' | 'Z'))
+            }
+            _ => false,
+        }
+    }
+
+    /// Makes hosted qubits dormant after products completed this lcycle: after the qubit's
+    /// last product, or after a product that releases the patch (`releases_patch`) when the
+    /// next product on the qubit is not ready yet. The nodes become Magic, the X node starts
+    /// a fresh cultivation, and any pending S correction is dropped (the state it belonged
+    /// to is gone; the patch is re-prepared when the qubit goes live again).
     fn retire_hosted(&mut self) {
         let completed = std::mem::take(&mut self.hosted.completed_buf);
         for &id in &completed {
             if id as usize >= self.hosted.n_initial_products {
-                continue; // a scheduler-added S correction, not counted in `remaining`
+                continue; // a scheduler-added S correction, not part of any chain
             }
             let qubits: Vec<u16> =
                 self.input.circuit.product(id).operators.iter().map(|op| op.qubit).collect();
@@ -482,8 +509,22 @@ impl Scheduler {
                 if !self.hosted.live.get(qi).copied().unwrap_or(false) {
                     continue;
                 }
+                debug_assert_eq!(
+                    self.hosted.chain[qi].get(self.hosted.done[qi]).copied(),
+                    Some(id),
+                    "hosted q{}: products completed out of program order",
+                    q
+                );
+                self.hosted.done[qi] += 1;
                 self.hosted.remaining[qi] -= 1;
-                if self.hosted.remaining[qi] > 0 {
+                let dormant = match self.hosted.chain[qi].get(self.hosted.done[qi]) {
+                    None => true,
+                    Some(&next) => {
+                        Self::releases_patch(self.input.circuit.product(id), q)
+                            && !self.pps_pending.iter().any(|pp| pp.id == next)
+                    }
+                };
+                if !dormant {
                     continue;
                 }
                 let [x_id, z_id] = self.input.topo.data_ids[qi];
@@ -498,6 +539,7 @@ impl Scheduler {
                 self.input.topo.set_hosted_live(q, false);
                 self.cultivation.restart(&mut self.input.topo, x_id);
                 self.input.topo.cultivation_times[z_id as usize] = NOT_CULTIVATING;
+                self.correction_power[qi] = 0;
                 info_sched!("  hosted ancilla q{} dormant", q);
             }
         }
@@ -2456,5 +2498,64 @@ mod tests {
         let (lcycles, _) = sched.sched_circuit().unwrap();
         let live = sched.hosted_live_lcycles(3);
         assert!(live > 0 && live < lcycles / 2, "live {} of {} lcycles", live, lcycles);
+    }
+
+    #[test]
+    fn hosted_patch_sleeps_between_a_measurement_and_its_next_use() {
+        // q3: T, Z-measure (releases the patch), then reused only after q0's long chain.
+        let mut lines = vec!["+___X<T>", "+___Z<M>"];
+        lines.extend(std::iter::repeat("+X___<T>").take(30));
+        lines.push("+X__X<T>");
+        let mut sched = hosted_scheduler(&lines, &[3], 5);
+        let (lcycles, _) = sched.sched_circuit().expect("hosted schedule failed");
+        assert_eq!(sched.hosted_activations(3), 2, "one window per use");
+        let live = sched.hosted_live_lcycles(3);
+        assert!(live < lcycles / 2, "live {} of {} lcycles", live, lcycles);
+        assert!(!sched.hosted.live[3]);
+    }
+
+    #[test]
+    fn hosted_patch_stays_live_through_a_y_or_multi_patch_measurement() {
+        for meas in ["+___Y<M>", "+__ZZ<M>"] {
+            let mut lines = vec!["+___X<T>", meas];
+            lines.extend(std::iter::repeat("+X___<T>").take(30));
+            lines.push("+X__X<T>");
+            let mut sched = hosted_scheduler(&lines, &[3], 5);
+            sched.sched_circuit().expect("hosted schedule failed");
+            assert_eq!(sched.hosted_activations(3), 1, "{} must not release q3", meas);
+        }
+    }
+
+    #[test]
+    fn hosted_patch_stays_live_when_the_next_product_is_already_ready() {
+        // The T after the measurement is ready as soon as the measurement completes.
+        let lines = &["+___Z<M>", "+___X<T>", "+X___<T>"];
+        let mut sched = hosted_scheduler(lines, &[3], 6);
+        sched.sched_circuit().expect("hosted schedule failed");
+        assert_eq!(sched.hosted_activations(3), 1);
+    }
+
+    #[test]
+    fn hosted_patch_sleeps_through_reaction_latency_and_wakes_on_release() {
+        // q3's next product needs q0's outcome: it is held back by the latency.
+        let lines = &["+___Z<M>", "+Z___<M>", "+___X<T>@1"];
+        let mut sched = hosted_scheduler(lines, &[3], 7);
+        sched.set_reaction_latency(6);
+        sched.sched_circuit().expect("hosted schedule failed");
+        assert_eq!(sched.hosted_activations(3), 2);
+        assert!(!sched.hosted.live[3]);
+    }
+
+    #[test]
+    fn releasing_a_hosted_patch_drops_its_pending_correction() {
+        let lines = &["+___X<T>", "+___Z<M>", "+X___<T>", "+X__X<T>"];
+        let mut sched = hosted_scheduler(lines, &[3], 8);
+        init_hosting_only(&mut sched);
+        sched.activate_hosted_for(&[0]);
+        sched.correction_power[3] = 1;
+        sched.hosted.completed_buf.extend_from_slice(&[0, 1]); // T, then the releasing M
+        sched.retire_hosted();
+        assert!(!sched.hosted.live[3]);
+        assert_eq!(sched.correction_power[3], 0);
     }
 }
