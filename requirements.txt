@@ -15,8 +15,8 @@ qiskit-qasm3-import
 # used only for the angles qiskit's Rust gridsynth panics on at coarse --epsilon.
 # Also pulled in by bqskit-ft; listed here so a plain clone has it too.
 pygridsynth
-# Rz synthesis backend for data_processing/dcsynth_to_cliffordt.py (needs mpmath).
-mpmath
+# data_processing/dcsynth_to_cliffordt.py imports `cyclosynth`, which is not on PyPI: build it from
+# the cyclosynth/ submodule (cd cyclosynth && maturin build --release && pip install target/wheels/*.whl).
 # Type checker used to verify data_processing/compile_cliffordt.py during
 # development (pyright data_processing/compile_cliffordt.py). Not a runtime
 # dependency of the pipeline itself.

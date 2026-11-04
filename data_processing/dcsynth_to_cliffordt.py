@@ -16,13 +16,14 @@ This script does that lowering. The steps:
      (fewer T gates), and flushed at every CX, measurement, reset or conditional.
   2. A 2x2 unitary becomes Clifford+T by: identity -> nothing; a Pauli -> one x/y/z gate (those
      are free Pauli-frame updates downstream); another Clifford -> a shortest h/s word; anything
-     else -> ZYZ Euler angles with each Rz synthesised by gridsynth (`pygridsynth`) to `--epsilon`.
+     else -> ZYZ Euler angles synthesised by cyclosynth to `--epsilon` (jointly optimised U3).
   3. An `if_else` is flattened to leaves "under these bit values, apply this unitary to qubit q".
      For each qubit the leaves are completed to all 2^k assignments of the k bits involved. Then
      the *cheapest* assignment's unitary U_ref is applied unconditionally and only the difference
      V_a = U_a U_ref^dagger is conditioned on the bits. dcsynth's corrections usually differ by a
      Pauli (or at worst a Clifford), so most of them become free frame updates instead of
-     conditional T gates that the scheduler must wait on.
+     conditional T gates that the scheduler must wait on. (dcsynth's ae_4 corrections are Paulis
+     only to within ~1e-5; see `--clifford-tol`.)
 
 Anything `transpile` cannot express (a conditional CX, a measurement inside an `if_else`, a
 classical expression as a condition) raises `NotImplementedError` rather than being dropped.
@@ -145,64 +146,102 @@ def nearest_clifford(u: np.ndarray, tol: float) -> list[str] | None:
 
 
 # ----------------------------------------------------------------------------- synthesis
-_GS_REVERSED: bool | None = None  # does pygridsynth's string read last-gate-first?
+# Rotations are synthesised by cyclosynth (the Rust extension built from the `cyclosynth/`
+# submodule; `maturin build --release` there and pip-install the wheel). It returns a string over
+# H S T X Z with lowercase s, t meaning the dagger.
+_LETTERS = {
+    "H": "h", "S": "s", "s": "sdg", "T": "t", "t": "tdg",
+    "X": "x", "Y": "y", "Z": "z", "h": "h", "x": "x", "y": "y", "z": "z",
+}
+_IGNORED_LETTERS = set("WwI")  # global phase / identity
+_CS_REVERSED: bool | None = None  # is the string in matrix order (last letter applied first)?
+# "u3": jointly optimised U3 search (fewest T, ~seconds per rotation at eps 1e-8, needs eps >= 1e-10);
+# "zyz": three native Rz syntheses at eps/3 each (about 2.5-3x the T, milliseconds, any eps).
+SYNTH_MODE = "u3"
 
 
-def _gridsynth_letters(theta: float, eps: float) -> str:
-    import mpmath
-    from pygridsynth.gridsynth import gridsynth_gates
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        return gridsynth_gates(theta=mpmath.mpf(theta), epsilon=mpmath.mpf(eps))
+def _cyclosynth():
+    try:
+        import cyclosynth
+    except ImportError as e:  # pragma: no cover
+        raise SystemExit(
+            "cannot import cyclosynth. Build it from the cyclosynth/ submodule "
+            "(cd cyclosynth && maturin build --release && pip install target/wheels/*.whl)"
+        ) from e
+    return cyclosynth
 
 
 def _letters_to_gates(s: str, reverse: bool) -> list[str]:
-    names = {"H": "h", "S": "s", "T": "t", "X": "x", "Y": "y", "Z": "z"}
-    letters = [c for c in s if c in names]  # W (global phase) and I are dropped
+    out = []
+    for c in s:
+        if c in _IGNORED_LETTERS:
+            continue
+        if c not in _LETTERS:
+            raise RuntimeError(f"unexpected gate letter {c!r} in cyclosynth output {s[:40]!r}")
+        out.append(_LETTERS[c])
     if reverse:
-        letters = letters[::-1]
-    return _compress_s_runs_keep_others(letters, names)
+        out.reverse()
+    return _compress_s_runs(out)
 
 
-def _compress_s_runs_keep_others(letters: list[str], names: dict[str, str]) -> list[str]:
-    return _compress_s_runs([names[c] for c in letters])
+def _gates_of(result, what: str) -> str:
+    if not result or result.gates is None:
+        raise RuntimeError(f"cyclosynth found no circuit for {what}")
+    return result.gates
 
 
 def rz_matrix(theta: float) -> np.ndarray:
     return np.array([[np.exp(-0.5j * theta), 0], [0, np.exp(0.5j * theta)]])
 
 
-def _calibrate_gridsynth() -> bool:
-    """Work out, once, whether the gridsynth string lists the last-applied gate first."""
-    theta, eps = 0.3, 1e-3
-    s = _gridsynth_letters(theta, eps)
+def ry_matrix(theta: float) -> np.ndarray:
+    c, s = math.cos(theta / 2), math.sin(theta / 2)
+    return np.array([[c, -s], [s, c]], dtype=complex)
+
+
+def _calibrate_cyclosynth() -> bool:
+    """Work out, once, whether cyclosynth's gate string is in matrix order (so the last letter is
+    applied first). Its README says matrix order, its type stub says time order; trust neither."""
+    cs, eps = _cyclosynth(), 1e-3
+    cases = [
+        (_gates_of(cs.synthesize_rz(0.3, eps), "calibration Rz"), rz_matrix(0.3)),
+        (
+            _gates_of(cs.synthesize_u3(1.0472, 2.7577, 5.3947, eps), "calibration U3"),
+            rz_matrix(2.7577) @ ry_matrix(1.0472) @ rz_matrix(5.3947),
+        ),
+    ]
     best = []
     for reverse in (False, True):
-        m = seq_matrix(_letters_to_gates(s, reverse))
-        best.append((phase_distance(m, rz_matrix(theta)), reverse))
+        d = max(phase_distance(seq_matrix(_letters_to_gates(g, reverse)), m) for g, m in cases)
+        best.append((d, reverse))
     d, reverse = min(best)
     if d > 10 * eps:
-        raise RuntimeError(f"cannot interpret pygridsynth output (distance {d:.2e})")
+        raise RuntimeError(f"cannot interpret cyclosynth output (distance {d:.2e})")
     return reverse
+
+
+def _to_gates(letters: str) -> list[str]:
+    global _CS_REVERSED
+    if _CS_REVERSED is None:
+        _CS_REVERSED = _calibrate_cyclosynth()
+    return _letters_to_gates(letters, _CS_REVERSED)
 
 
 def synth_rz(theta: float, eps: float) -> list[str]:
     """Rz(theta) = diag(e^{-i theta/2}, e^{i theta/2}) as Clifford+T gates (time order)."""
-    global _GS_REVERSED
     k = round(theta / (math.pi / 4))
     if abs(theta - k * math.pi / 4) < 1e-9:
         return list(EXACT_RZ[k % 8])
-    if _GS_REVERSED is None:
-        _GS_REVERSED = _calibrate_gridsynth()
-    return _letters_to_gates(_gridsynth_letters(theta, eps), _GS_REVERSED)
+    return _to_gates(_gates_of(_cyclosynth().synthesize_rz(theta, eps), f"Rz({theta})"))
 
 
 def synth_1q(u: np.ndarray, eps: float, cliff_tol: float = 1e-7) -> list[str]:
     """Clifford+T gates (time order) equal to `u` up to a global phase.
 
-    Exact for identity, Paulis and Cliffords (within `cliff_tol`); otherwise a ZYZ decomposition
-    with every Rz synthesised to `eps`, so the whole sequence is within about 3*eps of `u`.
+    Exact for identity, Paulis and Cliffords (within `cliff_tol`). Otherwise `u` ~ Rz(phi) Ry(theta)
+    Rz(lam) goes to cyclosynth: a diagonal target as one Rz, a general one through its jointly
+    optimised U3 route (valid for eps >= 1e-10), falling back to the rotation-by-rotation ZYZ
+    route (eps/3 each) below that or if the joint search finds nothing.
     """
     if phase_distance(u, I2) < cliff_tol:
         return []
@@ -215,11 +254,18 @@ def synth_1q(u: np.ndarray, eps: float, cliff_tol: float = 1e-7) -> list[str]:
     from qiskit.synthesis import OneQubitEulerDecomposer
 
     theta, phi, lam = OneQubitEulerDecomposer("ZYZ").angles(u)  # u ~ Rz(phi) Ry(theta) Rz(lam)
-    out = synth_rz(lam, eps)
-    if abs(theta) > 1e-12:
-        # Ry(b) = S H Rz(b) H Sdg as a matrix product, so in time order: sdg, h, rz, h, s.
-        out += ["sdg", "h"] + synth_rz(theta, eps) + ["h", "s"]
-    out += synth_rz(phi, eps)
+    if abs(theta) < 1e-12:
+        out = synth_rz(phi + lam, eps)
+    else:
+        cs = _cyclosynth()
+        r = None
+        if SYNTH_MODE == "u3" and eps >= 1e-10:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                r = cs.synthesize_u3(float(theta), float(phi), float(lam), eps)
+        if not r or r.gates is None:
+            r = cs.synthesize_zyz(float(phi), float(theta), float(lam), eps)
+        out = _to_gates(_gates_of(r, "a general unitary"))
     out = _compress_s_runs(out)
     err = phase_distance(seq_matrix(out), u)
     if err > max(8 * eps, 1e-9):
@@ -441,8 +487,11 @@ class Lowerer:
         return "\n".join(head + self.lines) + "\n"
 
 
-def lower(qc, epsilon: float = 1e-8, clifford_tol: float = 1e-7) -> tuple[str, Counter]:
+def lower(qc, epsilon: float = 1e-8, clifford_tol: float = 1e-7,
+          synth_mode: str = "u3") -> tuple[str, Counter]:
     """Lower a dcsynth circuit; returns (OpenQASM 2 text, statistics)."""
+    global SYNTH_MODE
+    SYNTH_MODE = synth_mode
     lw = Lowerer(qc, epsilon, clifford_tol)
     text = lw.run()
     return text, lw.stats
@@ -466,14 +515,18 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("input", type=Path)
     ap.add_argument("-o", "--output", type=Path, help="default: <input stem>.cliffordt.qasm")
-    ap.add_argument("--epsilon", type=float, default=1e-8, help="gridsynth precision per Rz")
+    ap.add_argument("--epsilon", type=float, default=1e-8, help="cyclosynth diamond-distance precision per 2x2 unitary")
     ap.add_argument(
         "--clifford-tol", type=float, default=1e-7,
         help="a 2x2 unitary this close to a Clifford is snapped to it exactly",
     )
+    ap.add_argument(
+        "--synth", choices=("u3", "zyz"), default="u3",
+        help="u3: jointly optimised U3 (fewest T, slow at eps 1e-8); zyz: three fast Rz syntheses",
+    )
     args = ap.parse_args()
     qc = load_circuit(args.input)
-    text, st = lower(qc, args.epsilon, args.clifford_tol)
+    text, st = lower(qc, args.epsilon, args.clifford_tol, args.synth)
     out = args.output or args.input.with_suffix(".cliffordt.qasm")
     out.write_text(text)
     print(

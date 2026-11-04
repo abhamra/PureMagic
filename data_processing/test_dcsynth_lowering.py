@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for dcsynth_to_cliffordt.py, and the dcsynth -> transpile -> oracle pipeline.
 
-Run (needs numpy, qiskit, pygridsynth; the `transpile` binary must be built):
+Run (needs numpy, qiskit, cyclosynth; the `transpile` binary must be built):
 
   cargo build --release --bin transpile
   python data_processing/test_dcsynth_lowering.py            # or: pytest data_processing/

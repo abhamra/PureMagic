@@ -51,6 +51,14 @@ The lowering applies the cheapest reference unitary unconditionally and conditio
 difference. dcsynth's corrections are `P_a . U` (a Pauli or Clifford after a block's unitary), so
 the differences are Paulis, which are free frame updates, instead of conditional T rotations.
 
+In practice the corrections are Paulis only up to dcsynth's branch accuracy. On `ae_4` (from the
+dcsynth artifact's exp. 1 library) each correction is "identity for one outcome, X for the other"
+to within about 1e-5. With the default `--clifford-tol 1e-7` that residue is a real rotation and
+costs conditional T gates (hundreds at eps 1e-6). cyclosynth finds a Pauli when one lies within
+`--epsilon`, so at coarse epsilon the corrections become free frame updates on their own, and
+`--clifford-tol 1e-4` snaps them at any epsilon. Choose the tolerance to match the error you
+already accept from dcsynth.
+
 ## The three ideas in `transpile`
 
 **1. Measurement needs nothing special.** In the Heisenberg picture a measurement of `Z_q` after
@@ -148,9 +156,13 @@ what `validate_dynamic.py` checks.
 
 * Conditional CX/CZ, a measurement inside an `if`, and classical expressions are rejected, not
   dropped. dcsynth's default "perqubit" layout never needs them.
-* Rz synthesis is approximate (`--epsilon`, per rotation); Pauli and Clifford corrections are exact.
+* Synthesis is approximate (`--epsilon`, diamond distance per 2x2 unitary); Pauli and Clifford
+  corrections are exact.
 * Several conditions on one `if_else` are completed to all `2^k` assignments (k <= 8).
 * `compile_cliffordt` does not handle dynamic circuits; use the converter, which synthesises
-  gates itself with `pygridsynth`.
+  gates itself with `cyclosynth` (build it from the `cyclosynth/` submodule). `--synth u3`
+  (default) is the jointly optimised route: fewest T, but seconds per rotation at eps 1e-8 and
+  valid for eps >= 1e-10; `--synth zyz` is three native Rz syntheses, about 2.5-3x the T but
+  milliseconds at any epsilon.
 * The model has no notion of the ancilla being a different kind of patch: every qubit, ancilla
   included, is a logical data patch in the layout.
