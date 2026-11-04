@@ -124,6 +124,26 @@ python data_processing/test_dcsynth_lowering.py                # converter, end 
 exactly (statevector, branching at every measurement) and compares the joint distribution of all
 outcomes (total variation < 1e-9) in every reset mode and width.
 
+## Visualizing and checking a schedule
+
+```bash
+./target/release/puremagic -c circuit.trans --reaction-latency 5
+python data_processing/plot_dynamic.py circuit.trans            # reads circuit.schedule, circuit.trans.dyn.json
+python data_processing/plot_dynamic.py circuit.trans --window 0:600 -o out/zoom
+```
+
+`plot_dynamic.py` re-derives the constraints from the `.trans` file and checks the `.schedule`
+output against them, without using the scheduler's code: every product scheduled once (CX two
+consecutive lcycles, S/SX a short consecutive run), a product starts after the previous product on
+each of its qubits, a product with `@k` starts at least `L+1` lcycles after product `k` ended, no qubit
+is used twice in one lcycle, and the sidecar is consistent (every `needs` has its `@` edge; frame
+dependencies and fix events only use outcomes already measured). It exits 1 on any violation. It writes
+`<prefix>.timeline.png` (one row per qubit; conditional products outlined in red; an arrow from each
+measurement to what waits on it, so the reaction gap is visible) and `<prefix>.overview.png`
+(occupancy per qubit over the whole run plus cumulative T and measurement counts). The timeline
+shows the first ~3000 products unless `--window` is given. Outcome-correctness (not just ordering) is
+what `validate_dynamic.py` checks.
+
 ## Limits
 
 * Conditional CX/CZ, a measurement inside an `if`, and classical expressions are rejected, not

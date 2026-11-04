@@ -1,0 +1,31 @@
+# Everything in requirements.txt plus the two local bqskit forks. Requires the
+# bqskit/ and bqskit-ft/ clones in the repo root (both are gitignored).
+# Run from the repo root: pip install -r requirements-bqskit.txt
+-r requirements.txt
+# Editable install from the local bqskit/ clone (branch ZXZXZ-fix), not stock
+# PyPI bqskit: fixes ZXZXZDecomposition doubling synthesis calls for diagonal
+# unitaries (see data_processing/compile_cliffordt.py's build_bqskit_workflow
+# docstring -- ~25% fewer T gates on diagonal-heavy circuits via the bqskit
+# backend). A plain `bqskit` line here would silently reinstall the stock
+# package and lose that fix with no error -- it's still a valid, importable
+# package either way, just worse. Resolved relative to the cwd pip is run
+# from (postCreateCommand runs from the workspace root), not this file's own
+# location -- a pip quirk for local-path editable installs.
+#
+# This editable line alone is NOT enough to make `import bqskit` work: bqskit-ft
+# below installs into site-packages/bqskit/ft/, which without a sibling
+# __init__.py is a namespace portion that shadows the editable clone entirely
+# (`from bqskit import Circuit` then fails). The devcontainer's PYTHONPATH
+# entry is what resolves it -- see the containerEnv comment in
+# .devcontainer/devcontainer.json before changing either line.
+-e ./bqskit
+# Editable install from the local bqskit-ft/ clone, not stock PyPI bqskit-ft:
+# the PyPI-published bqskit-ft==0.2.0 has a materially different GridSynthPass
+# API (a `precision: int` gate-count-style parameter) from this clone's
+# (`algorithmic_error: float`, an actual epsilon bound), which is what
+# data_processing/compile_cliffordt.py's build_final_synthesis_passes calls
+# with. A plain `bqskit-ft` line here installs cleanly and imports fine, so
+# there's no install-time signal that anything is wrong -- it only surfaces
+# as `TypeError: GridSynthPass.__init__() got an unexpected keyword argument
+# 'algorithmic_error'` the first time the bqskit backend actually runs.
+-e ./bqskit-ft
