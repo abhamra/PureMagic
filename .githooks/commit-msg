@@ -36,4 +36,16 @@ if printf '%s\n' "$body" | grep -qiE '^[[:space:]]*[a-z][a-z-]*:.*noreply@anthro
 	fail "assistant no-reply address in a trailer"
 fi
 
+# Session links and "generated with" banners that assistant tools append.
+if printf '%s\n' "$body" | grep -qiE '^[[:space:]]*claude-session:'; then
+	fail "Claude-Session trailer"
+fi
+if printf '%s\n' "$body" | grep -qiE 'generated (with|by) \[?(claude|chatgpt|copilot|gemini)'; then
+	fail "\"generated with\" assistant banner"
+fi
+# A session URL on its own, without a trailer key (as appended to PR descriptions).
+if printf '%s\n' "$body" | grep -qiE 'claude\.ai/code/session_'; then
+	fail "assistant session link"
+fi
+
 exit 0
