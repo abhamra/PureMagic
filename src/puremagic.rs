@@ -59,6 +59,12 @@ struct Args {
     /// Use only the sides of data qubits for edges, not the top and bottom
     #[arg(short = 'S', long = "sides_only")]
     sides_only: bool,
+    /// Logical qubits to host on injection patches, e.g. `3,4` (pure-magic mode, -u, only).
+    /// A hosted qubit's patch cultivates magic states while the qubit is idle: it is live
+    /// from when its first product is ready until its last one completes. A listed qubit
+    /// that no product touches stays dormant for the whole run.
+    #[arg(long = "ancilla-qubits", value_delimiter = ',', num_args = 1..)]
+    ancilla_qubits: Vec<u16>,
     /// Record normalized cultivation-time distribution to <CIRCUIT_FNAME>.cultivation_dist
     #[arg(short = 'C', long)]
     record_cultivation_dist: bool,
@@ -114,6 +120,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.plot.contains(&"cstats".to_string()) {
         circuit.plot_layer_stats()?;
     }
+    if !args.ancilla_qubits.is_empty() && !args.use_magic_routing {
+        return Err("--ancilla-qubits needs pure-magic mode (-u): a hosted patch is a \
+                    magic-state cultivator while idle, and only -u routes through those"
+            .into());
+    }
+    if let Some(&q) = args.ancilla_qubits.iter().find(|&&q| q as usize >= circuit.n_qubits) {
+        return Err(format!(
+            "--ancilla-qubits: qubit {} is outside the circuit ({} qubits)",
+            q, circuit.n_qubits
+        )
+        .into());
+    }
     let mut topo_graph = TopoGraph::new();
     let rseed: u32 = if args.randomize_data_qubits { args.common.rseed as u32 } else { 0 };
     let n_data_qubits = circuit.n_qubits;
@@ -126,6 +144,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.common.ancilla_rows,
         args.sides_only,
     );
+    if !args.ancilla_qubits.is_empty() {
+        topo_graph.host_qubits(&args.ancilla_qubits)?;
+        println!("Hosted ancilla qubits (injection patches): {:?}", topo_graph.hosted_qubits);
+    }
     if args.plot.contains(&"topo".to_string()) {
         topo_graph.plot(".topo", &[], "")?;
         topo_graph.print()?;
@@ -158,6 +180,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     println!("Parallelism: {:.3}x", n_scheduled as f64 / tot_lcycles as f64);
+    for &q in &sched.input.topo.hosted_qubits {
+        let live = sched.hosted_live_lcycles(q);
+        println!(
+            "Hosted ancilla q{}: live {} / {} lcycles ({:.1}%), went live {} time(s)",
+            q,
+            live,
+            tot_lcycles,
+            100.0 * live as f64 / tot_lcycles.max(1) as f64,
+            sched.hosted_activations(q)
+        );
+    }
 
     let mut rng = StdRng::seed_from_u64(args.common.rseed);
     let est = sched.input.circuit.estimate_layer_volume(

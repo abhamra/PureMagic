@@ -525,7 +525,8 @@ impl Circuit {
         for pp in &self.pps {
             for &a in &pp.after {
                 let child = first_id[pp.id as usize];
-                let parent = first_id.get(a as usize + 1).copied().unwrap_or(expanded.len() as i32) - 1;
+                let parent =
+                    first_id.get(a as usize + 1).copied().unwrap_or(expanded.len() as i32) - 1;
                 // A duplicate of a qubit-overlap edge is harmless: parents and children stay
                 // consistent, exactly as for a CX whose two qubits share a parent.
                 deps.push((child, parent));
