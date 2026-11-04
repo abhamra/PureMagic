@@ -55,9 +55,20 @@ def read_trans(path):
     return prods
 
 
+class Schedule(defaultdict):
+    """{product id: [lcycles]} plus ``kinds``: {product id: kind as printed}."""
+
+    def __init__(self):
+        super().__init__(list)
+        self.kinds = {}
+
+
 def read_schedule(path):
-    """Return {product id: [lcycles]} (a CX appears in two lcycles)."""
-    when = defaultdict(list)
+    """Return {product id: [lcycles]} (a CX appears in two lcycles).
+
+    ``when.kinds`` maps each id to the kind the schedule prints for it; the scheduler's own
+    S-correction products (ids past the end of the trans file) are only known from there."""
+    when = Schedule()
     with open(path) as f:
         for line in f:
             line = ANSI.sub("", line.rstrip("\n"))
@@ -67,8 +78,9 @@ def read_schedule(path):
             if not m:
                 raise SystemExit(f"{path}: cannot parse schedule line {line!r}")
             lc = int(m.group(1))
-            for pid, _kind in ITEM.findall(m.group(3)):
+            for pid, kind in ITEM.findall(m.group(3)):
                 when[int(pid)].append(lc)
+                when.kinds[int(pid)] = kind
     return when
 
 
@@ -102,9 +114,22 @@ def check(prods, when, side, L):
         if ls != list(range(ls[0], ls[0] + len(ls))):
             err(f"product {i} <{kind}> lcycles {ls} are not consecutive")
         start[i], end[i] = ls[0], ls[-1]
-    for i in when:
-        if i >= n:
-            err(f"schedule mentions product {i}, but the trans file has only {n}")
+    # The scheduler adds S corrections after T gates (ids from n upward, see
+    # Scheduler::next_correction_id). Accept those; anything else past the end is an error.
+    n_corr = 0
+    for i in sorted(when):
+        if i < n:
+            continue
+        ls = sorted(when[i])
+        kind = when.kinds.get(i)
+        if kind != "S":
+            err(f"schedule mentions product {i} <{kind}>, but the trans file has only {n}")
+        elif not 1 <= len(ls) <= 4 or ls != list(range(ls[0], ls[0] + len(ls))):
+            err(f"scheduler S correction {i} has lcycles {ls}, expected 1-4 consecutive")
+        else:
+            n_corr += 1
+    if n_corr:
+        print(f"{n_corr} scheduler-added S correction(s) accepted")
 
     # qubit order + classical order
     last = {}
