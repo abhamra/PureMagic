@@ -5,6 +5,8 @@ Cliffords are commuted there too. A *dynamic* circuit (for example the output of
 ancilla-reuse compiler) measures a qubit in the middle, resets it, reuses it, and applies gates
 that depend on the measurement outcomes. This document describes how that is supported; `docs/mcm-changes.md` is the full specification
 (every change, the file formats, the timing model, costs and limits).
+`notebooks/dynamic_circuit_tutorial.ipynb` walks one small circuit through every step, from
+dcsynth to the checked schedule.
 
 Nothing here changes how a static circuit is transpiled or scheduled. Without `reset`, `if(...)`
 or a mid-circuit `measure`, the outputs are identical to before (the `--sidecar` file is the only
