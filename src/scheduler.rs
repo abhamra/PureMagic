@@ -638,7 +638,7 @@ impl Scheduler {
                 let dormant = match self.hosted.chain[qi].get(self.hosted.done[qi]) {
                     None => true,
                     Some(&next) => {
-                        Self::releases_patch(self.input.circuit.product(id), q)
+                        self.releases_patch_now(id, q)
                             && !self.pps_pending.iter().any(|pp| pp.id == next)
                     }
                 };
@@ -1021,6 +1021,59 @@ impl Scheduler {
     /// `precomputed_terminals`/`precomputed_root_info` and returning any (qubit, new_basis) swaps.
     /// Always recomputes from the circuit's original operators so changing correction_power
     /// between lcycles is reflected correctly.
+    /// True if product `pp_id`'s basis must be (re)computed against the pending S corrections:
+    /// one of its qubits has an odd correction power, or it was conjugated before and the
+    /// correction has since been resolved.
+    fn conjugation_due(&self, pp_id: i32) -> bool {
+        self.input
+            .circuit
+            .product(pp_id)
+            .operators
+            .iter()
+            .any(|op| self.correction_power[op.qubit as usize] % 2 == 1)
+            || self.conjugated_t_products.contains(&pp_id)
+    }
+
+    /// Re-derives product `pp_id`'s terminals from the pending corrections (`apply_t_conjugation`)
+    /// and records whether it is now conjugated. Returns the qubits whose basis changed.
+    fn refresh_conjugation(&mut self, pp_id: i32) -> Vec<(u16, char)> {
+        let swapped = self.apply_t_conjugation(pp_id);
+        if swapped.is_empty() {
+            self.conjugated_t_products.remove(&pp_id);
+        } else {
+            self.conjugated_t_products.insert(pp_id);
+        }
+        swapped
+    }
+
+    /// True if product `id`, once complete, leaves patch `q` in a state a fresh patch can
+    /// reproduce (`releases_patch`), judged in the basis it was actually measured in: a pending
+    /// odd S correction on `q` turns an X measurement into Y, which does not release the patch.
+    fn releases_patch_now(&self, id: i32, q: u16) -> bool {
+        let pp = self.input.circuit.product(id);
+        if !Self::releases_patch(pp, q) {
+            return false;
+        }
+        if pp.gate_type.is_r() || self.correction_power[q as usize] % 2 == 0 {
+            return true;
+        }
+        let basis =
+            Self::conjugate_pauli_label(pp.operators[0].basis, self.correction_basis[q as usize]);
+        matches!(basis, 'X' | 'Z')
+    }
+
+    /// A re-initialization `<R>` replaces the patch's state, so any S correction still owed to
+    /// the old state is void.
+    fn clear_corrections_on_reinit(&mut self) {
+        for i in 0..self.pp_paths.len() {
+            let pp = self.input.circuit.product(self.pp_paths[i].0);
+            if pp.gate_type.is_r() {
+                let q = pp.operators[0].qubit as usize;
+                self.correction_power[q] = 0;
+            }
+        }
+    }
+
     fn apply_t_conjugation(&mut self, pp_id: i32) -> Vec<(u16, char)> {
         // Copy original operator data to release the borrow on self.input.circuit.
         let orig_ops: Vec<(u16, char)> = self
@@ -1223,6 +1276,43 @@ impl Scheduler {
         // before the loop body calls `&mut self` methods.
         let ids_to_process: Vec<i32> = self.remaining_ids_buf.clone();
         for &pp_id in &ids_to_process {
+            // A multi-qubit measurement whose basis a pending S correction changes cannot use
+            // its tree (precomputed for the original basis): route it now, on its conjugated
+            // terminals.
+            if self.input.circuit.product(pp_id).gate_type.is_m()
+                && self.precomputed_clifford_trees.contains_key(&pp_id)
+                && self.conjugation_due(pp_id)
+            {
+                self.refresh_conjugation(pp_id);
+                if self.conjugated_t_products.contains(&pp_id) {
+                    let result = if self.terminal_nodes(pp_id) {
+                        self.sched_t_or_multi(pp_id, plotting)
+                    } else {
+                        PathResult::NoPath
+                    };
+                    match result {
+                        PathResult::PathFound(opt_graph) => {
+                            to_remove.push(pp_id);
+                            if let Some(ref g) = opt_graph {
+                                let node_ids: Vec<u16> = g.iter_nodes().collect();
+                                self.mark_nodes_used(&node_ids);
+                            }
+                            let keep = if plotting { opt_graph.map(Rc::new) } else { None };
+                            self.pp_paths.push((pp_id, keep));
+                        }
+                        PathResult::NoPath => {
+                            let pp = self.input.circuit.product(pp_id);
+                            Self::mark_blocked_product_as_used(
+                                &mut self.used,
+                                &self.input.topo,
+                                pp,
+                            );
+                        }
+                    }
+                    continue;
+                }
+                // The correction no longer changes its basis: the precomputed tree applies.
+            }
             // Clone the Rc to end the immutable borrow on `precomputed_clifford_trees`.
             let Some(tree) = self.precomputed_clifford_trees.get(&pp_id).map(Rc::clone) else {
                 continue;
@@ -1469,23 +1559,12 @@ impl Scheduler {
             }
             // Apply just-in-time S^k conjugation (X<->Y swap for odd power) only when needed;
             // skipping the common case avoids Vec allocations and topology lookups every lcycle.
-            if gate_type.is_t() {
-                let any_odd_correction = self
-                    .input
-                    .circuit
-                    .product(pp_id)
-                    .operators
-                    .iter()
-                    .any(|op| self.correction_power[op.qubit as usize] % 2 == 1);
-                let was_conjugated = self.conjugated_t_products.contains(&pp_id);
-                if any_odd_correction || was_conjugated {
-                    let swapped = self.apply_t_conjugation(pp_id);
-                    if swapped.is_empty() {
-                        self.conjugated_t_products.remove(&pp_id);
-                    } else {
-                        self.conjugated_t_products.insert(pp_id);
-                        self.t_conjugated_bases.insert(pp_id, swapped);
-                    }
+            // A measurement is conjugated like a T: measuring P on the state before a pending
+            // correction S is measuring S^dag P S, and the correction stays pending afterwards.
+            if (gate_type.is_t() || gate_type.is_m()) && self.conjugation_due(pp_id) {
+                let swapped = self.refresh_conjugation(pp_id);
+                if gate_type.is_t() && !swapped.is_empty() {
+                    self.t_conjugated_bases.insert(pp_id, swapped);
                 }
             }
             if *n_avail_magic > 0 || !gate_type.is_t() {
@@ -1621,7 +1700,8 @@ impl Scheduler {
             )
         } else {
             debug_assert!(
-                !Self::should_precompute(self.input.circuit.product(pp_id)),
+                !Self::should_precompute(self.input.circuit.product(pp_id))
+                    || self.conjugated_t_products.contains(&pp_id),
                 "should_precompute product {:?} reached Steiner path",
                 pp_id
             );
@@ -1663,6 +1743,7 @@ impl Scheduler {
         self.cultivation.t_products_remaining =
             self.cultivation.t_products_remaining.saturating_sub(t_newly_scheduled);
         self.process_t_gate_outcomes();
+        self.clear_corrections_on_reinit();
         self.unlock_children();
         let ready = std::mem::take(&mut self.children_buf);
         self.children_buf = self.admit(ready);
@@ -2716,7 +2797,10 @@ mod tests {
         let mut sched = hosted_scheduler(lines, &[3], 8);
         init_hosting_only(&mut sched);
         sched.activate_hosted_for(&[0]);
+        // About Z, so the Z measurement stays a Z measurement and still releases the patch
+        // (an S_X correction would make it a Y measurement, which does not).
         sched.correction_power[3] = 1;
+        sched.correction_basis[3] = 'Z';
         sched.hosted.completed_buf.extend_from_slice(&[0, 1]); // T, then the releasing M
         sched.retire_hosted();
         assert!(!sched.hosted.live[3]);
@@ -2850,5 +2934,67 @@ mod tests {
         assert_eq!(sched.hosted_activations(3), 1);
         assert_eq!(sched.hosted.remaining[3], 0);
         assert!(!sched.hosted.live[3]);
+    }
+
+    // ── measurements under a pending T-failure correction ───────────────────────────
+
+    /// Runs `lines` with a pending S correction (power 1, about `axis`) on qubit `q` at the start.
+    fn run_with_pending(lines: &[&str], q: usize, axis: char) -> Scheduler {
+        let mut sched = build_scheduler(lines, 0);
+        sched.correction_power[q] = 1;
+        sched.correction_basis[q] = axis;
+        sched.sched_circuit().expect("sched_circuit failed");
+        sched
+    }
+
+    #[test]
+    fn pending_correction_turns_an_x_measurement_into_y_and_stays_pending() {
+        let sched = run_with_pending(&["+X___<M>"], 0, 'Z');
+        assert!(sched.conjugated_t_products.contains(&0), "S_Z conjugates X to Y");
+        assert_eq!(sched.precomputed_terminals[0].len(), 2, "a Y measurement uses both nodes");
+        assert_eq!(lcycle_of(&sched, 0), 1);
+        assert_eq!(sched.correction_power[0], 1, "measuring does not discharge the correction");
+    }
+
+    #[test]
+    fn pending_correction_about_the_same_axis_leaves_a_measurement_alone() {
+        let sched = run_with_pending(&["+Z___<M>"], 0, 'Z');
+        assert!(!sched.conjugated_t_products.contains(&0));
+        assert_eq!(sched.precomputed_terminals[0].len(), 1);
+    }
+
+    #[test]
+    fn multi_qubit_measurement_is_routed_live_on_its_conjugated_basis() {
+        // Its precomputed tree is for X⊗Z; with S_Z pending on q0 it is measured as Y⊗Z.
+        let sched = run_with_pending(&["+XZ__<M>"], 0, 'Z');
+        assert!(sched.conjugated_t_products.contains(&0));
+        assert_eq!(sched.precomputed_terminals[0].len(), 3, "Y on q0 (2 nodes) + Z on q1");
+        assert_eq!(lcycle_of(&sched, 0), 1);
+    }
+
+    #[test]
+    fn reinitialization_voids_a_pending_correction() {
+        let sched = run_with_pending(&["+Z___<M>", "+Z___<R>"], 0, 'X');
+        assert_eq!(sched.correction_power[0], 0);
+    }
+
+    #[test]
+    fn hosted_patch_is_not_released_by_an_effective_y_measurement() {
+        // q3: X measurement, then a T after q0's long chain. Plain, the measurement releases the
+        // patch (two live windows); with S_Z pending on q3 it is a Y measurement and does not.
+        let mut lines = vec!["+___X<M>"];
+        lines.extend(std::iter::repeat("+X___<T>").take(30));
+        lines.push("+X__X<T>");
+        let run = |pending: bool| {
+            let mut sched = hosted_scheduler(&lines, &[3], 5);
+            if pending {
+                sched.correction_power[3] = 1;
+                sched.correction_basis[3] = 'Z';
+            }
+            sched.sched_circuit().expect("hosted schedule failed");
+            sched.hosted_activations(3)
+        };
+        assert_eq!(run(false), 2);
+        assert_eq!(run(true), 1);
     }
 }
