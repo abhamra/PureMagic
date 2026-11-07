@@ -109,6 +109,22 @@ impl Circuit {
                     deps.push((pp.id, a));
                 }
             }
+            // A condition can only be decided once its outcomes are known, so every product it
+            // names must be a classical dependency, and a measurement.
+            for &(c, _) in &pp.cond {
+                assert!(
+                    pp.after.contains(&c),
+                    "product {} is conditioned on product {}, which is not in its @ list",
+                    pp.id,
+                    c
+                );
+                assert!(
+                    self.pps[c as usize].gate_type.is_m(),
+                    "product {} is conditioned on product {}, which is not a measurement",
+                    pp.id,
+                    c
+                );
+            }
         }
         for (child_id, parent_id) in deps {
             self.pps[child_id as usize].parents.push(parent_id);
@@ -430,6 +446,7 @@ impl Circuit {
                                 parents: vec![],
                                 children: vec![],
                                 after: vec![],
+                                cond: vec![],
                                 max_qubit: op.qubit,
                             };
                             expanded.push(corr);
@@ -457,6 +474,7 @@ impl Circuit {
                                 parents: vec![],
                                 children: vec![],
                                 after: vec![],
+                                cond: vec![],
                                 max_qubit: op.qubit,
                             };
                             expanded.push(corr);

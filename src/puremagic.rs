@@ -73,6 +73,17 @@ struct Args {
     /// modelling the time to decode a logical measurement before acting on its outcome. 0 = ideal.
     #[arg(long = "reaction-latency", default_value_t = 0)]
     reaction_latency: usize,
+    /// Conditional products (a `?id=v,..` suffix in the `.trans` file): `random` samples each
+    /// measurement's outcome and skips products whose condition fails, so the schedule is that
+    /// of the circuit those outcomes call for; `worst` runs them all (an upper bound).
+    #[arg(long = "cond-outcomes", value_enum, default_value_t = scheduler::CondOutcomes::Random)]
+    cond_outcomes: scheduler::CondOutcomes,
+    /// Probability that a measurement's true outcome is 1, for `--cond-outcomes random`.
+    #[arg(long = "cond-p1", default_value_t = 0.5, value_parser = |s: &str| {
+        let p: f64 = s.parse().map_err(|_| format!("'{}' is not a number", s))?;
+        if (0.0..=1.0).contains(&p) { Ok(p) } else { Err(format!("{} is not in [0, 1]", p)) }
+    })]
+    cond_p1: f64,
     #[arg(
         short,
         long,
@@ -165,9 +176,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.record_cultivation_dist,
     );
     sched.set_reaction_latency(args.reaction_latency);
+    sched.set_cond_outcomes(args.cond_outcomes, args.cond_p1);
 
     let (tot_lcycles, n_scheduled) = sched.sched_circuit()?;
-    assert!(n_scheduled >= n_products);
+    assert!(n_scheduled + sched.skipped.len() >= n_products);
     let volume = n_qubits * tot_lcycles;
     println!("Scheduled {} in {} logical cycles, volume {}", n_scheduled, tot_lcycles, volume);
     if !args.common.no_t_failures && n_sx_cliffords > 0 {

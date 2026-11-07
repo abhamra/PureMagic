@@ -88,6 +88,11 @@ pub(crate) struct PauliProduct {
     /// e.g. a gate conditioned on a mid-circuit measurement. They become DAG edges in
     /// `Circuit::gen_deps` even though the products share no qubit.
     pub after: Vec<i32>,
+    /// Condition, parsed from a `?id=v,..` suffix: the product runs only if the true outcome of
+    /// every named product (a measurement, also listed in `after`) equals `v`. Empty for an
+    /// unconditional product. The scheduler skips a product whose condition is false (see
+    /// `Scheduler::set_cond_outcomes`).
+    pub cond: Vec<(i32, bool)>,
     pub max_qubit: u16,
     pub id: i32,
     pub gate_type: GateType,
@@ -101,6 +106,7 @@ impl Default for PauliProduct {
             parents: Vec::new(),
             children: Vec::new(),
             after: Vec::new(),
+            cond: Vec::new(),
             id: -1,
             gate_type: GateType::T,
         }
@@ -112,14 +118,35 @@ impl PauliProduct {
         Self::default()
     }
 
-    /// Parses a circuit format string: `[±][X/Y/Z/_...][<gate_type>][@id,id,..]`.
+    /// Parses a circuit format string: `[±][X/Y/Z/_...][<gate_type>][@id,id,..][?id=v,..]`.
     ///
     /// The optional `@` suffix lists the ids of earlier products this one classically depends
     /// on (see [`PauliProduct::after`]). Ids count the products kept by `Circuit::load_circuit`,
-    /// which for `transpile` output is simply the 0-based line number.
+    /// which for `transpile` output is simply the 0-based line number. The optional `?` suffix
+    /// is the product's condition (see [`PauliProduct::cond`]); each id it names must also be in
+    /// the `@` list, which `Circuit::gen_deps` checks.
     pub(crate) fn set_from_str(&mut self, product_id: i32, s: &str) -> Result<(), Box<dyn Error>> {
         self.id = product_id;
         let full = s;
+        let (s, cond) = match s.split_once('?') {
+            Some((body, terms)) => {
+                let mut v = Vec::new();
+                for tok in terms.split(',') {
+                    let bad = || format!("Bad condition term `{}` in product {}", tok, full);
+                    let (id, val) = tok.trim().split_once('=').ok_or_else(bad)?;
+                    let id: i32 = id.parse().map_err(|_| bad())?;
+                    let val = match val {
+                        "0" => false,
+                        "1" => true,
+                        _ => return Err(bad().into()),
+                    };
+                    v.push((id, val));
+                }
+                (body, v)
+            }
+            None => (s, Vec::new()),
+        };
+        self.cond = cond;
         let (s, after) = match s.split_once('@') {
             Some((body, ids)) => {
                 let mut v = Vec::new();
@@ -365,6 +392,26 @@ mod tests {
         let mut plain = PauliProduct::new();
         plain.set_from_str(0, "+_Z_<T>").unwrap();
         assert!(plain.after.is_empty());
+        assert!(plain.cond.is_empty());
+    }
+
+    #[test]
+    fn set_from_str_condition_suffix() {
+        let mut pp = PauliProduct::new();
+        pp.set_from_str(9, "+___Z<S>@3,5?3=1,5=0").unwrap();
+        assert!(pp.gate_type.is_s());
+        assert_eq!(pp.after, vec![3, 5]);
+        assert_eq!(pp.cond, vec![(3, true), (5, false)]);
+        assert_eq!(pp.operators.len(), 1);
+        assert_eq!(pp.operators[0].qubit, 3);
+    }
+
+    #[test]
+    fn set_from_str_rejects_malformed_condition() {
+        for bad in ["+_Z<T>@1?1=2", "+_Z<T>@1?1", "+_Z<T>@1?x=1"] {
+            let mut pp = PauliProduct::new();
+            assert!(pp.set_from_str(4, bad).is_err(), "{} should not parse", bad);
+        }
     }
 
     #[test]

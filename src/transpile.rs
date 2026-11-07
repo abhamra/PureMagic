@@ -1633,30 +1633,35 @@ fn write_trans(output_path: &str, items: &[TransItem]) -> io::Result<(usize, usi
         }
     }
 
+    let line_of = |m: &usize| *meas_line.get(m).expect("a needed outcome comes from an emitted M");
     for item in items {
-        let needs = match item {
+        let (needs, cond) = match item {
             TransItem::Pauli(p) => {
                 if p.label == "T" {
                     n_ts += 1;
                 }
-                &p.meta.needs
+                (&p.meta.needs, &p.meta.cond)
             }
             TransItem::Clifford(c) => {
                 n_cliffords += 1;
-                &c.meta.needs
+                (&c.meta.needs, &c.meta.cond)
             }
             TransItem::Event(_) => continue,
         };
         write!(writer, "{}", item)?;
         if !needs.is_empty() {
-            let mut lines: Vec<usize> = needs
-                .iter()
-                .map(|m| *meas_line.get(m).expect("a needed outcome comes from an emitted M"))
-                .collect();
+            let mut lines: Vec<usize> = needs.iter().map(line_of).collect();
             lines.sort_unstable();
             lines.dedup();
             let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
             write!(writer, "@{}", lines.join(","))?;
+        }
+        // `?line=v,..`: the product runs only if the true outcome of every named measurement line
+        // equals v. Each named line is also in the `@` list (a condition is always needed).
+        if !cond.is_empty() {
+            let terms: Vec<String> =
+                cond.iter().map(|(m, v)| format!("{}={}", line_of(m), *v as u8)).collect();
+            write!(writer, "?{}", terms.join(","))?;
         }
         writeln!(writer)?;
     }
@@ -2596,7 +2601,13 @@ mod tests {
         let m_line = lines.iter().position(|l| l.ends_with("<M>")).unwrap();
         // An unconditional `<S>` may precede it (a flushed H), so pick the line with an edge.
         let s_line = lines.iter().find(|l| l.contains("<S>@")).expect("a conditional S line");
-        assert!(s_line.ends_with(&format!("<S>@{}", m_line)), "{} vs M at {}", s_line, m_line);
+        // ... and carries the condition itself: run only if that line's outcome is 1.
+        assert!(
+            s_line.ends_with(&format!("<S>@{}?{}=1", m_line, m_line)),
+            "{} vs M at {}",
+            s_line,
+            m_line
+        );
     }
 
     #[test]

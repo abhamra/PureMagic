@@ -1193,8 +1193,15 @@ fn dynamic_fixture_transpiles_and_schedules_in_every_reset_mode() {
         let trans = std::fs::read_to_string(tmp.path().join("d.trans")).unwrap();
         // Only `init` re-initialises a patch, so only it emits <R> lines.
         assert_eq!(trans.contains("<R>"), mode == "init", "{}: unexpected <R> presence", mode);
+        // `worst` runs every conditional product, so every line must be scheduled.
         let (ok, stdout, stderr) = run_puremagic(
-            &["--circuit", tmp.path().join("d.trans").to_str().unwrap(), "-F"],
+            &[
+                "--circuit",
+                tmp.path().join("d.trans").to_str().unwrap(),
+                "-F",
+                "--cond-outcomes",
+                "worst",
+            ],
             tmp.path(),
         );
         assert!(ok, "puremagic failed on {} output; stderr:\n{}", mode, stderr);
@@ -1227,8 +1234,10 @@ fn reaction_latency_default_is_a_no_op_and_larger_latency_costs_cycles_per_hop()
         transpile_to(&fixture("dyn_pingpong.cliffordt.qasm"), "pp.trans", &[], tmp.path());
     assert!(ok, "{}", log);
     let circuit = tmp.path().join("pp.trans");
+    // Every conditional gate runs (`worst`), so all three hops are on the critical path.
     let cycles = |extra: &[&str]| {
-        let mut args = vec!["--circuit", circuit.to_str().unwrap(), "-F"];
+        let mut args =
+            vec!["--circuit", circuit.to_str().unwrap(), "-F", "--cond-outcomes", "worst"];
         args.extend_from_slice(extra);
         let (ok, stdout, stderr) = run_puremagic(&args, tmp.path());
         assert!(ok, "puremagic failed; stderr:\n{}", stderr);
@@ -1238,6 +1247,47 @@ fn reaction_latency_default_is_a_no_op_and_larger_latency_costs_cycles_per_hop()
     assert_eq!(cycles(&["--reaction-latency", "0"]), ideal, "latency 0 must equal the default");
     assert_eq!(cycles(&["--reaction-latency", "4"]), ideal + 3 * 4);
     assert_eq!(cycles(&["--reaction-latency", "10"]), ideal + 3 * 10);
+}
+
+#[test]
+fn random_outcomes_run_the_branch_the_outcomes_call_for() {
+    // dyn_pingpong's conditional gates all read `==1`. With P(1) = 1 every one runs, which is
+    // exactly the worst-case schedule; with P(1) = 0 every one is skipped, which is shorter but
+    // still waits out the latency (skipping needs the outcome as much as running does).
+    let tmp = TempDir::new().unwrap();
+    let (ok, log) =
+        transpile_to(&fixture("dyn_pingpong.cliffordt.qasm"), "pp.trans", &[], tmp.path());
+    assert!(ok, "{}", log);
+    let trans = std::fs::read_to_string(tmp.path().join("pp.trans")).unwrap();
+    assert!(trans.lines().any(|l| l.contains('?')), "conditional lines carry `?`");
+    let circuit = tmp.path().join("pp.trans");
+    let run = |extra: &[&str]| {
+        let mut args =
+            vec!["--circuit", circuit.to_str().unwrap(), "-F", "--reaction-latency", "6"];
+        args.extend_from_slice(extra);
+        let (ok, stdout, stderr) = run_puremagic(&args, tmp.path());
+        assert!(ok, "puremagic failed; stderr:\n{}", stderr);
+        (scheduled_counts(&stdout), stdout)
+    };
+    let ((n_worst, worst), _) = run(&["--cond-outcomes", "worst"]);
+    let ((n_all, all), out_all) = run(&["--cond-outcomes", "random", "--cond-p1", "1"]);
+    let ((n_none, none), out_none) = run(&["--cond-outcomes", "random", "--cond-p1", "0"]);
+    assert_eq!((n_all, all), (n_worst, worst), "P(1) = 1 runs every `==1` gate");
+    assert!(out_all.contains("skipped 0 "), "{}", out_all);
+    assert!(n_none < n_worst, "P(1) = 0 skips the conditional gates");
+    assert!(none < worst, "skipping shortens the schedule: {} vs {}", none, worst);
+    assert!(out_none.contains("Conditional products:"), "{}", out_none);
+}
+
+#[test]
+fn cond_p1_outside_the_unit_interval_is_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let (ok, _, stderr) = run_puremagic(
+        &["--circuit", fixture("tiny.trans").to_str().unwrap(), "-F", "--cond-p1", "1.5"],
+        tmp.path(),
+    );
+    assert!(!ok, "--cond-p1 1.5 must be rejected");
+    assert!(stderr.contains("not in [0, 1]"), "{}", stderr);
 }
 
 #[test]

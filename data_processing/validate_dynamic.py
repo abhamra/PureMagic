@@ -259,7 +259,7 @@ def run_reference(n: int, ops) -> dict[tuple, float]:
 
 
 # --------------------------------------------------------------------------- candidate
-LINE = re.compile(r"^([+-])([_XYZ]+)<(\w+)>(?:@([\d,]+))?$")
+LINE = re.compile(r"^([+-])([_XYZ]+)<(\w+)>(?:@([\d,]+))?(?:\?([\d=,]+))?$")
 
 
 def run_trans(n: int, trans_path: str, sidecar: dict | None) -> dict[tuple, float]:
@@ -279,6 +279,13 @@ def run_trans(n: int, trans_path: str, sidecar: dict | None) -> dict[tuple, floa
         want = sorted({line_of_meas[m] for m in recs[k].get("needs", [])})
         assert got == want, f"line {k} `{text}`: @-suffix {got} but sidecar needs lines {want}"
         assert all(a < k for a in got), f"line {k}: classical dependency on a later line"
+        # The `?line=v,..` suffix must be the sidecar's `cond`, written with M lines.
+        cond_txt = LINE.match(text).group(5)
+        got_cond = sorted((int(t.split("=")[0]), int(t.split("=")[1]))
+                          for t in cond_txt.split(",")) if cond_txt else []
+        want_cond = sorted((line_of_meas[m], int(v)) for m, v in recs[k].get("cond", []))
+        assert got_cond == want_cond, (
+            f"line {k} `{text}`: ?-suffix {got_cond} but sidecar cond {want_cond}")
 
     dist: dict[tuple, float] = defaultdict(float)
 

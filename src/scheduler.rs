@@ -165,6 +165,17 @@ impl SchedulerInput {
     }
 }
 
+/// How the scheduler treats conditional products (a `?id=v,..` suffix in the `.trans` file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum CondOutcomes {
+    /// Sample each measurement's true outcome when a condition first needs it (1 with
+    /// probability `cond_p1`), and skip every conditional product whose condition then fails:
+    /// the schedule is that of the circuit the sampled outcomes actually call for.
+    Random,
+    /// Ignore conditions and run every conditional product: an upper bound on the cost.
+    Worst,
+}
+
 /// Assigns Pauli products to lcycles and routes them through the topology.
 pub(crate) struct Scheduler {
     pub(crate) input: SchedulerInput,
@@ -235,6 +246,18 @@ pub(crate) struct Scheduler {
     /// `(due_lcycle, child_id)`: parent completions on classical edges whose release is held back
     /// by `reaction_latency`. Released at the start of the first lcycle after `due_lcycle`.
     delayed_unlocks: Vec<(usize, i32)>,
+    /// Conditional products: how they are decided, and P(outcome = 1) for `Random`.
+    cond_outcomes: CondOutcomes,
+    cond_p1: f64,
+    /// Separate stream for measurement outcomes, so sampling them leaves the cultivation and
+    /// T-failure draws (and hence an unconditional circuit's schedule) unchanged.
+    rng_outcomes: StdRng,
+    /// Sampled true outcome per measurement product id, in the order they were sampled.
+    pub(crate) outcomes: IndexMap<i32, bool>,
+    /// Conditional products skipped because their condition failed, in the order skipped.
+    pub(crate) skipped: Vec<i32>,
+    skipped_set: HashSet<i32>,
+    n_skipped_t: usize,
     /// Hosted-ancilla state (`--ancilla-qubits`), indexed by logical qubit; empty when
     /// nothing is hosted. A hosted patch is dormant (cultivating) until one of its products
     /// is ready, and again after a product that leaves it in a known single-patch state
@@ -326,8 +349,87 @@ impl Scheduler {
             free_merged_products: HashSet::new(),
             reaction_latency: 0,
             delayed_unlocks: Vec::new(),
+            cond_outcomes: CondOutcomes::Random,
+            cond_p1: 0.5,
+            rng_outcomes: StdRng::seed_from_u64(rseed as u64 ^ 0x6f75_7463_6f6d_6573),
+            outcomes: IndexMap::new(),
+            skipped: Vec::new(),
+            skipped_set: HashSet::new(),
+            n_skipped_t: 0,
             hosted: HostedAncillas::default(),
         }
+    }
+
+    /// Sets how conditional products are decided (default: `Random` with `p1` = 0.5).
+    pub(crate) fn set_cond_outcomes(&mut self, mode: CondOutcomes, p1: f64) {
+        assert!((0.0..=1.0).contains(&p1), "outcome probability {} is not in [0, 1]", p1);
+        self.cond_outcomes = mode;
+        self.cond_p1 = p1;
+    }
+
+    /// Number of products with a condition.
+    pub(crate) fn n_conditional(&self) -> usize {
+        self.input.circuit.pps.iter().filter(|pp| !pp.cond.is_empty()).count()
+    }
+
+    /// The true outcome of measurement product `m`, sampled the first time it is asked for.
+    fn outcome(&mut self, m: i32) -> bool {
+        if let Some(&o) = self.outcomes.get(&m) {
+            return o;
+        }
+        let o = self.rng_outcomes.gen_bool(self.cond_p1);
+        self.outcomes.insert(m, o);
+        o
+    }
+
+    /// True if product `id` runs: it has no condition, conditions are ignored (`Worst`), or
+    /// every term holds. Only called once the product is ready, so every outcome it names has
+    /// been measured (a condition's products are always in its `@` list).
+    fn cond_holds(&mut self, id: i32) -> bool {
+        if self.cond_outcomes == CondOutcomes::Worst {
+            return true;
+        }
+        let cond = self.input.circuit.product(id).cond.clone();
+        // Sample every term (no short-circuit), so the outcomes drawn do not depend on order.
+        let values: Vec<bool> = cond.iter().map(|&(m, _)| self.outcome(m)).collect();
+        cond.iter().zip(values).all(|(&(_, want), got)| got == want)
+    }
+
+    /// Filters products that just became ready. A conditional product whose condition fails
+    /// is skipped: it completes at once without being scheduled (no lcycle, no magic state, no
+    /// T-failure draw, no S correction), and its children are unlocked and admitted in turn.
+    /// Returns, in order, the products that should run.
+    fn admit(&mut self, ready: Vec<i32>) -> Vec<i32> {
+        let mut run = Vec::with_capacity(ready.len());
+        let mut work: std::collections::VecDeque<i32> = ready.into();
+        while let Some(id) = work.pop_front() {
+            if self.input.circuit.product(id).cond.is_empty() || self.cond_holds(id) {
+                run.push(id);
+                continue;
+            }
+            info_sched!("  conditional product {} skipped: condition false", id);
+            self.skipped.push(id);
+            self.skipped_set.insert(id);
+            if self.input.circuit.product(id).gate_type.is_t() {
+                self.n_skipped_t += 1;
+                self.cultivation.t_products_remaining =
+                    self.cultivation.t_products_remaining.saturating_sub(1);
+            }
+            if !self.hosted.live.is_empty() {
+                self.hosted.completed_buf.push(id);
+            }
+            // A skipped product has no outcome, so no child waits on it through the reaction
+            // latency (only measurements are named by `@`, and a measurement is never
+            // conditional); every edge from it releases at once.
+            let children = self.input.circuit.product(id).children.clone();
+            for child in children {
+                self.remaining_parents[child as usize] -= 1;
+                if self.remaining_parents[child as usize] == 0 {
+                    work.push_back(child);
+                }
+            }
+        }
+        run
     }
 
     /// Sets the classical reaction latency (lcycles) applied to `@`-dependency edges.
@@ -343,6 +445,7 @@ impl Scheduler {
         }
         let now = self.current_lcycle;
         let mut still_waiting = Vec::with_capacity(self.delayed_unlocks.len());
+        let mut ready = Vec::new();
         for (due, child_id) in std::mem::take(&mut self.delayed_unlocks) {
             if due >= now {
                 still_waiting.push((due, child_id));
@@ -350,14 +453,17 @@ impl Scheduler {
             }
             self.remaining_parents[child_id as usize] -= 1;
             if self.remaining_parents[child_id as usize] == 0 {
-                let child = self.input.circuit.product(child_id).clone();
-                self.pps_pending.push(child);
-                if self.hosting() {
-                    self.activate_hosted_for(&[child_id]);
-                }
+                ready.push(child_id);
             }
         }
         self.delayed_unlocks = still_waiting;
+        for child_id in self.admit(ready) {
+            let child = self.input.circuit.product(child_id).clone();
+            self.pps_pending.push(child);
+            if self.hosting() {
+                self.activate_hosted_for(&[child_id]);
+            }
+        }
     }
 
     pub(crate) fn hosted_live_lcycles(&self, q: u16) -> usize {
@@ -507,6 +613,18 @@ impl Scheduler {
             for q in qubits {
                 let qi = q as usize;
                 if !self.hosted.live.get(qi).copied().unwrap_or(false) {
+                    // A skipped product on a dormant qubit: it is done, but there was no work,
+                    // so the patch stays dormant.
+                    if self.skipped_set.contains(&id) && qi < self.hosted.done.len() {
+                        debug_assert_eq!(
+                            self.hosted.chain[qi].get(self.hosted.done[qi]).copied(),
+                            Some(id),
+                            "hosted q{}: skipped product out of program order",
+                            q
+                        );
+                        self.hosted.done[qi] += 1;
+                        self.hosted.remaining[qi] -= 1;
+                    }
                     continue;
                 }
                 debug_assert_eq!(
@@ -1182,6 +1300,7 @@ impl Scheduler {
             parents: vec![],
             children: vec![],
             after: Vec::new(),
+            cond: Vec::new(),
             max_qubit: qubit,
         };
         self.input.circuit.pps.push(s_pp);
@@ -1545,6 +1664,8 @@ impl Scheduler {
             self.cultivation.t_products_remaining.saturating_sub(t_newly_scheduled);
         self.process_t_gate_outcomes();
         self.unlock_children();
+        let ready = std::mem::take(&mut self.children_buf);
+        self.children_buf = self.admit(ready);
         self.advance_clifford_state();
         debug_sched!(
             "After inserting previous lcycle cliffords, pps_to_sched len {}",
@@ -1707,7 +1828,7 @@ impl Scheduler {
 
     fn print_sched_stats(&mut self, n_lcycles: usize) {
         self.stats.summarize(n_lcycles);
-        let tot_t = self.count_t_products();
+        let tot_t = self.count_t_products() - self.n_skipped_t;
         let fail_pct =
             if tot_t > 0 { 100.0 * self.t_gate_failures as f64 / tot_t as f64 } else { 0.0 };
         println!("Magic state cultivation time:");
@@ -1720,6 +1841,22 @@ impl Scheduler {
         println!("  min:     {}", min);
         println!("  max:     {}", max);
         println!("T gate failures: {}/{} ({:.1}%)", self.t_gate_failures, tot_t, fail_pct);
+        let n_cond = self.n_conditional();
+        if n_cond > 0 {
+            match self.cond_outcomes {
+                CondOutcomes::Worst => {
+                    println!("Conditional products: {} (all run: --cond-outcomes worst)", n_cond)
+                }
+                CondOutcomes::Random => println!(
+                    "Conditional products: {}, skipped {} ({} T) on {} sampled outcome(s), p1={}",
+                    n_cond,
+                    self.skipped.len(),
+                    self.n_skipped_t,
+                    self.outcomes.len(),
+                    self.cond_p1
+                ),
+            }
+        }
         println!("Steiner tree computation called {} times", self.stree_computation.n_calls);
         println!("A* computation called {} times", self.astar.n_calls);
 
@@ -1885,8 +2022,14 @@ impl Scheduler {
         let n_products = self.input.circuit.n_products();
         let mut errors: Vec<String> = Vec::new();
         for pp_id in 0..n_products as i32 {
-            if !self.scheduled_products.contains(&pp_id) {
+            let scheduled = self.scheduled_products.contains(&pp_id);
+            let skipped = self.skipped_set.contains(&pp_id);
+            if !scheduled && !skipped {
                 errors.push(format!("  product {} was never scheduled", pp_id));
+            } else if scheduled && skipped {
+                errors.push(format!("  product {} was both scheduled and skipped", pp_id));
+            } else if skipped && self.input.circuit.product(pp_id).cond.is_empty() {
+                errors.push(format!("  unconditional product {} was skipped", pp_id));
             }
         }
         if !errors.is_empty() {
@@ -1895,7 +2038,11 @@ impl Scheduler {
                 format!("Completeness errors:\n{}", errors.join("\n")),
             ));
         }
-        println!("Schedule check passed: all {} products scheduled", n_products);
+        println!(
+            "Schedule check passed: all {} products scheduled or skipped ({} skipped)",
+            n_products,
+            self.skipped.len()
+        );
         Ok(())
     }
 
@@ -1916,6 +2063,23 @@ impl Scheduler {
         writeln!(buf_f, "# Total logical cycles: {}", max_lcycle)?;
         writeln!(buf_f, "# Total products: {}", tot_products)?;
         writeln!(buf_f, "# Parallelism: {:.2}", tot_products as f64 / max_lcycle as f64)?;
+        if self.n_conditional() > 0 {
+            // Read by plot_dynamic.py to check that exactly the failing conditions were skipped.
+            let mode = match self.cond_outcomes {
+                CondOutcomes::Random => "random",
+                CondOutcomes::Worst => "worst",
+            };
+            writeln!(buf_f, "# cond_outcomes: {} p1={}", mode, self.cond_p1)?;
+            let mut outs: Vec<(i32, bool)> = self.outcomes.iter().map(|(&m, &o)| (m, o)).collect();
+            outs.sort_unstable();
+            let outs: Vec<String> =
+                outs.iter().map(|(m, o)| format!("{}={}", m, *o as u8)).collect();
+            writeln!(buf_f, "# outcomes: {}", outs.join(" "))?;
+            let mut skipped = self.skipped.clone();
+            skipped.sort_unstable();
+            let skipped: Vec<String> = skipped.iter().map(|id| id.to_string()).collect();
+            writeln!(buf_f, "# skipped: {}", skipped.join(" "))?;
+        }
 
         let colors = [
             Color::Green,
@@ -2557,5 +2721,134 @@ mod tests {
         sched.retire_hosted();
         assert!(!sched.hosted.live[3]);
         assert_eq!(sched.correction_power[3], 0);
+    }
+
+    // ── conditional products (`?id=v` suffix, --cond-outcomes) ────────────────────
+
+    /// q0 is measured; q1 then gets an S if the outcome is 1, or a T if it is 0; an
+    /// unconditional T on q1 follows both.
+    const COND_CIRCUIT: [&str; 5] =
+        ["+X___<T>", "+Z___<M>", "+_Z__<S>@1?1=1", "+_Z__<T>@1?1=0", "+_X__<T>"];
+
+    fn cond_run(
+        lines: &[&str], mode: CondOutcomes, p1: f64, latency: usize, rseed: u32,
+    ) -> Scheduler {
+        let mut sched = build_scheduler(lines, rseed);
+        sched.set_reaction_latency(latency);
+        sched.set_cond_outcomes(mode, p1);
+        sched.sched_circuit().expect("sched_circuit failed");
+        sched
+    }
+
+    fn ran(sched: &Scheduler, id: i32) -> bool {
+        sched.lcycle_scheduled.iter().any(|(_, ids)| ids.contains(&id))
+    }
+
+    #[test]
+    fn worst_mode_runs_every_conditional_product() {
+        let sched = cond_run(&COND_CIRCUIT, CondOutcomes::Worst, 0.5, 2, 3);
+        assert!(sched.skipped.is_empty());
+        assert!(sched.outcomes.is_empty(), "worst mode samples nothing");
+        assert!((0..5).all(|id| ran(&sched, id)));
+    }
+
+    #[test]
+    fn random_mode_skips_exactly_the_failing_branch() {
+        // p1 = 1: the outcome is 1, so the S (=1) runs and the T (=0) is skipped; p1 = 0: reverse.
+        for (p1, runs, skips) in [(1.0, 2, 3), (0.0, 3, 2)] {
+            let sched = cond_run(&COND_CIRCUIT, CondOutcomes::Random, p1, 2, 3);
+            assert_eq!(sched.outcomes.get(&1).copied(), Some(p1 == 1.0));
+            assert_eq!(sched.skipped, vec![skips], "p1 {}", p1);
+            assert!(ran(&sched, runs) && !ran(&sched, skips), "p1 {}", p1);
+            assert!(ran(&sched, 4), "the unconditional successor still runs");
+        }
+    }
+
+    #[test]
+    fn skipped_product_releases_its_successor_at_once() {
+        // The conditional S takes 3 lcycles when it runs; skipped, the measurement after it on
+        // q1 starts the lcycle the S is released (no lcycle is spent on the S).
+        let lines = ["+Z___<M>", "+_Z__<S>@0?0=1", "+_X__<M>"];
+        for latency in [0usize, 4] {
+            let skip = cond_run(&lines, CondOutcomes::Random, 0.0, latency, 1);
+            let worst = cond_run(&lines, CondOutcomes::Worst, 0.5, latency, 1);
+            assert_eq!(skip.skipped, vec![1]);
+            assert_eq!(lcycle_of(&worst, 1), 2 + latency);
+            assert_eq!(lcycle_of(&skip, 2), 2 + latency, "latency {}", latency);
+            assert_eq!(lcycle_of(&worst, 2), 5 + latency, "latency {}", latency);
+        }
+    }
+
+    #[test]
+    fn outcome_sampling_leaves_an_unconditional_schedule_unchanged() {
+        // Outcomes use their own random stream, so cultivation and T-failure draws (and hence
+        // the schedule of a circuit without conditions) are the same in every mode.
+        let lines = ["+X___<T>", "+Z___<M>", "+_Z__<T>@1", "+XZ__<T>", "+__X_<T>", "+_Z_Z<T>"];
+        let a = cond_run(&lines, CondOutcomes::Worst, 0.5, 2, 9);
+        let b = cond_run(&lines, CondOutcomes::Random, 0.3, 2, 9);
+        assert_eq!(a.lcycle_scheduled, b.lcycle_scheduled);
+        assert_eq!(a.t_gate_failures, b.t_gate_failures);
+    }
+
+    #[test]
+    fn random_outcomes_are_deterministic_per_seed() {
+        let lines = ["+Z___<M>", "+_Z__<M>", "+__Z_<S>@0?0=1", "+___Z<S>@1?1=0", "+__X_<T>"];
+        let a = cond_run(&lines, CondOutcomes::Random, 0.5, 1, 11);
+        let b = cond_run(&lines, CondOutcomes::Random, 0.5, 1, 11);
+        assert_eq!(a.outcomes, b.outcomes);
+        assert_eq!(a.skipped, b.skipped);
+        assert_eq!(a.lcycle_scheduled, b.lcycle_scheduled);
+    }
+
+    #[test]
+    fn multi_term_condition_needs_every_term_and_samples_them_all() {
+        // Runs only if q0 gave 1 and q1 gave 0. With p1 = 1 or 0 one term always fails.
+        let lines = ["+Z___<M>", "+_Z__<M>", "+__Z_<S>@0,1?0=1,1=0", "+__X_<M>"];
+        for p1 in [0.0, 1.0] {
+            let sched = cond_run(&lines, CondOutcomes::Random, p1, 1, 2);
+            assert_eq!(sched.skipped, vec![2], "p1 {}", p1);
+            assert_eq!(sched.outcomes.len(), 2, "both terms sampled");
+            assert!(ran(&sched, 3));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "not in its @ list")]
+    fn condition_outside_the_at_list_is_rejected() {
+        build_scheduler(&["+Z___<M>", "+_Z__<S>?0=1"], 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a measurement")]
+    fn condition_on_a_non_measurement_is_rejected() {
+        build_scheduler(&["+Z___<T>", "+_Z__<S>@0?0=1"], 0);
+    }
+
+    #[test]
+    fn skipped_product_on_a_dormant_hosted_qubit_keeps_it_dormant() {
+        // q3's only product is a conditional S that is skipped: q3 never goes live.
+        let mut lines = vec!["+Z___<M>", "+___Z<S>@0?0=1"];
+        lines.extend(std::iter::repeat("+X___<T>").take(10));
+        let mut sched = hosted_scheduler(&lines, &[3], 6);
+        sched.set_cond_outcomes(CondOutcomes::Random, 0.0);
+        sched.sched_circuit().expect("hosted schedule failed");
+        assert_eq!(sched.skipped, vec![1]);
+        assert_eq!(sched.hosted_activations(3), 0);
+        assert_eq!(sched.hosted.remaining[3], 0);
+    }
+
+    #[test]
+    fn hosted_qubit_wakes_for_the_product_after_a_skipped_one() {
+        // q3: a skipped conditional S, then a real T: one live window, for the T only.
+        let mut lines = vec!["+Z___<M>", "+___Z<S>@0?0=1", "+___X<T>"];
+        lines.extend(std::iter::repeat("+X___<T>").take(10));
+        let mut sched = hosted_scheduler(&lines, &[3], 6);
+        sched.set_cond_outcomes(CondOutcomes::Random, 0.0);
+        sched.sched_circuit().expect("hosted schedule failed");
+        assert_eq!(sched.skipped, vec![1]);
+        assert!(ran(&sched, 2));
+        assert_eq!(sched.hosted_activations(3), 1);
+        assert_eq!(sched.hosted.remaining[3], 0);
+        assert!(!sched.hosted.live[3]);
     }
 }
