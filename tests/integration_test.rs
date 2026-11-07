@@ -1335,3 +1335,29 @@ fn puremagic_ancilla_qubits_schedules_and_reports() {
     assert!(stdout.contains("Hosted ancilla q2: live"), "no q2 report:\n{}", stdout);
     assert!(stdout.contains("Hosted ancilla q3: live"), "no q3 report:\n{}", stdout);
 }
+
+#[test]
+fn plotting_paths_does_not_change_the_schedule() {
+    // A single-qubit S/SX holds its data node and an ancilla for 3 lcycles. Without plotting,
+    // those nodes used to be held only in the first lcycle (the S/SX tree was not kept), so
+    // the schedule depended on --plot paths. dyn_pingpong in flush mode has physical S/SX.
+    let tmp = TempDir::new().unwrap();
+    let (ok, log) = transpile_to(
+        &fixture("dyn_pingpong.cliffordt.qasm"),
+        "pp.trans",
+        &["--reset_mode", "flush"],
+        tmp.path(),
+    );
+    assert!(ok, "{}", log);
+    let circuit = tmp.path().join("pp.trans");
+    for seed in ["1", "2", "3", "5"] {
+        let run = |extra: &[&str]| {
+            let mut args = vec!["--circuit", circuit.to_str().unwrap(), "-u", "-r", seed];
+            args.extend_from_slice(extra);
+            let (ok, stdout, stderr) = run_puremagic(&args, tmp.path());
+            assert!(ok, "puremagic failed; stderr:\n{}", stderr);
+            scheduled_counts(&stdout)
+        };
+        assert_eq!(run(&[]), run(&["--plot", "paths"]), "seed {}", seed);
+    }
+}
