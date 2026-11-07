@@ -117,8 +117,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut circuit = Circuit::new(&circuit_fname);
     circuit.load_circuit()?;
     let n_products = circuit.n_products();
-    let n_sx_cliffords =
-        circuit.pps.iter().filter(|pp| pp.gate_type.is_s() || pp.gate_type.is_sx()).count();
     let _n_layers = circuit.print_statistics();
     #[cfg(debug_assertions)]
     circuit.print()?;
@@ -182,6 +180,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(n_scheduled + sched.skipped.len() >= n_products);
     let volume = n_qubits * tot_lcycles;
     println!("Scheduled {} in {} logical cycles, volume {}", n_scheduled, tot_lcycles, volume);
+    // Estimates and ratios below describe the circuit that ran: conditional products the
+    // scheduler skipped are left out entirely.
+    let skipped: std::collections::HashSet<i32> = sched.skipped.iter().copied().collect();
+    let ran_circuit = (!skipped.is_empty()).then(|| sched.input.circuit.without(&skipped));
+    let ran = ran_circuit.as_ref().unwrap_or(&sched.input.circuit);
+    let n_products = ran.n_products();
+    let n_sx_cliffords =
+        ran.pps.iter().filter(|pp| pp.gate_type.is_s() || pp.gate_type.is_sx()).count();
     if !args.common.no_t_failures && n_sx_cliffords > 0 {
         let corrections = sched.correction_gates_emitted;
         println!(
@@ -205,7 +211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut rng = StdRng::seed_from_u64(args.common.rseed);
-    let est = sched.input.circuit.estimate_layer_volume(
+    let est = ran.estimate_layer_volume(
         n_magic_qubits,
         n_qubits,
         args.common.magic_state_lambda,
