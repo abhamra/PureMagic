@@ -15,6 +15,10 @@ the reference for how it works. Branch: `mcm-ancilla`, which contains `mcm-suppo
 | 3481138, e8659f3 | mcm-ancilla | Merge; hosted patches sleep between uses |
 | 7a1fdda | mcm-ancilla | Conditions in `.trans` (`?`); scheduler skips products whose condition fails (`--cond-outcomes`) |
 | d697a79 | mcm-ancilla | Conditional CX/CZ/SWAP; flushed CZ/SWAP no longer dropped |
+| 351d2c8 | mcm-ancilla | Measurements honor a pending T-failure correction |
+| 53ab131 | mcm-ancilla | Estimates leave skipped conditional products out |
+| 86e858c | mcm-ancilla | Exact check skipped above 10 qubits |
+| bcc0cfc | mcm-ancilla | Lowering: error ledger and `--error-budget` |
 
 ## 1. Model
 
@@ -216,6 +220,14 @@ the flushes that conditional gates cause at transpile time (§8), which is Level
 - **T failures** are a 50% coin flip per executed T. The S correction is tracked per qubit
   (`correction_power`) and applied lazily: it is merged into the next Clifford on that qubit, or
   later T bases are conjugated (`t_conjugated_bases`).
+- **Measurements under a pending correction** (351d2c8) are conjugated the same way: measuring P
+  before a pending S is measuring S†PS, so with an odd correction an X measurement is a Y
+  measurement (both half-nodes). The correction stays pending afterwards. A multi-qubit
+  measurement whose basis changes is routed live on its conjugated terminals instead of its
+  precomputed tree. The hosting release rule uses the effective basis. A re-initialization `<R>`
+  voids the qubit's pending correction.
+- **Estimates** (parallelism, volume, normalized efficiency, S-correction ratio) are computed on
+  `Circuit::without(skipped)`, the circuit that actually ran (53ab131).
 - **Termination**: the loop runs while products are pending, Cliffords are in flight, or delayed
   releases are outstanding.
 
@@ -231,6 +243,62 @@ the flushes that conditional gates cause at transpile time (§8), which is Level
   gate becoming its own conditional line with the same condition.
 - Rotations are synthesized with cyclosynth (`--synth u3`, the default, falls back to zyz).
   Rotations within `--clifford-tol` of a Clifford are snapped to it.
+- Every approximation is recorded (a ledger) and the realized error is reported; with
+  `--error-budget`, ε and the snap threshold are chosen to fit a total budget (§6a).
+
+## 6a. Error budget (bcc0cfc)
+
+**Unit.** Every error is measured as e = ½‖Φ − 𝒱‖◇: the worst-case trace distance between the
+outputs of the implemented channel Φ and the ideal unitary V, over all inputs including
+entangled ones. **It adds up**: the diamond norm is subadditive under composition and unchanged
+by tensoring with an identity, and a classically controlled choice is bounded by its worst
+branch. So for the whole circuit,
+
+    e_total ≤ Σ_blocks e_block + Σ_rotations e_rot + Σ_snaps e_snap.
+
+**Each tool in that unit.**
+
+| Source | Tool's own metric | In e |
+|---|---|---|
+| cyclosynth rotation | phase-minimized operator norm `min_φ ‖U − e^{iφ}V‖`, ≤ ε | e ≤ that norm (for unitaries e = sin(θ/2) ≤ 2 sin(θ/4) = the norm) |
+| Clifford snap (lowering) | same norm, < `--clifford-tol` | same |
+| BQSKit block (`bq`) | HS distance `√(1 − |Tr U†V|²/D²)` ≤ its threshold | computed exactly from the circuits: e ≤ `min_φ ‖U − e^{iφ}V‖`; a priori ≤ √(2D)·HS distance |
+| dcsynth dynamic block (`dc`) | `--epsilon` bounds **C = 1 − Σⱼ|Tr V†Kⱼ|²/D²**, an infidelity (the square of a distance), not a distance | computed from the Kraus operators Kⱼ = Bⱼ⟨j|U_main|0⟩: e ≤ δ + δ²/2, δ = √‖Σⱼ Eⱼ†Eⱼ‖ with Eⱼ = Kⱼ − cⱼV. In practice e ≈ 1.15–1.5·√C |
+
+So a library compiled at dcsynth ε = 1e-6 means up to ~1e-3 *per block* in e, not 1e-6. Measured
+on qnn_4/grover_4 (fresh libraries), the realized block errors are 5e-6 to 1.4e-4, against 1e-8
+per cyclosynth rotation.
+
+**Where block errors come from.** `bench_results/scripts/block_errors.py` computes e for every
+block an assembly uses, from the actual circuits. Stage A writes the sum as `block_error` in
+`variants.json`.
+
+**Distributing a budget E in the lowering** (`--error-budget E --block-error B`):
+
+1. The blocks are already compiled, so their error B is fixed; the lowering gets R = E − B (an
+   error if R ≤ 0: the library must be compiled more accurately).
+2. **Equal ε for every rotation.** A rotation to accuracy ε costs about c·log₂(1/ε) T gates.
+   Minimizing Σ c·log₂(1/εᵢ) subject to Σ εᵢ = const gives equal marginal costs c/(εᵢ ln 2), i.e.
+   equal εᵢ.
+3. **Snap threshold τ = ε(1 + ln(1/ε)).** Snapping a target at distance d saves about
+   c·log₂(1/ε) T and spends d − ε more error. Absorbing that error by tightening the rotations
+   costs about c(d − ε)/(ε ln 2) T. So snapping pays exactly when d < ε(1 + ln(1/ε)), for any c.
+   That is about 12ε at ε = 1e-5, so snapping should be far more aggressive than ε.
+4. A dry pass collects each target's distance to the nearest Clifford. ε is the largest value
+   with Σ_{d<τ(ε)} d + ε·#{d ≥ τ(ε)} ≤ R (bisection; repeated while τ moves the targets). The
+   circuit is lowered once with (ε, τ), and the realized total is checked against E.
+
+On qnn_4 DC-opt (B = 3.8e-5):
+
+| Setting | ε | T count | Realized e |
+|---|---|---|---|
+| fixed ε 1e-8, tol 1e-4 | 1e-8 | 3,838 | 4.7e-5 + B (snaps alone 4.6e-5) |
+| `--error-budget 1e-3` | 1.8e-5 | 2,263 | 8.0e-4 |
+| `--error-budget 1e-2` | 2.0e-4 | 1,731 | 7.2e-3 |
+
+**Not covered.** The budget for *compiling* the blocks (dcsynth's ε) is chosen before this step;
+splitting E between block compilation and lowering needs dcsynth's depth-vs-ε trade-off.
+Exp 7's BQSKit-FT path (`full_rz_compile`) uses HS distances and is not part of this pipeline.
 
 ## 7. Verification
 
@@ -239,12 +307,14 @@ the flushes that conditional gates cause at transpile time (§8), which is Level
 | `data_processing/validate_dynamic.py` | **Exact oracle.** Simulates the input QASM and the `.trans` + sidecar exactly (statevector, branching at each measurement) in every reset mode, and compares the joint outcome distribution (TV < 1e-9). Also checks that `@` matches the sidecar's `needs` and `?` matches its `cond`. `--random N` fuzzes. |
 | `data_processing/plot_dynamic.py` | **Schedule checker**, independent of the scheduler. Every product is scheduled once, unless skipped (CX 2 consecutive lcycles, S/SX 1–4). A skipped product's condition is false under the logged outcomes; in `random` mode every conditional product that ran has a true condition. Qubit order is checked against the previous product that ran on each qubit; classical order is start ≥ end + L + 1. No qubit is used twice in an lcycle. The sidecar is consistent. Also draws timeline and overview plots. |
 | `cargo test` | Parser (`?`, `@`, `<R>`), transpiler (frame, conditional gates, reset modes, sidecar), scheduler (latency, hosting, dormancy, conditional skipping: both modes, p1 extremes, multi-term conditions, determinism, hosting with skipped products, rejection of bad conditions), integration (end to end on `tests/fixtures/dyn_*.qasm`) |
-| `test_dcsynth_lowering.py` | The lowering end to end |
+| `test_dcsynth_lowering.py` | The lowering end to end, including the error budget (fits E, more budget never costs more T, ε is the largest that fits) |
 
 Status: `cargo test` passes in debug. Release has one failure, `node::add_nb_beyond_max`, which
-already fails on `main`. The oracle passes on 60 random dynamic circuits and the 3 fixtures. The
-end-to-end pipeline was verified exactly on grover_3, ae_3 and ae_4. On larger circuits, only the
-schedule checker runs, and it has passed on every schedule.
+already fails on `main`. The oracle passes on 460 random dynamic circuits (with CZ, SWAP and
+conditional two-qubit gates) and the fixtures. It is run only up to **10 qubits** (86e858c;
+stage A's sampled fidelity has the same cap); wider circuits get the schedule checker only, which
+checks ordering and resources, not outcomes. The end-to-end pipeline was verified exactly on
+grover_3, ae_3 and ae_4.
 
 ## 8. Costs and known limitations
 
@@ -267,28 +337,29 @@ schedule checker runs, and it has passed on every schedule.
   each T's own injection correction, both need decoded outcomes before their S correction is
   resolved. Corrections are applied lazily, so this is usually hidden, but no latency is charged
   for it.
-- **To verify.** A failed T on a multi-qubit Pauli is corrected with per-qubit S gates
-  (`correction_power`); the exact correction is a π/4 rotation on the whole product.
+- **Multi-qubit T failures are modelled per qubit (not exact).** A failed π/8 rotation on
+  P = P₁⊗…⊗P_w needs the π/4 rotation e^{−iπ/4·P}, a single weight-w Clifford. PureMagic
+  instead raises each qubit's `correction_power` and later applies, or conjugates by, single-qubit
+  S gates. The two differ:
+  - **Cost.** One multi-patch π/4 product vs w separate 3-lcycle S gates.
+  - **Effect on later products.** e^{−iπ/4·P} maps an anticommuting Q to ∝ PQ, which can change
+    the support (P = Z₁Z₂, Q = X₁ → Y₁Z₂). The per-qubit swap gives Y₁. Later products may
+    therefore be routed on the wrong qubits.
+
+  This predates the MCM work and affects static circuits too: 61% of grover_5 DC-opt's T
+  products and 90% of its Orig's have weight > 1. The standard fix is Litinski's auto-corrected
+  π/8 rotation. The P⊗Z injection measurement is followed by an X or Y measurement of the magic
+  ancilla, chosen by the outcome, so the data never needs a correction; the cost is an ancilla
+  measurement that waits for decoding, which is where reaction latency belongs.
 - **Unsupported.** Measurement or reset inside `if`, conditional gates on three or more qubits,
   classical expressions, loops.
 - **Modelling.** Every qubit, ancilla included, is a full logical patch, unless hosted. Unused
   declared qubits still get patches: strip them before scheduling (the benchmark harness does).
-- **A pending T correction is ignored by measurements.** After a failed T, later T products on
-  the qubit are re-conjugated (`apply_t_conjugation`), but a measurement is scheduled in its
-  original basis and the pending correction carries on past it (it is cleared only when a hosted
-  patch goes dormant). Physically the correction must come first or rotate the measurement
-  basis, e.g. X becomes Y, which routes differently and affects the hosting release rule. Mid-circuit
-  measurements make this far more common than in static circuits, where it only touches the final
-  measurements.
 - **Hosting relies on `--reset_mode flush|init`.** A hosted patch is released only after a
   weight-1 X/Z measurement or `<R>`; with `frame`, ancilla measurements are usually multi-qubit,
   so the patch stays live until its last product.
-- **Estimates ignore skipping.** The printed volume estimate and "normalized scheduling
-  efficiency" count every product, including skipped conditional ones.
-- **No circuit-level error budget.** Synthesis error (ε per rotation) and Clifford snapping (up
-  to `--clifford-tol` per rotation or correction) are not summed into a reported total.
-- **Exactness at scale.** The oracle is exponential in width; above ~14 qubits only the schedule
-  checker (ordering and resources, not outcomes) runs.
+- **Exactness at scale.** The oracle is exponential in width, so above 10 qubits only the schedule
+  checker runs (ordering and resources, not outcomes).
 
 ## 9. Planned
 
