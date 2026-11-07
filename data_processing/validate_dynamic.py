@@ -470,6 +470,12 @@ def random_circuit(rng: random.Random, n: int, n_gates: int) -> str:
     return "\n".join(head + decls + rest) + "\n"
 
 
+# The exact check simulates the full state, branching at every measurement: past ~10 qubits it is
+# too slow to be worth running, so wider circuits are skipped (stage A's sampled fidelity uses the
+# same cap).
+MAX_EXACT_QUBITS = 10
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("qasm", nargs="?", help="a .cliffordt.qasm file")
@@ -481,6 +487,8 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--qubits", type=int, default=3)
     ap.add_argument("--gates", type=int, default=14)
+    ap.add_argument("--max-qubits", type=int, default=MAX_EXACT_QUBITS,
+                    help="skip circuits wider than this (the exact simulation is exponential)")
     a = ap.parse_args()
 
     binary = Path(a.transpile)
@@ -492,6 +500,8 @@ def main() -> int:
     defer_opts = [True] if a.defer_trailing else [False, True]
 
     if a.random:
+        if a.qubits > a.max_qubits:
+            ap.error(f"--qubits {a.qubits} exceeds --max-qubits {a.max_qubits}")
         rng = random.Random(a.seed)
         bad = 0
         with tempfile.TemporaryDirectory() as td:
@@ -508,6 +518,11 @@ def main() -> int:
 
     if not a.qasm:
         ap.error("give a .cliffordt.qasm file or --random N")
+    n_qubits, _ = parse_qasm(a.qasm)
+    if n_qubits > a.max_qubits:
+        print(f"SKIPPED: {n_qubits} qubits > --max-qubits {a.max_qubits}; the exact check is only "
+              f"run on small circuits (use plot_dynamic.py's schedule checks instead)")
+        return 0
     ok = check(Path(a.qasm), binary, modes, widths, defer_opts)
     print("ALL MATCH" if ok else "MISMATCH")
     return 0 if ok else 1
