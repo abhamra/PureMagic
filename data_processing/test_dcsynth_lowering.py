@@ -407,6 +407,48 @@ def test_unsupported_constructs_raise():
         raise AssertionError("a measurement inside an if_else must be rejected")
 
 
+def test_allocate_fits_the_budget_and_snaps_by_the_threshold():
+    rng = np.random.default_rng(0)
+    d = list(np.abs(rng.normal(0, 1e-3, 40))) + list(rng.uniform(0.05, 0.5, 60))
+    for budget in (1e-4, 1e-3, 1e-2):
+        eps, tau = lowering.allocate(d, budget)
+        assert tau == lowering.snap_threshold(eps)
+        def used(e):
+            t = lowering.snap_threshold(e)
+            return sum(x for x in d if x < t) + e * sum(1 for x in d if x >= t)
+        assert used(eps) <= budget * (1 + 1e-9), (budget, used(eps))
+        # eps is the largest that fits: a slightly larger one does not. (The error used is not
+        # continuous in eps, since a target crossing the snap threshold jumps from eps to its
+        # distance, so the budget is not always used exactly.)
+        assert eps == budget or used(eps * (1 + 1e-6)) > budget, budget
+    # the snap threshold exceeds eps: snapping slightly worse than eps still saves T
+    assert lowering.snap_threshold(1e-5) > 10 * 1e-5
+
+
+def test_error_budget_is_met_and_a_larger_budget_costs_no_more_t(tmp_path: Path):
+    qc = CIRCUITS["generic"]()
+    t_prev = None
+    for budget in (1e-6, 1e-4, 1e-2):
+        text, st = lowering.lower(qc, error_budget=budget, block_error=budget / 10)
+        assert st["error_total"] <= budget * (1 + 1e-9), (budget, st["error_total"])
+        assert abs(st["error_blocks"] - budget / 10) < 1e-15
+        t = st["t"] + st["conditional_t"]
+        assert t_prev is None or t <= t_prev, (budget, t, t_prev)
+        t_prev = t
+        # still the same circuit, up to the allowed error
+        _, got = run_lowered(text, tmp_path, f"budget{budget:g}")
+        assert vd.tv_distance(run_qiskit(qc), got) < 4 * budget + 1e-9
+
+
+def test_error_budget_used_up_by_blocks_is_rejected():
+    try:
+        lowering.lower(CIRCUITS["generic"](), error_budget=1e-4, block_error=2e-4)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a budget smaller than the block error must be rejected")
+
+
 def main() -> int:
     import tempfile
 

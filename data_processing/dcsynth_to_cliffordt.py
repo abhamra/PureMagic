@@ -137,6 +137,11 @@ def pauli_name(u: np.ndarray, tol: float) -> str | None:
     return None
 
 
+def clifford_distance(u: np.ndarray) -> float:
+    """Distance (phase-minimized operator norm) from `u` to the nearest single-qubit Clifford."""
+    return min(phase_distance(u, seq_matrix(word)) for word in CLIFFORDS.values())
+
+
 def nearest_clifford(u: np.ndarray, tol: float) -> list[str] | None:
     """The gate word of the Clifford within `tol` of `u` (mod phase), if there is one."""
     for key, word in CLIFFORDS.items():
@@ -279,19 +284,38 @@ def t_count(seq: list[str]) -> int:
 
 # ----------------------------------------------------------------------------- lowering
 class Lowerer:
-    def __init__(self, qc, eps: float, cliff_tol: float) -> None:
-        self.qc, self.eps, self.cliff_tol = qc, eps, cliff_tol
+    """Walks a dcsynth circuit and writes the Clifford+T dialect.
+
+    Every approximation is recorded in ``ledger`` as (kind, error) in the phase-minimized
+    operator norm, which bounds half the diamond distance of that gate: ``rot`` for a
+    cyclosynth rotation (error <= eps), ``snap`` for a target replaced by a Clifford, Pauli or
+    identity (error < cliff_tol). Errors add up over the circuit (see `lower`).
+
+    With ``dry=True`` nothing is synthesized: each target is recorded with its distance to the
+    nearest Clifford (kind ``item``), which is all `lower` needs to split an error budget."""
+
+    def __init__(self, qc, eps: float, cliff_tol: float, dry: bool = False) -> None:
+        self.qc, self.eps, self.cliff_tol, self.dry = qc, eps, cliff_tol, dry
         self.lines: list[str] = []
         self.pending: dict[int, np.ndarray] = {}
         self.stats: Counter = Counter()
-        self._cache: dict[tuple, list[str]] = {}
+        self._cache: dict[tuple, tuple[list[str], float]] = {}
+        self.ledger: list[tuple[str, float]] = []
 
     # -- emission ----------------------------------------------------------------------
     def synth(self, u: np.ndarray) -> list[str]:
         key = _canon(u, 9)
+        if self.dry:
+            d = clifford_distance(u)
+            self.ledger.append(("item", d))
+            return nearest_clifford(u, self.cliff_tol) or ["t"]  # a placeholder rotation
         if key not in self._cache:
-            self._cache[key] = synth_1q(u, self.eps, self.cliff_tol)
-        return self._cache[key]
+            word = synth_1q(u, self.eps, self.cliff_tol)
+            self._cache[key] = (word, phase_distance(seq_matrix(word), u))
+        word, err = self._cache[key]
+        if err > 1e-15 or t_count(word):
+            self.ledger.append(("rot" if t_count(word) else "snap", err))
+        return word
 
     def emit(self, gate: str, q: int, conds: tuple = ()) -> None:
         if conds:
@@ -421,6 +445,9 @@ class Lowerer:
             self.flush(q)  # the reference runs now, unconditionally; only V_a waits for outcomes
             for a, v in zip(assignments, vs):
                 if phase_distance(v, I2) < self.cliff_tol:
+                    d = phase_distance(v, I2)  # this branch's correction is dropped
+                    if d > 1e-15:
+                        self.ledger.append(("item" if self.dry else "snap", d))
                     continue
                 conds = tuple(zip(bits, a))
                 for g in self.synth(v):
@@ -487,13 +514,89 @@ class Lowerer:
         return "\n".join(head + self.lines) + "\n"
 
 
+def snap_threshold(eps: float) -> float:
+    """Snap a target to a Clifford when it is within this distance, given rotation accuracy eps.
+
+    Synthesizing a rotation to accuracy eps costs about c*log2(1/eps) T gates, so tightening all
+    rotations to absorb extra error x costs about c*x/(eps*ln 2) T gates. Snapping a target at
+    distance d costs nothing in T and d - eps more error than synthesizing it; it pays when
+    c*log2(1/eps) > c*(d - eps)/(eps*ln 2), i.e. d < eps*(1 + ln(1/eps)), whatever c is."""
+    return eps * (1.0 + math.log(1.0 / eps))
+
+
+def allocate(distances: list[float], budget: float) -> tuple[float, float]:
+    """Largest rotation accuracy eps whose total error fits `budget`, and its snap threshold.
+
+    `distances` holds each target's distance to the nearest Clifford. A target within
+    tau = snap_threshold(eps) is snapped (error = its distance); every other one is a rotation
+    synthesized to eps. Every rotation gets the same eps, which minimizes the total T count
+    when all rotations have the same cost curve (equal marginal cost per unit of error)."""
+    d = np.sort(np.asarray(distances, dtype=float))
+    prefix = np.concatenate([[0.0], np.cumsum(d)])
+
+    def used(eps: float) -> float:
+        k = int(np.searchsorted(d, snap_threshold(eps), side="left"))
+        return prefix[k] + eps * (len(d) - k)
+
+    if len(d) == 0:
+        return budget, snap_threshold(budget)
+    lo, hi = 1e-15, budget
+    if used(hi) <= budget:
+        return hi, snap_threshold(hi)
+    for _ in range(200):  # bisection in log space
+        mid = math.sqrt(lo * hi)
+        lo, hi = (mid, hi) if used(mid) <= budget else (lo, mid)
+    return lo, snap_threshold(lo)
+
+
 def lower(qc, epsilon: float = 1e-8, clifford_tol: float = 1e-7,
-          synth_mode: str = "u3") -> tuple[str, Counter]:
-    """Lower a dcsynth circuit; returns (OpenQASM 2 text, statistics)."""
+          synth_mode: str = "u3", error_budget: float | None = None,
+          block_error: float = 0.0) -> tuple[str, Counter]:
+    """Lower a dcsynth circuit; returns (OpenQASM 2 text, statistics).
+
+    Error accounting. Every error is measured as half the diamond distance of the implemented
+    operation from the ideal one, and these add up along the circuit. The total is at most
+    block_error (dcsynth's realized block errors, from stage A) + the sum of the lowering's
+    rotation errors (each <= eps) + its snap errors (each < clifford_tol); the statistics report
+    the lowering's realized parts and the total.
+
+    With `error_budget`, `epsilon` and `clifford_tol` are chosen instead: the part of the budget
+    left after `block_error` is split by `allocate` (dry passes find the targets; they depend on
+    the snap threshold, so the split is repeated until it is stable), and the circuit is lowered
+    once with the result."""
     global SYNTH_MODE
     SYNTH_MODE = synth_mode
+    if error_budget is not None:
+        rest = error_budget - block_error
+        if rest <= 0:
+            raise ValueError(f"error budget {error_budget:.3g} is used up by the blocks "
+                             f"({block_error:.3g}); compile the blocks more accurately")
+        tau = clifford_tol
+        for _ in range(6):
+            dry = Lowerer(qc, rest, tau, dry=True)
+            dry.run()
+            epsilon, new_tau = allocate([e for _, e in dry.ledger], rest)
+            if abs(new_tau - tau) <= 1e-3 * new_tau:
+                tau = new_tau
+                break
+            tau = new_tau
+        clifford_tol = tau
     lw = Lowerer(qc, epsilon, clifford_tol)
     text = lw.run()
+    rot = [e for k, e in lw.ledger if k == "rot"]
+    snap = [e for k, e in lw.ledger if k == "snap"]
+    lw.stats.update({
+        "epsilon": epsilon, "clifford_tol": clifford_tol,
+        "n_rotations": len(rot), "n_snaps": len(snap),
+        "error_rotations": float(sum(rot)), "error_snaps": float(sum(snap)),
+        "error_lowering": float(sum(rot) + sum(snap)), "error_blocks": block_error,
+        "error_total": float(sum(rot) + sum(snap) + block_error),
+    })
+    if error_budget is not None:
+        lw.stats["error_budget"] = error_budget
+        if lw.stats["error_total"] > error_budget * (1 + 1e-9):
+            raise RuntimeError(f"realized error {lw.stats['error_total']:.3g} exceeds the budget "
+                               f"{error_budget:.3g}")
     return text, lw.stats
 
 
@@ -515,7 +618,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("input", type=Path)
     ap.add_argument("-o", "--output", type=Path, help="default: <input stem>.cliffordt.qasm")
-    ap.add_argument("--epsilon", type=float, default=1e-8, help="cyclosynth diamond-distance precision per 2x2 unitary")
+    ap.add_argument("--epsilon", type=float, default=1e-8,
+                    help="cyclosynth precision per 2x2 unitary (phase-minimized operator norm, "
+                         ">= half the diamond distance); ignored with --error-budget")
     ap.add_argument(
         "--clifford-tol", type=float, default=1e-7,
         help="a 2x2 unitary this close to a Clifford is snapped to it exactly",
@@ -524,9 +629,19 @@ def main() -> int:
         "--synth", choices=("u3", "zyz"), default="u3",
         help="u3: jointly optimised U3 (fewest T, slow at eps 1e-8); zyz: three fast Rz syntheses",
     )
+    ap.add_argument(
+        "--error-budget", type=float, default=None,
+        help="total error allowed for the whole circuit (half diamond distance); chooses "
+             "--epsilon and --clifford-tol so that block error + lowering error fits it",
+    )
+    ap.add_argument(
+        "--block-error", type=float, default=0.0,
+        help="realized error of dcsynth's blocks (stage A's variants.json `block_error`)",
+    )
     args = ap.parse_args()
     qc = load_circuit(args.input)
-    text, st = lower(qc, args.epsilon, args.clifford_tol, args.synth)
+    text, st = lower(qc, args.epsilon, args.clifford_tol, args.synth,
+                     args.error_budget, args.block_error)
     out = args.output or args.input.with_suffix(".cliffordt.qasm")
     out.write_text(text)
     print(
@@ -534,6 +649,14 @@ def main() -> int:
         f"{st['measure']} measure, {st['reset']} reset, {st['if_else']} if_else, "
         f"{st['cx']} cx, T count {st['t']} unconditional + {st['conditional_t']} conditional "
         f"({st['conditional_gates']} conditional gates in all)",
+        file=sys.stderr,
+    )
+    print(
+        f"error (half diamond distance): blocks {st['error_blocks']:.3g} + rotations "
+        f"{st['error_rotations']:.3g} ({st['n_rotations']} at eps {st['epsilon']:.3g}) + snaps "
+        f"{st['error_snaps']:.3g} ({st['n_snaps']}, tol {st['clifford_tol']:.3g}) = "
+        f"{st['error_total']:.3g}"
+        + (f" of budget {st['error_budget']:.3g}" if "error_budget" in st else ""),
         file=sys.stderr,
     )
     return 0
