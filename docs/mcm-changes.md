@@ -19,6 +19,8 @@ the reference for how it works. Branch: `mcm-ancilla`, which contains `mcm-suppo
 | 53ab131 | mcm-ancilla | Estimates leave skipped conditional products out |
 | 86e858c | mcm-ancilla | Exact check skipped above 10 qubits |
 | bcc0cfc | mcm-ancilla | Lowering: error ledger and `--error-budget` |
+| cc57acb | mcm-ancilla | An S/SX holds its nodes for all 3 lcycles (schedules no longer depend on `--plot paths`) |
+| d15d91a | mcm-ancilla | `notebooks/dynamic_circuit_tutorial.ipynb` |
 
 ## 1. Model
 
@@ -330,7 +332,13 @@ grover_3, ae_3 and ae_4.
   | heis_20 DC-opt | 41,398 | 5,287 | 84,382 | 23,467 | 175 |
 
   An S/SX occupies 3 lcycles. This is a likely contributor to DC volume growing faster than T
-  count, but it has not been isolated.
+  count, but it has not been isolated. In the tutorial's 3-qubit example, the conditional gates'
+  flushes create about 175 of 203 unconditional S/SX gates (with the conditional lines removed,
+  27 remain, all from the reset flush), and they form a serial tail of about 500 lcycles.
+- **Fixed in cc57acb: S/SX nodes were held for 1 of their 3 lcycles unless paths were plotted.**
+  Schedules of circuits with physical S/SX were therefore optimistic: DC-opt lcycles rise by
+  +1.6% to +14.8% with the fix (tfim_20 +15%, grover_5 and qaoa_12 +3–4%). Static circuits emit
+  no physical S/SX and were unaffected.
 - **Conditional T does not need the flush.** A conditional π/8 rotation on the conjugated Pauli
   commutes with the Clifford pushing like an unconditional one; only the condition gates it.
 - **Timing assumptions the scheduler does not enforce.** A T whose sign depends on the frame, and
