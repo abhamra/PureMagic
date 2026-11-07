@@ -14,6 +14,7 @@ the reference for how it works. Branch: `mcm-ancilla`, which contains `mcm-suppo
 | 2a0d3a7 | ancilla-patch | `--ancilla-qubits`: ancillas hosted on injection patches |
 | 3481138, e8659f3 | mcm-ancilla | Merge; hosted patches sleep between uses |
 | 7a1fdda | mcm-ancilla | Conditions in `.trans` (`?`); scheduler skips products whose condition fails (`--cond-outcomes`) |
+| d697a79 | mcm-ancilla | Conditional CX/CZ/SWAP; flushed CZ/SWAP no longer dropped |
 
 ## 1. Model
 
@@ -38,9 +39,10 @@ adds three things. Each is handled as follows.
    | Pauli under several bits | Frame update on a *derived* AND outcome | Keeps the frame linear in the outcomes |
    | Clifford (`if(m) h/s/sx q`) | **Physical**: flush pending Cliffords, pay off the qubit's frame (`fix` event), emit `<S>`/`<SX>` products carrying the condition | Absorbing it into the tableau would make every later product depend on the outcome |
    | T (`if(m) t q`) | **Physical**: same flush and frame payment, then a weight-1 conditional `<T>` | Strictly only the condition is needed; see §8 |
+   | CX / CZ / SWAP (`if(m) cx q[a],q[b]`) | **Physical**, like a conditional Clifford: flush, pay off the frame on *both* qubits, emit conditional `<CX>` (CZ as H·CX·H, SWAP as three CX) | Same reason; both qubits must be frame-free (d697a79) |
 
-   Only single-qubit conditional gates are supported. Conditional CX, a measurement inside an
-   `if`, and classical expressions are rejected with an error, not dropped.
+   A measurement or reset inside an `if`, gates on three or more qubits, and classical
+   expressions are rejected with an error, not dropped.
 
 A conditional product carries two things:
 - **when**: the `@` list, the measurements whose outcome it waits for. This is a DAG edge plus
@@ -121,9 +123,12 @@ that they agree.
   pending Cliffords, so the measurement is weight 1 and later products start from a clean frame;
   `init` also emits `<R>` and clears the qubit's frame.
 - **Conditional gates**: see §1. Physical ones: `flush_clifford_queue` (the whole queue, every
-  qubit), `pay_frame` → `Event::Fix`, then products with `meta.cond` and `meta.needs` (condition
-  outcomes ∪ the fix's outcomes). A conditional Clifford's dropped Pauli joins the frame on a
-  derived outcome.
+  qubit), `pay_frame` → `Event::Fix` for every qubit the gate touches, then products with
+  `meta.cond` and `meta.needs` (condition outcomes ∪ the fixes' outcomes). A conditional
+  Clifford's dropped Pauli joins the frame on a derived outcome.
+- **CZ and SWAP** have no `.trans` form; `expand_for_emit` rewrites them into CX (+H) wherever
+  Cliffords are emitted. Before d697a79 a CZ or SWAP pending at a flush was silently dropped
+  (wrong output; the dcsynth lowering only emits `cx`, so no benchmark was affected).
 - **Output**: `write_trans` writes `@` (needs) and `?` (cond), mapping outcome ids to
   measurement lines. `write_sidecar` writes the sidecar. CLI: `--reset_mode`, `--sidecar`.
 
@@ -264,10 +269,26 @@ schedule checker runs, and it has passed on every schedule.
   for it.
 - **To verify.** A failed T on a multi-qubit Pauli is corrected with per-qubit S gates
   (`correction_power`); the exact correction is a π/4 rotation on the whole product.
-- **Unsupported.** Conditional multi-qubit gates, measurement inside `if`, and classical
-  expressions.
+- **Unsupported.** Measurement or reset inside `if`, conditional gates on three or more qubits,
+  classical expressions, loops.
 - **Modelling.** Every qubit, ancilla included, is a full logical patch, unless hosted. Unused
   declared qubits still get patches: strip them before scheduling (the benchmark harness does).
+- **A pending T correction is ignored by measurements.** After a failed T, later T products on
+  the qubit are re-conjugated (`apply_t_conjugation`), but a measurement is scheduled in its
+  original basis and the pending correction carries on past it (it is cleared only when a hosted
+  patch goes dormant). Physically the correction must come first or rotate the measurement
+  basis, e.g. X becomes Y, which routes differently and affects the hosting release rule. Mid-circuit
+  measurements make this far more common than in static circuits, where it only touches the final
+  measurements.
+- **Hosting relies on `--reset_mode flush|init`.** A hosted patch is released only after a
+  weight-1 X/Z measurement or `<R>`; with `frame`, ancilla measurements are usually multi-qubit,
+  so the patch stays live until its last product.
+- **Estimates ignore skipping.** The printed volume estimate and "normalized scheduling
+  efficiency" count every product, including skipped conditional ones.
+- **No circuit-level error budget.** Synthesis error (ε per rotation) and Clifford snapping (up
+  to `--clifford-tol` per rotation or correction) are not summed into a reported total.
+- **Exactness at scale.** The oracle is exponential in width; above ~14 qubits only the schedule
+  checker (ordering and resources, not outcomes) runs.
 
 ## 9. Planned
 
@@ -282,3 +303,39 @@ schedule checker runs, and it has passed on every schedule.
 - **`--cond-outcomes trace FILE`**: real outcomes from simulation or hardware (the online
   executor case).
 - **Latency-aware selection**: prefer measurements that conditional products wait on.
+- **Repeat-until-success (RUS) circuits**: see the design sketch below.
+
+### Repeat-until-success: what supporting it would take
+
+An RUS gadget runs a block, measures, and repeats the block until the measurement reports
+success. That needs three things the stack does not have: loops, measurements under a
+condition, and per-measurement success probabilities.
+
+1. **Input and lowering.** Accept a loop (Qiskit `WhileLoopOp`, or an OpenQASM 3 `while`) in
+   `dcsynth_to_cliffordt.py`, and lower it by **bounded unrolling**: K copies of the body, where
+   copy i runs only if attempts 1..i-1 all failed. Each copy's operations get the AND condition
+   (`?m1=0,m2=0,..`), which `?` already expresses. K is chosen so that P(not done after K) is
+   below the error budget. True unbounded loops would need the scheduler to instantiate
+   iterations itself (see 5).
+2. **Measurement and reset under a condition** (the transpiler rejects them today).
+   - The value a later `if` reads becomes a multiplexer: the new outcome if the measurement ran,
+     else the bit's old value. Express it as derived outcomes (ANDs of terms), the way
+     `derived_outcome` handles multi-bit conditions.
+   - A conditional reset puts a multiplexed term into the frame. Avoid that by requiring
+     `flush`/`init` resets inside loop bodies, so each attempt starts frame-free.
+   - The tableau must be the same on both branches. Flush at every iteration boundary, so a
+     skipped iteration leaves the same Clifford frame as an executed one.
+3. **Scheduler.**
+   - Allow conditional `<M>`/`<R>`. A skipped measurement has no outcome, so products listing
+     it in `@` must take the outcome of whichever attempt actually ran: release them when the
+     loop's last executed measurement is decoded.
+   - Sample outcomes with per-measurement success probabilities rather than the global
+     `--cond-p1`: an annotation in `.trans` (e.g. `<M>%0.75`) or the sidecar.
+   - Report expected cost over seeds; the number of iterations is now random.
+4. **Formats and checks.** Sidecar records for conditional measurements and multiplexed
+   outcomes. The checker must accept skipped measurements. The oracle must branch over
+   iterations, which is feasible for small K.
+5. **Unbounded / online alternative.** Keep the body as a template and let the scheduler
+   re-instantiate it on failure. This needs dynamic product ids, Steiner trees and terminals
+   computed at run time, and a hosting chain that grows. It is closer to a real online executor,
+   but a much larger change than unrolling.
