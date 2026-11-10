@@ -36,7 +36,8 @@ adds three things. Each is handled as follows.
    **Reset** is that measurement plus a correction: the qubit holds `|m⟩`, so it is owed `X^m`.
    The correction goes into a classical **Pauli frame** (per qubit, the XOR of the outcomes that
    owe an X and a Z), not onto the lattice. A later product whose Pauli anticommutes with the
-   frame only changes sign, which is recorded as `frame_deps`.
+   frame only changes sign, which is recorded as `frame_deps`. For a T, that sign decides T vs T†,
+   so it also waits for those outcomes (`@`).
 3. **Conditional operations**, by gate type:
 
    | Conditional gate | Treatment | Why |
@@ -93,7 +94,8 @@ Written for every dynamic circuit (`transpile --sidecar` forces it for static on
 
 - `products`: one record per `.trans` line, in order.
   - Every record: `i`, `label`.
-  - T/M/R: `sign`, `frame_deps` (outcome ids whose XOR flips the sign).
+  - T/M/R: `sign`, `frame_deps` (outcome ids whose XOR flips the sign). A T with `frame_deps`
+    also has `needs` (it waits for those measurements: its sign decides T vs T†).
   - M: `meas_id`, `logical_qubit`, `clbit`, `is_reset`.
   - Conditional records: `cond` (`[outcome id, value]` pairs) and `needs` (outcome ids = the `@` list).
 - `events`: `fix` (before product `before`, apply `X^(…)Z^(…)` to a qubit to pay off its frame)
@@ -341,10 +343,13 @@ grover_3, ae_3 and ae_4.
   no physical S/SX and were unaffected.
 - **Conditional T does not need the flush.** A conditional π/8 rotation on the conjugated Pauli
   commutes with the Clifford pushing like an unconditional one; only the condition gates it.
-- **Timing assumptions the scheduler does not enforce.** A T whose sign depends on the frame, and
-  each T's own injection correction, both need decoded outcomes before their S correction is
-  resolved. Corrections are applied lazily, so this is usually hidden, but no latency is charged
-  for it.
+- **A T whose sign depends on outcomes waits for them.** If a T's Pauli anticommutes with a
+  Pauli the frame owes, it is T or T† depending on those outcomes; the transpiler gives it those
+  measurements as `needs` (an `@` edge, with reaction latency). A measurement's sign only
+  relabels its outcome and gets no edge.
+- **Timing assumption the scheduler does not enforce.** Each T's own injection correction needs
+  the injection outcome decoded before it is applied. Corrections are applied lazily, so this is
+  usually hidden, but no latency is charged for it.
 - **Multi-qubit T failures are modelled per qubit (not exact).** A failed π/8 rotation on
   P = P₁⊗…⊗P_w needs the π/4 rotation e^{−iπ/4·P}, a single weight-w Clifford. PureMagic
   instead raises each qubit's `correction_power` and later applies, or conjugates by, single-qubit

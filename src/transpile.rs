@@ -193,8 +193,9 @@ struct PauliMeta {
     /// For a *conditional* product: it executes only if every `(outcome id, value)` holds, where
     /// outcome ids are true outcomes as defined above. Empty for an unconditional product.
     cond: Vec<(usize, bool)>,
-    /// Outcomes this product needs before it can start (its conditions, plus any owed Pauli that
-    /// was paid for physically just before it). Written to the `.trans` line as `@line,..` so the
+    /// Outcomes this product needs before it can start: its conditions, plus any owed Pauli that
+    /// was paid for physically just before it, or, for a T, the outcomes that decide whether it
+    /// is T or T† (its `frame_deps`). Written to the `.trans` line as `@line,..` so the
     /// scheduler orders it after the measurements that decide it.
     needs: Vec<usize>,
 }
@@ -1401,6 +1402,12 @@ fn transpile_opts(
                 };
                 let mut emitted = TransPauli::from_pauli_string(&ps, "T");
                 emitted.apply_frame(frame.deps(&ps));
+                // A rotation whose sign depends on outcomes (it is T or T† depending on them)
+                // cannot be performed before those outcomes are known: it waits for them, like
+                // a conditional gate. A measurement's sign, by contrast, only relabels its
+                // outcome classically, so measurements get no such edge.
+                emitted.meta.needs =
+                    real_outcomes(&emitted.meta.frame_deps, &derived_defs).into_iter().collect();
                 layers.place(&pauli_support(&emitted), LAYER_COST_T);
                 ops.push(TransItem::Pauli(emitted));
             }
@@ -1777,11 +1784,15 @@ fn write_sidecar(
         ResetMode::Init => "init",
     };
     let cond_fields = |m: &PauliMeta| -> String {
-        if m.cond.is_empty() {
-            String::new()
-        } else {
-            format!(",\"cond\":{},\"needs\":{}", json_terms(&m.cond), json_usize_list(&m.needs))
+        let mut out = String::new();
+        if !m.cond.is_empty() {
+            out += &format!(",\"cond\":{}", json_terms(&m.cond));
         }
+        // Conditional products, and T products whose sign depends on outcomes, wait for these.
+        if !m.needs.is_empty() {
+            out += &format!(",\"needs\":{}", json_usize_list(&m.needs));
+        }
+        out
     };
     let (mut products, mut events, mut derived) = (Vec::new(), Vec::new(), Vec::new());
     let mut line = 0usize;
@@ -2710,6 +2721,33 @@ mod tests {
                 .count();
             assert_eq!(cx, n_cx, "{}", two_q);
         }
+    }
+
+    #[test]
+    fn t_whose_sign_depends_on_an_outcome_waits_for_it() {
+        // The conditional X leaves X_1 owed on outcome 0; the later T (a Z_1 rotation)
+        // anticommutes with it, so it is T or T† depending on that outcome. The final
+        // measurement's sign also depends on it, but that only relabels its outcome.
+        let (n, gates) = parse_lines(&[
+            "qreg q[2];",
+            "creg c[1];",
+            "h q[0];",
+            "measure q[0] -> c[0];",
+            "if(c==1) x q[1];",
+            "t q[1];",
+        ]);
+        let items = transpile_opts(n, &gates, 0, false, ResetMode::Frame);
+        let paulis: Vec<&TransPauli> = items
+            .iter()
+            .filter_map(|i| if let TransItem::Pauli(p) = i { Some(p) } else { None })
+            .collect();
+        let t = paulis.iter().find(|p| p.label == "T").unwrap();
+        assert_eq!(t.meta.frame_deps, vec![0]);
+        assert_eq!(t.meta.needs, vec![0], "the T waits for the outcome deciding its sign");
+        for m in paulis.iter().filter(|p| p.label == "M") {
+            assert!(m.meta.needs.is_empty(), "a measurement's sign is classical bookkeeping");
+        }
+        assert!(items_text(&items).lines().any(|l| l.ends_with("<T>@0")));
     }
 
     #[test]

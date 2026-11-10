@@ -394,7 +394,7 @@ def main():
     nq = max((q for p in prods for q, _ in p["qubits"]), default=-1) + 1
     nT = sum(p["kind"] == "T" for p in prods)
     nM = sum(p["kind"] == "M" for p in prods)
-    nC = len(side and [r for r in side["products"] if r.get("needs")] or [])
+    nC = len(side and [r for r in side["products"] if r.get("cond")] or [])
     nK = sum(bool(p["cond"]) for p in prods)
     if nK:
         print(f"{nK} products carry a condition; cond mode {when.cond_mode or 'not logged'}, "
