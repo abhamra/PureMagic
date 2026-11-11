@@ -76,6 +76,12 @@ struct Args {
     /// Conditional products (a `?id=v,..` suffix in the `.trans` file): `random` samples each
     /// measurement's outcome and skips products whose condition fails, so the schedule is that
     /// of the circuit those outcomes call for; `worst` runs them all (an upper bound).
+    /// How a failed T injection is corrected: `litinski` (auto-corrected pi/8 rotation: a borrowed
+    /// |0> helper next to the magic patch; magic and helper held until the correction is decided,
+    /// nothing owed on the data) or `legacy` (the old per-qubit S record, which is incorrect for
+    /// multi-qubit T gates and for failures about different axes; kept to compare against).
+    #[arg(long = "t-correction", value_enum, default_value_t = scheduler::TCorrection::Litinski)]
+    t_correction: scheduler::TCorrection,
     #[arg(long = "cond-outcomes", value_enum, default_value_t = scheduler::CondOutcomes::Random)]
     cond_outcomes: scheduler::CondOutcomes,
     /// Probability that a measurement's true outcome is 1, for `--cond-outcomes random`.
@@ -175,6 +181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     sched.set_reaction_latency(args.reaction_latency);
     sched.set_cond_outcomes(args.cond_outcomes, args.cond_p1);
+    sched.set_t_correction(args.t_correction);
 
     let (tot_lcycles, n_scheduled) = sched.sched_circuit()?;
     assert!(n_scheduled + sched.skipped.len() >= n_products);
