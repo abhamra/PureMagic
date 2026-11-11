@@ -63,7 +63,9 @@ Run with `-h` to see all options.
 | `-S, --sides_only` | off | Use only side edges of data patches (not top/bottom) |
 | `-F, --no-t-failures` | off | Disable T gate failures (every T gate succeeds on first attempt) |
 | `-C, --record-cultivation-dist` | off | Record normalized cultivation-time distribution to `<name>.cultivation_dist` |
-| `--reaction-latency <L>` | `0` | Dynamic circuits: lcycles a product with an `@id` classical dependency waits after the product it names completes (outcome decoding time) |
+| `--reaction-latency <L>` | `0` | Lcycles to decode an outcome and act on it: a product with an `@id` classical dependency waits this long after the product it names completes, and a T's correction is decided this long after injection |
+| `--t-correction <MODE>` | `litinski` | How a failed T injection (50%) is corrected: `litinski` (borrowed \|0⟩ helper patch, auto-corrected), `inplace-y` (magic patch measured in X or Y), or `legacy` (old per-qubit S record, incorrect; for comparison). See [docs/t-gate-corrections.md](docs/t-gate-corrections.md) |
+| `--y-meas-lcycles <N>` | `1` | Extra lcycles an in-place Y measurement of a magic patch takes |
 | `-a, --ancilla-rows <N>` | `1` | Number of ancilla rows between data patches (magic routing only) |
 | `-l, --log-scheduler <LEVEL>` | `none` | Scheduler trace log level: `none`, `info`, or `debug`; only populated in debug builds |
 | `-I, --show-product-ids` | off | Show product IDs instead of Pauli terms in circuit plots |

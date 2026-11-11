@@ -21,6 +21,9 @@ the reference for how it works. Branch: `mcm-ancilla`, which contains `mcm-suppo
 | bcc0cfc | mcm-ancilla | Lowering: error ledger and `--error-budget` |
 | cc57acb | mcm-ancilla | An S/SX holds its nodes for all 3 lcycles (schedules no longer depend on `--plot paths`) |
 | d15d91a | mcm-ancilla | `notebooks/dynamic_circuit_tutorial.ipynb` |
+| d94a740 | mcm-ancilla | A T whose sign depends on measurement outcomes waits for them (`@` needs) |
+| 2f84ec0, a673091 | t-autocorrect-litinski | Failed T injections auto-corrected (Litinski), default `--t-correction litinski`; see `docs/t-gate-corrections.md` |
+| 563a4ef | t-autocorrect-litinski | `--t-correction inplace-y` (Gidney in-place Y) and `--y-meas-lcycles` |
 
 ## 1. Model
 
@@ -221,10 +224,15 @@ the flushes that conditional gates cause at transpile time (§8), which is Level
 
 ### Other scheduler details that matter for dynamic circuits
 
-- **T failures** are a 50% coin flip per executed T. The S correction is tracked per qubit
-  (`correction_power`) and applied lazily: it is merged into the next Clifford on that qubit, or
-  later T bases are conjugated (`t_conjugated_bases`).
-- **Measurements under a pending correction** (351d2c8) are conjugated the same way: measuring P
+- **T failures** are a 50% coin flip per executed T. By default (`--t-correction litinski`) the
+  correction is applied on a borrowed helper patch, so nothing is owed on the data; the helper is
+  held until the correction is decided (reaction latency, chained through earlier anticommuting
+  T gates). See `docs/t-gate-corrections.md`. The two bullets below describe only
+  `--t-correction legacy`, which is kept to compare against.
+- **Legacy model.** The S correction is tracked per qubit (`correction_power`) and applied
+  lazily: it is merged into the next Clifford on that qubit, or later T bases are conjugated
+  (`t_conjugated_bases`).
+- **Measurements under a pending correction** (351d2c8, legacy model) are conjugated the same way: measuring P
   before a pending S is measuring S†PS, so with an odd correction an X measurement is a Y
   measurement (both half-nodes). The correction stays pending afterwards. A multi-qubit
   measurement whose basis changes is routed live on its conjugated terminals instead of its
@@ -347,10 +355,13 @@ grover_3, ae_3 and ae_4.
   Pauli the frame owes, it is T or T† depending on those outcomes; the transpiler gives it those
   measurements as `needs` (an `@` edge, with reaction latency). A measurement's sign only
   relabels its outcome and gets no edge.
-- **Timing assumption the scheduler does not enforce.** Each T's own injection correction needs
+- **Fixed on t-autocorrect-litinski: T-failure corrections.** The two items below describe the
+  legacy model (`--t-correction legacy`). The default now auto-corrects each T on an ancilla and
+  charges the reaction latency for deciding it; see `docs/t-gate-corrections.md`.
+- **Timing assumption the legacy model does not enforce.** Each T's own injection correction needs
   the injection outcome decoded before it is applied. Corrections are applied lazily, so this is
   usually hidden, but no latency is charged for it.
-- **Multi-qubit T failures are modelled per qubit (not exact).** A failed π/8 rotation on
+- **Multi-qubit T failures are modelled per qubit (not exact; legacy model).** A failed π/8 rotation on
   P = P₁⊗…⊗P_w needs the π/4 rotation e^{−iπ/4·P}, a single weight-w Clifford. PureMagic
   instead raises each qubit's `correction_power` and later applies, or conjugates by, single-qubit
   S gates. The two differ:
