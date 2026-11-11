@@ -77,8 +77,8 @@ struct Args {
     /// measurement's outcome and skips products whose condition fails, so the schedule is that
     /// of the circuit those outcomes call for; `worst` runs them all (an upper bound).
     /// How a failed T injection is corrected: `litinski` (auto-corrected pi/8 rotation: a borrowed
-    /// |0> helper next to the magic patch; magic and helper held until the correction is decided,
-    /// nothing owed on the data) or `legacy` (the old per-qubit S record, which is incorrect for
+    /// |0> helper next to the magic patch, held until the correction is decided; nothing owed on
+    /// the data) or `legacy` (the old per-qubit S record, which is incorrect for
     /// multi-qubit T gates and for failures about different axes; kept to compare against).
     #[arg(long = "t-correction", value_enum, default_value_t = scheduler::TCorrection::Litinski)]
     t_correction: scheduler::TCorrection,

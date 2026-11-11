@@ -176,12 +176,12 @@ const HELPER_MAX_WAIT: usize = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum TCorrection {
     /// Auto-corrected pi/8 rotation (Litinski, Game of Surface Codes). In the injection lcycle a
-    /// free neighbour of the magic patch is borrowed as a |0> helper and Z_m (x) Y_helper is measured
-    /// alongside P (x) Z_m. Once the injection outcome is decoded, the magic patch is measured in X
-    /// and the helper in X or Z, which applies the correction or not. No Clifford ever reaches
-    /// the data: later products are never changed and no S gate is emitted. The magic and helper
-    /// patches are held until that decision (reaction latency, chained through earlier T gates
-    /// whose Paulis anticommute).
+    /// free neighbour of the magic patch is borrowed as a |0> helper; Z_m (x) Y_helper is measured
+    /// alongside P (x) Z_m, then the magic patch in X, which frees it. Once the injection outcome
+    /// is decoded the helper is measured in X or Z, which applies the correction or not. No
+    /// Clifford ever reaches the data: later products are never changed and no S gate is
+    /// emitted. The helper is held until that decision (reaction latency, chained through
+    /// earlier T gates whose Paulis anticommute).
     Litinski,
     /// The per-qubit S-correction record PureMagic used before (correction_power). Incorrect: it
     /// splits the correction of a multi-qubit T into independent one-qubit corrections and
@@ -449,39 +449,46 @@ impl Scheduler {
     /// owed also depends on the Pauli-frame bits of earlier T gates whose Paulis anticommute with
     /// this one (their byproduct flips this rotation's sign), and those bits are known only L
     /// lcycles after their own decision. So decisions chain: with L = 0 the decision is immediate.
-    fn decision_lcycle(&mut self, pp_id: i32) -> usize {
+    fn decision_lcycle(&self, pp_id: i32) -> usize {
         let now = self.current_lcycle;
         let l = self.reaction_latency;
         let mut decision = now + l;
         if l == 0 {
             return decision;
         }
-        let qubits: Vec<usize> =
-            self.input.circuit.product(pp_id).operators.iter().map(|op| op.qubit as usize).collect();
-        let n = qubits.iter().copied().max().unwrap_or(0) + 1;
-        if self.t_decisions.len() < n {
-            self.t_decisions.resize(n, Vec::new());
-        }
-        for &q in &qubits {
-            // Entries that can no longer bind (decided at least L lcycles ago) are dropped.
-            self.t_decisions[q].retain(|&(_, d)| d + l > now);
-            let earlier: Vec<(i32, usize)> = self.t_decisions[q].clone();
-            for (j, d) in earlier {
-                if self.anticommute(j, pp_id) {
-                    decision = decision.max(d + l);
+        for op in &self.input.circuit.product(pp_id).operators {
+            for &(j, d) in self.t_decisions.get(op.qubit as usize).map_or(&[][..], |v| v) {
+                // An earlier decision binds until its frame bits are known (d + L).
+                if d + l > now && d + l > decision && self.anticommute(j, pp_id) {
+                    decision = d + l;
                 }
             }
-        }
-        for &q in &qubits {
-            self.t_decisions[q].push((pp_id, decision));
         }
         decision
     }
 
+    /// Records T product `pp_id`'s decision lcycle on its qubits for later T gates.
+    fn record_decision(&mut self, pp_id: i32, decision: usize) {
+        let (now, l) = (self.current_lcycle, self.reaction_latency);
+        if l == 0 {
+            return;
+        }
+        for i in 0..self.input.circuit.product(pp_id).operators.len() {
+            let q = self.input.circuit.product(pp_id).operators[i].qubit as usize;
+            if self.t_decisions.len() <= q {
+                self.t_decisions.resize(q + 1, Vec::new());
+            }
+            // Entries whose frame bits are already known can no longer bind.
+            self.t_decisions[q].retain(|&(_, d)| d + l > now);
+            self.t_decisions[q].push((pp_id, decision));
+        }
+    }
+
     /// Rank of node `nb` as a |0> helper for a T injection, lower is better, or None if it can
-    /// never be one (a data patch, a hosted patch, the route-only half of one). Free routing (bus)
-    /// patches come first, then cultivating magic patches with the least progress (their
-    /// cultivation restarts afterwards). A ready magic state is never borrowed: it would waste
+    /// never be one (a data patch, a hosted patch, the route-only half of one). A free routing
+    /// (bus) patch comes first, then the cultivating magic patch with the least progress (its
+    /// cultivation restarts). With magic routing (-u) there are no bus patches, so the helper is
+    /// always a cultivating magic patch. A ready magic state is never borrowed: it would waste
     /// the state, and a T waiting for it could find none left.
     fn helper_rank(&self, nb: u16) -> Option<(u8, i32)> {
         let topo = &self.input.topo;
@@ -518,44 +525,51 @@ impl Scheduler {
         self.input.topo.node(magic).nbs_slice().iter().any(|&nb| self.helper_rank(nb).is_some())
     }
 
+    /// Keeps patch `node` occupied through lcycle `last` (nothing to do if `last` is now).
+    fn hold(&mut self, node: u16, last: usize) {
+        let now = self.current_lcycle;
+        if last > now {
+            self.held.push((last, node));
+            self.t_stats.hold_patch_lcycles += last - now;
+        }
+    }
+
     /// Bookkeeping for a T product injected this lcycle from magic patch `magic`.
+    ///
+    /// Litinski: P (x) Z_m and Z_m (x) Y_h are measured together, then the magic patch in X, so
+    /// the magic patch is free again after this lcycle. Only the helper h waits for the decision
+    /// (it is measured in X to apply the correction, in Z not to).
     fn inject_t(&mut self, pp_id: i32, magic: u16) {
         let now = self.current_lcycle;
         let decision = self.decision_lcycle(pp_id);
+        self.record_decision(pp_id, decision);
         self.t_stats.injections += 1;
         self.t_stats.injection_log.push((now, pp_id, magic, decision));
         self.t_stats.max_decision_delay = self.t_stats.max_decision_delay.max(decision - now);
-        if decision > now {
-            self.held.push((decision, magic));
-            self.t_stats.hold_patch_lcycles += decision - now;
-        }
         info_sched!(
             "  T {} injected from magic {}; correction decided in lcycle {}",
             pp_id,
             self.input.topo.label(magic),
             decision
         );
-        if self.t_correction == TCorrection::Litinski {
-            match self.pick_helper(magic) {
-                Some(h) => {
-                    info_sched!("    helper |0> patch {}", self.input.topo.label(h));
-                    self.t_stats.helper_log.push((now, magic, h));
-                    self.mark_nodes_used(&[h]);
-                    self.t_stats.helpers += 1;
-                    if decision > now {
-                        self.held.push((decision, h));
-                        self.t_stats.hold_patch_lcycles += decision - now;
-                    }
-                }
-                None if self.helper_possible(magic) => {
-                    info_sched!("    no free neighbour for the helper yet");
-                    self.t_stats.helpers_deferred += 1;
-                    self.helper_wanted.push((magic, decision, now + HELPER_MAX_WAIT));
-                }
-                None => {
-                    info_sched!("    no neighbour can be a helper; magic patch measured in place");
-                    self.t_stats.helpers_missing += 1;
-                }
+        match self.pick_helper(magic) {
+            Some(h) => {
+                info_sched!("    helper |0> patch {}", self.input.topo.label(h));
+                self.t_stats.helper_log.push((now, magic, h));
+                self.t_stats.helpers += 1;
+                self.mark_nodes_used(&[h]);
+                self.hold(h, decision);
+            }
+            None if self.helper_possible(magic) => {
+                // The magic patch keeps its state until a helper is free (hold_t_patches).
+                info_sched!("    no free neighbour for the helper yet");
+                self.t_stats.helpers_deferred += 1;
+                self.helper_wanted.push((magic, decision, now + HELPER_MAX_WAIT));
+            }
+            None => {
+                info_sched!("    no neighbour can be a helper; magic patch measured in place");
+                self.t_stats.helpers_missing += 1;
+                self.hold(magic, decision);
             }
         }
     }
@@ -579,33 +593,31 @@ impl Scheduler {
         }
         self.mark_nodes_used(&nodes);
         let wanted = std::mem::take(&mut self.helper_wanted);
+        // Every waiting magic patch still holds its state: occupy them all before any helper is
+        // picked, so no waiting patch is borrowed as another one's helper.
+        for &(magic, _, _) in &wanted {
+            self.mark_nodes_used(&[magic]);
+            self.t_stats.hold_patch_lcycles += 1;
+        }
         for (magic, decision, give_up) in wanted {
-            if !self.used[magic as usize] {
-                self.mark_nodes_used(&[magic]); // still holding the magic state
-                self.t_stats.hold_patch_lcycles += 1;
-            }
             match self.pick_helper(magic) {
                 Some(h) => {
+                    // Z_m (x) Y_h and X_m now; the magic patch is free from the next lcycle.
                     self.t_stats.helper_log.push((now, magic, h));
-                    self.mark_nodes_used(&[h]);
                     self.t_stats.helpers += 1;
-                    let last = decision.max(now);
-                    if last > now {
-                        self.held.push((last, h));
-                        self.held.push((last, magic));
-                        self.t_stats.hold_patch_lcycles += 2 * (last - now);
-                    }
+                    self.mark_nodes_used(&[h]);
+                    self.hold(h, decision);
                 }
                 None if now < give_up => self.helper_wanted.push((magic, decision, give_up)),
                 None => {
                     // Waiting longer could deadlock (two magic patches each waiting on the
                     // other); measure the magic patch in place instead.
-                    info_sched!("  no helper for {}; measured in place", self.input.topo.label(magic));
+                    info_sched!(
+                        "  no helper for {}; measured in place",
+                        self.input.topo.label(magic)
+                    );
                     self.t_stats.helpers_missing += 1;
-                    if decision > now {
-                        self.held.push((decision, magic));
-                        self.t_stats.hold_patch_lcycles += decision - now;
-                    }
+                    self.hold(magic, decision);
                 }
             }
         }
@@ -1064,7 +1076,10 @@ impl Scheduler {
                 // Only error if T gates are pending: pending Cliffords may just be waiting on a
                 // temporarily-blocked correction S gate and don't need magic to make progress.
                 let has_pending_t = self.pps_pending.iter().any(|pp| pp.gate_type.is_t());
+                let holds_outstanding =
+                    self.holding_now || !self.held.is_empty() || !self.helper_wanted.is_empty();
                 if has_pending_t
+                    && !holds_outstanding
                     && !(0..self.input.topo.n_nodes)
                         .any(|node_i| self.input.topo.is_cultivating(node_i as u16))
                 {
@@ -3004,7 +3019,11 @@ mod tests {
             let (_, n) = sched.sched_circuit().expect("sched_circuit failed");
             assert!(sched.t_gate_failures > 0, "seed {}: want some failures", rseed);
             assert_eq!(n, n_products, "seed {}: no correction products may be added", rseed);
-            assert!(sched.t_conjugated_bases.is_empty(), "seed {}: a product was relabelled", rseed);
+            assert!(
+                sched.t_conjugated_bases.is_empty(),
+                "seed {}: a product was relabelled",
+                rseed
+            );
             assert!(sched.correction_power.iter().all(|&p| p == 0));
             assert_eq!(sched.t_stats.injections, 12);
         }
@@ -3023,11 +3042,12 @@ mod tests {
                 for &(t, magic, h) in &st.helper_log {
                     assert!(topo.node(magic).nbs_slice().contains(&h), "helper not adjacent");
                     assert_ne!(topo.node(h).node_type, NodeType::Data, "helper on a data patch");
-                    // Neither patch may serve as another T's magic state while it is held.
+                    // The magic patch is held until its helper arrives (lcycle t); the helper
+                    // until the decision d. Neither may serve another T as its magic state then.
                     let (t0, _, _, d) =
                         *st.injection_log.iter().rev().find(|e| e.2 == magic && e.0 <= t).unwrap();
                     for &(t1, pp, m1, _) in &st.injection_log {
-                        if t1 > t0 && t1 <= d {
+                        if t1 > t0 && t1 <= t {
                             assert_ne!(m1, magic, "magic patch reused while held (T {})", pp);
                         }
                         if t1 >= t && t1 <= d {
@@ -3035,6 +3055,20 @@ mod tests {
                         }
                     }
                 }
+                // Holds: one helper per injection for its decision delay, plus the lcycles a
+                // magic patch waited for a helper (or held in place when none was found).
+                let min_hold: usize = st.injection_log.iter().map(|&(t, _, _, d)| d - t).sum();
+                assert!(
+                    st.hold_patch_lcycles >= min_hold,
+                    "L={} seed={} held {} < {} (helpers {} waited {} missing {})",
+                    latency,
+                    rseed,
+                    st.hold_patch_lcycles,
+                    min_hold,
+                    st.helpers,
+                    st.helpers_deferred,
+                    st.helpers_missing
+                );
                 for &(t, pp, magic, d) in &st.injection_log {
                     assert!(d >= t + latency, "T {} decided before its outcome is decoded", pp);
                     assert_eq!(topo.node(magic).node_type, NodeType::Magic);
