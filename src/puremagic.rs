@@ -75,10 +75,17 @@ struct Args {
     reaction_latency: usize,
     /// How a failed T injection is corrected: `litinski` (auto-corrected pi/8 rotation: a borrowed
     /// |0> helper next to the magic patch, held until the correction is decided; nothing owed on
-    /// the data) or `legacy` (the old per-qubit S record, which is incorrect for
-    /// multi-qubit T gates and for failures about different axes; kept to compare against).
+    /// the data), `inplace-y` (no helper: the magic patch is held until the decision and then
+    /// measured in X, or in Y for a failed T) or `legacy` (the old per-qubit S record, which is
+    /// incorrect for multi-qubit T gates and for failures about different axes; kept to compare
+    /// against).
     #[arg(long = "t-correction", value_enum, default_value_t = scheduler::TCorrection::Litinski)]
     t_correction: scheduler::TCorrection,
+    /// Extra lcycles an in-place Y measurement of a magic patch takes (`inplace-y`, and
+    /// `litinski` injections that found no helper). Gidney's in-place Y measurement takes
+    /// floor(d/2)+2 rounds, about half an lcycle; the default rounds it up to 1.
+    #[arg(long = "y-meas-lcycles", default_value_t = 1)]
+    y_meas_lcycles: usize,
     /// Conditional products (a `?id=v,..` suffix in the `.trans` file): `random` samples each
     /// measurement's outcome and skips products whose condition fails, so the schedule is that
     /// of the circuit those outcomes call for; `worst` runs them all (an upper bound).
@@ -182,6 +189,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     sched.set_reaction_latency(args.reaction_latency);
     sched.set_cond_outcomes(args.cond_outcomes, args.cond_p1);
     sched.set_t_correction(args.t_correction);
+    sched.set_y_meas_lcycles(args.y_meas_lcycles);
 
     let (tot_lcycles, n_scheduled) = sched.sched_circuit()?;
     assert!(n_scheduled + sched.skipped.len() >= n_products);

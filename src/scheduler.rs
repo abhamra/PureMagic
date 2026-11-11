@@ -183,6 +183,13 @@ pub(crate) enum TCorrection {
     /// emitted. The helper is held until that decision (reaction latency, chained through
     /// earlier T gates whose Paulis anticommute).
     Litinski,
+    /// In-place Y measurement (Gidney, "Inplace Access to the Surface Code Y Basis", Quantum
+    /// 2024): no helper. After P (x) Z_m the magic patch itself is held until the correction is
+    /// decided, then measured in X (no correction) or Y (applies it). A Y measurement takes
+    /// floor(d/2)+2 rounds, modelled as `--y-meas-lcycles` extra lcycles on the magic patch, and
+    /// the frame bit it yields is known only after that. Single-patch injection, but the magic
+    /// patch cannot cultivate while it waits.
+    InplaceY,
     /// The per-qubit S-correction record PureMagic used before (correction_power). Incorrect: it
     /// splits the correction of a multi-qubit T into independent one-qubit corrections and
     /// merges corrections about different axes into a Pauli. Kept to compare against.
@@ -292,8 +299,16 @@ pub(crate) struct Scheduler {
     /// Patches held after a T injection until its correction is decided: (last lcycle, node).
     held: Vec<(usize, u16)>,
     /// Litinski injections whose magic patch had no free neighbour for the |0> helper yet:
-    /// (magic node, decision lcycle). The magic patch is held until a helper is found.
-    helper_wanted: Vec<(u16, usize, usize)>,
+    /// (T product, magic node, decision lcycle, give-up lcycle). The magic patch is held until
+    /// a helper is found.
+    helper_wanted: Vec<(i32, u16, usize, usize)>,
+    /// Magic patches measured in place, by T product: (magic node, decision lcycle). If the T
+    /// failed, the patch is measured in Y, which takes `y_meas_lcycles` more.
+    inplace_pending: HashMap<i32, (u16, usize)>,
+    /// Failed T products still waiting for a helper (their measurement basis is not known yet).
+    failed_waiting: HashSet<i32>,
+    /// Extra lcycles an in-place Y measurement of a magic patch takes.
+    y_meas_lcycles: usize,
     /// True if `hold_t_patches` occupied any patch in the current lcycle.
     holding_now: bool,
     /// Per qubit, recent T products and the lcycle their correction is decided (decision chain).
@@ -313,6 +328,9 @@ pub(crate) struct TCorrectionStats {
     /// has no neighbour that could ever be one). Their magic patch is measured in place (the
     /// in-place Y measurement) instead; see docs/t-gate-corrections.md.
     pub(crate) helpers_missing: usize,
+    /// Magic patches measured in place, and how many of those needed the (slower) Y basis.
+    pub(crate) inplace: usize,
+    pub(crate) inplace_y: usize,
     /// Patch-lcycles spent holding magic and helper patches after their injection lcycle.
     pub(crate) hold_patch_lcycles: usize,
     /// Largest gap between an injection and its correction decision, in lcycles.
@@ -418,6 +436,9 @@ impl Scheduler {
             t_correction: TCorrection::Litinski,
             held: Vec::new(),
             helper_wanted: Vec::new(),
+            inplace_pending: HashMap::new(),
+            failed_waiting: HashSet::new(),
+            y_meas_lcycles: 1,
             holding_now: false,
             t_decisions: Vec::new(),
             t_stats: TCorrectionStats::default(),
@@ -427,6 +448,12 @@ impl Scheduler {
     /// Sets how failed T injections are corrected (default: Litinski auto-correction).
     pub(crate) fn set_t_correction(&mut self, mode: TCorrection) {
         self.t_correction = mode;
+    }
+
+    /// Sets how many extra lcycles an in-place Y measurement of a magic patch takes (default 1:
+    /// floor(d/2)+2 rounds, rounded up to whole lcycles).
+    pub(crate) fn set_y_meas_lcycles(&mut self, lcycles: usize) {
+        self.y_meas_lcycles = lcycles;
     }
 
     /// True if the Paulis of products `a` and `b` anticommute (they differ on an odd number of
@@ -534,6 +561,40 @@ impl Scheduler {
         }
     }
 
+    /// Pushes T product `pp_id`'s recorded decision back by `by` lcycles: its frame bit comes
+    /// from a measurement that ends that much later.
+    fn delay_decision(&mut self, pp_id: i32, by: usize) {
+        for i in 0..self.input.circuit.product(pp_id).operators.len() {
+            let q = self.input.circuit.product(pp_id).operators[i].qubit as usize;
+            if let Some(v) = self.t_decisions.get_mut(q) {
+                for e in v.iter_mut().filter(|e| e.0 == pp_id) {
+                    e.1 += by;
+                }
+            }
+        }
+    }
+
+    /// The magic patch of T product `pp_id` is measured in place once the correction is decided
+    /// (lcycle `decision`): in X, or in Y if the T failed. `failed` is None while the injection
+    /// outcome has not been drawn yet (the injection lcycle); `process_t_gate_outcomes` then
+    /// adds the Y time if needed.
+    fn measure_in_place(&mut self, pp_id: i32, magic: u16, decision: usize, failed: Option<bool>) {
+        self.t_stats.inplace += 1;
+        let y = self.y_meas_lcycles;
+        match failed {
+            Some(true) => {
+                self.t_stats.inplace_y += 1;
+                self.delay_decision(pp_id, y);
+                self.hold(magic, decision + y);
+            }
+            Some(false) => self.hold(magic, decision),
+            None => {
+                self.hold(magic, decision);
+                self.inplace_pending.insert(pp_id, (magic, decision));
+            }
+        }
+    }
+
     /// Bookkeeping for a T product injected this lcycle from magic patch `magic`.
     ///
     /// Litinski: P (x) Z_m and Z_m (x) Y_h are measured together, then the magic patch in X, so
@@ -552,6 +613,10 @@ impl Scheduler {
             self.input.topo.label(magic),
             decision
         );
+        if self.t_correction == TCorrection::InplaceY {
+            self.measure_in_place(pp_id, magic, decision, None);
+            return;
+        }
         match self.pick_helper(magic) {
             Some(h) => {
                 info_sched!("    helper |0> patch {}", self.input.topo.label(h));
@@ -564,12 +629,12 @@ impl Scheduler {
                 // The magic patch keeps its state until a helper is free (hold_t_patches).
                 info_sched!("    no free neighbour for the helper yet");
                 self.t_stats.helpers_deferred += 1;
-                self.helper_wanted.push((magic, decision, now + HELPER_MAX_WAIT));
+                self.helper_wanted.push((pp_id, magic, decision, now + HELPER_MAX_WAIT));
             }
             None => {
                 info_sched!("    no neighbour can be a helper; magic patch measured in place");
                 self.t_stats.helpers_missing += 1;
-                self.hold(magic, decision);
+                self.measure_in_place(pp_id, magic, decision, None);
             }
         }
     }
@@ -587,7 +652,7 @@ impl Scheduler {
                 nodes.iter().map(|&n| self.input.topo.label(n)).collect::<Vec<_>>(),
                 self.helper_wanted
                     .iter()
-                    .map(|&(m, _, _)| self.input.topo.label(m))
+                    .map(|&(_, m, _, _)| self.input.topo.label(m))
                     .collect::<Vec<_>>()
             );
         }
@@ -595,11 +660,11 @@ impl Scheduler {
         let wanted = std::mem::take(&mut self.helper_wanted);
         // Every waiting magic patch still holds its state: occupy them all before any helper is
         // picked, so no waiting patch is borrowed as another one's helper.
-        for &(magic, _, _) in &wanted {
+        for &(_, magic, _, _) in &wanted {
             self.mark_nodes_used(&[magic]);
             self.t_stats.hold_patch_lcycles += 1;
         }
-        for (magic, decision, give_up) in wanted {
+        for (pp_id, magic, decision, give_up) in wanted {
             match self.pick_helper(magic) {
                 Some(h) => {
                     // Z_m (x) Y_h and X_m now; the magic patch is free from the next lcycle.
@@ -607,8 +672,9 @@ impl Scheduler {
                     self.t_stats.helpers += 1;
                     self.mark_nodes_used(&[h]);
                     self.hold(h, decision);
+                    self.failed_waiting.remove(&pp_id);
                 }
-                None if now < give_up => self.helper_wanted.push((magic, decision, give_up)),
+                None if now < give_up => self.helper_wanted.push((pp_id, magic, decision, give_up)),
                 None => {
                     // Waiting longer could deadlock (two magic patches each waiting on the
                     // other); measure the magic patch in place instead.
@@ -617,7 +683,8 @@ impl Scheduler {
                         self.input.topo.label(magic)
                     );
                     self.t_stats.helpers_missing += 1;
-                    self.hold(magic, decision);
+                    let failed = self.failed_waiting.remove(&pp_id);
+                    self.measure_in_place(pp_id, magic, decision, Some(failed));
                 }
             }
         }
@@ -2063,12 +2130,26 @@ impl Scheduler {
             }
             if self.no_t_failures || self.rng_uniform.gen_bool(0.5) {
                 info_sched!("  T gate {} succeeded", pp_id);
+                self.inplace_pending.remove(&pp_id);
             } else {
                 self.t_gate_failures += 1;
                 if self.t_correction != TCorrection::Legacy {
                     // Auto-corrected: the correction is a choice of ancilla measurement basis, so
-                    // nothing is owed on the data.
+                    // nothing is owed on the data. A magic patch measured in place needs the
+                    // slower Y basis; one still waiting for a helper remembers the failure.
                     info_sched!("  T gate {} failed (50% probability), auto-corrected", pp_id);
+                    if let Some((magic, decision)) = self.inplace_pending.remove(&pp_id) {
+                        let y = self.y_meas_lcycles;
+                        self.t_stats.inplace_y += 1;
+                        self.delay_decision(pp_id, y);
+                        // Already held through `decision`; extend by the Y measurement.
+                        let now = self.current_lcycle;
+                        let start = decision.max(now);
+                        self.held.push((decision + y, magic));
+                        self.t_stats.hold_patch_lcycles += decision + y - start;
+                    } else if self.helper_wanted.iter().any(|w| w.0 == pp_id) {
+                        self.failed_waiting.insert(pp_id);
+                    }
                     continue;
                 }
                 info_sched!("  T gate {} failed (50% probability), S correction tracked", pp_id);
@@ -2207,14 +2288,17 @@ impl Scheduler {
             TCorrection::Legacy => println!("T correction: legacy (per-qubit S record)"),
             mode => println!(
                 "T correction: {:?}; {} injections, {} helper patches ({} waited for one, {} \
-                 found none), {} patch-lcycles held, max decision delay {} lcycles",
+                 found none), {} patch-lcycles held, max decision delay {} lcycles, {} measured \
+                 in place ({} in Y)",
                 mode,
                 self.t_stats.injections,
                 self.t_stats.helpers,
                 self.t_stats.helpers_deferred,
                 self.t_stats.helpers_missing,
                 self.t_stats.hold_patch_lcycles,
-                self.t_stats.max_decision_delay
+                self.t_stats.max_decision_delay,
+                self.t_stats.inplace,
+                self.t_stats.inplace_y
             ),
         }
         let n_cond = self.n_conditional();
@@ -3074,6 +3158,55 @@ mod tests {
                     assert_eq!(topo.node(magic).node_type, NodeType::Magic);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn inplace_y_holds_the_magic_patch_and_adds_y_time_for_failures() {
+        for (latency, y) in [(0usize, 1usize), (1, 1), (3, 2)] {
+            for rseed in 0u32..8 {
+                let mut sched = build_scheduler(T_HEAVY_LINES, rseed);
+                sched.set_t_correction(TCorrection::InplaceY);
+                sched.set_reaction_latency(latency);
+                sched.set_y_meas_lcycles(y);
+                let n_products = sched.input.circuit.n_products();
+                let (_, n) = sched.sched_circuit().expect("sched_circuit failed");
+                let st = &sched.t_stats;
+                assert_eq!(n, n_products);
+                assert!(sched.t_conjugated_bases.is_empty());
+                assert_eq!(st.helpers, 0, "in-place Y never borrows a helper");
+                assert_eq!(st.inplace, st.injections);
+                assert_eq!(st.inplace_y, sched.t_gate_failures, "one Y measurement per failure");
+                // Each magic patch is held from injection to decision, plus y if it failed.
+                let base: usize = st.injection_log.iter().map(|&(t, _, _, d)| d - t).sum();
+                assert_eq!(st.hold_patch_lcycles, base + y * st.inplace_y);
+                // A held magic patch never serves another T before its decision.
+                for &(t0, _, m0, d0) in &st.injection_log {
+                    for &(t1, pp, m1, _) in &st.injection_log {
+                        if t1 > t0 && t1 <= d0 {
+                            assert_ne!(m1, m0, "magic patch reused while held (T {})", pp);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inplace_y_failure_delays_the_next_anticommuting_decision() {
+        // Z then X on qubit 0: X's decision waits for Z's frame bit, which a Y measurement
+        // (a failed Z) delivers y lcycles later.
+        for rseed in 0u32..16 {
+            let mut sched = build_scheduler(&["+Z___<T>", "+X___<T>"], rseed);
+            sched.set_t_correction(TCorrection::InplaceY);
+            sched.set_reaction_latency(2);
+            sched.set_y_meas_lcycles(3);
+            sched.sched_circuit().expect("sched_circuit failed");
+            let log = &sched.t_stats.injection_log;
+            let (t0, _, _, d0) = log[0];
+            let (t1, _, _, d1) = log[1];
+            assert_eq!(d0, t0 + 2);
+            assert!(d1 == (t1 + 2).max(d0 + 2) || d1 == (t1 + 2).max(d0 + 3 + 2));
         }
     }
 
