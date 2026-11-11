@@ -3,7 +3,10 @@
 PureMagic's original input is a static Clifford+T circuit: every measurement is at the end, and
 Cliffords are commuted there too. A *dynamic* circuit (for example the output of the `dcsynth`
 ancilla-reuse compiler) measures a qubit in the middle, resets it, reuses it, and applies gates
-that depend on the measurement outcomes. This document describes how that is supported.
+that depend on the measurement outcomes. This document describes how that is supported; `docs/mcm-changes.md` is the full specification
+(every change, the file formats, the timing model, costs and limits).
+`notebooks/dynamic_circuit_tutorial.ipynb` walks one small circuit through every step, from
+dcsynth to the checked schedule.
 
 Nothing here changes how a static circuit is transpiled or scheduled. Without `reset`, `if(...)`
 or a mid-circuit `measure`, the outputs are identical to before (the `--sidecar` file is the only
@@ -94,6 +97,9 @@ is the conservative one.
 * A line may end in `@3,5`: ids (0-based line numbers) of earlier products whose *outcome* it
   needs. `<R>` is a one-qubit re-initialisation. Both are parsed in `pauliproduct.rs` and become
   edges in `Circuit::gen_deps`.
+* A conditional product's line also ends in `?3=1,5=0`: it runs only if the true outcome of
+  product 3 is 1 and of product 5 is 0 (each id is also in its `@` list). So the `.trans` file
+  alone describes the concrete circuit, and the scheduler can skip what the outcomes don't call for.
 * `<output>.dyn.json` (written for any dynamic circuit): everything an executor needs to
   recover true outcomes: per measurement `meas_id`, `clbit`, `is_reset`, `frame_deps`, derived AND
   outcomes, `fix` events. With `p` the physical outcome of product `k`:
@@ -112,6 +118,11 @@ Feed-forward adds two things:
   product it names completes (default 0 = ideal). Qubit-overlap edges are not delayed; if a child
   has both kinds on the same parent the whole edge is delayed (conservative). The scheduler loop
   keeps running while delayed releases are outstanding.
+* **Conditions.** `puremagic --cond-outcomes random` (default) samples each measurement's outcome
+  when a condition first needs it (1 with probability `--cond-p1`, default 0.5) and skips every
+  product whose condition fails: it takes no lcycle and no magic state, and its successors start
+  at once. `--cond-outcomes worst` runs every conditional product, as earlier versions did (an
+  upper bound). The schedule header logs the sampled outcomes and the skipped products.
 
 Latency is paid only where a measurement is on the critical path. For dcsynth-style circuits the
 corrections are mostly Paulis, so almost nothing depends on an outcome and the latency is hidden;

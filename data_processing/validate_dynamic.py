@@ -158,19 +158,33 @@ def parse_qasm(path: str):
         elif line.startswith("reset"):
             ops.append(("reset", int(re.search(r"\[(\d+)\]", line).group(1))))
         elif line.startswith("if"):
-            m = re.match(r"if\s*\(([^)]*)\)\s*(\w+)\s+q\[(\d+)\]", line)
+            m = re.match(r"if\s*\(([^)]*)\)\s*(\w+)\s+(.*);", line)
             terms = []
             for term in m.group(1).split("&&"):
                 reg, val = (x.strip() for x in term.split("=="))
                 base, size = cregs[reg]
                 assert size == 1, "validator supports 1-bit condition registers only"
                 terms.append((base, int(val)))
-            ops.append(("cond", terms, m.group(2), int(m.group(3))))
+            qs = tuple(int(x) for x in re.findall(r"q\[(\d+)\]", m.group(3)))
+            ops.append(("cond", terms, m.group(2), qs))
         else:
             m = re.match(r"(\w+)\s+(.*);", line)
             name, args = m.group(1), re.findall(r"q\[(\d+)\]", m.group(2))
             ops.append((name, *map(int, args)))
     return n, ops
+
+
+def apply_gate(st, g: str, qs) -> None:
+    """Apply gate `g` (a single-qubit name, cx, cz or swap) to qubits `qs`, in place."""
+    if g == "cx":
+        st.apply_cx(qs[0], qs[1])
+    elif g == "cz":
+        st.apply_cz(qs[0], qs[1])
+    elif g == "swap":
+        a, b = qs
+        st.apply_cx(a, b), st.apply_cx(b, a), st.apply_cx(a, b)
+    else:
+        st.apply1(G1[g], qs[0])
 
 
 def run_reference(n: int, ops) -> dict[tuple, float]:
@@ -185,7 +199,7 @@ def run_reference(n: int, ops) -> dict[tuple, float]:
             if op[0] == "measure" and op[2] is not None:
                 written.add(op[2])
         elif op[0] == "cond":
-            _, terms, g, q = op
+            _, terms, g, qs = op
             if len(terms) == 1 and g in ("x", "y", "z"):
                 continue  # a single-bit conditional Pauli is a pure frame update
             # Settle the terms like `resolve_static_conditions`: a bit nothing has written reads
@@ -203,7 +217,8 @@ def run_reference(n: int, ops) -> dict[tuple, float]:
                 continue  # the gate is dropped
             if keep and g in ("x", "y", "z"):
                 continue  # still a frame update (on a derived AND outcome)
-            ended[q] = False  # a physical gate: unconditional, or conditional non-Pauli
+            for q in qs:
+                ended[q] = False  # a physical gate: unconditional, or conditional non-Pauli
         else:
             for q in op[1:]:
                 ended[q] = False
@@ -236,22 +251,14 @@ def run_reference(n: int, ops) -> dict[tuple, float]:
                 rec(i + 1, nxt, prob * p, cb, ev, oc)
             return
         if kind == "cond":
-            _, terms, g, q = op
+            _, terms, g, qs = op
             if all(clbits.get(cb, 0) == val for cb, val in terms):
                 st = st.copy()
-                st.apply1(G1[g], q)
+                apply_gate(st, g, qs)
             rec(i + 1, st, prob, clbits, events, occ)
             return
         st = st.copy()
-        if kind == "cx":
-            st.apply_cx(op[1], op[2])
-        elif kind == "cz":
-            st.apply_cz(op[1], op[2])
-        elif kind == "swap":
-            a, b = op[1], op[2]
-            st.apply_cx(a, b), st.apply_cx(b, a), st.apply_cx(a, b)
-        else:
-            st.apply1(G1[kind], op[1])
+        apply_gate(st, kind, op[1:])
         rec(i + 1, st, prob, clbits, events, occ)
 
     rec(0, State(n), 1.0, {}, {}, {})
@@ -259,7 +266,7 @@ def run_reference(n: int, ops) -> dict[tuple, float]:
 
 
 # --------------------------------------------------------------------------- candidate
-LINE = re.compile(r"^([+-])([_XYZ]+)<(\w+)>(?:@([\d,]+))?$")
+LINE = re.compile(r"^([+-])([_XYZ]+)<(\w+)>(?:@([\d,]+))?(?:\?([\d=,]+))?$")
 
 
 def run_trans(n: int, trans_path: str, sidecar: dict | None) -> dict[tuple, float]:
@@ -279,6 +286,13 @@ def run_trans(n: int, trans_path: str, sidecar: dict | None) -> dict[tuple, floa
         want = sorted({line_of_meas[m] for m in recs[k].get("needs", [])})
         assert got == want, f"line {k} `{text}`: @-suffix {got} but sidecar needs lines {want}"
         assert all(a < k for a in got), f"line {k}: classical dependency on a later line"
+        # The `?line=v,..` suffix must be the sidecar's `cond`, written with M lines.
+        cond_txt = LINE.match(text).group(5)
+        got_cond = sorted((int(t.split("=")[0]), int(t.split("=")[1]))
+                          for t in cond_txt.split(",")) if cond_txt else []
+        want_cond = sorted((line_of_meas[m], int(v)) for m, v in recs[k].get("cond", []))
+        assert got_cond == want_cond, (
+            f"line {k} `{text}`: ?-suffix {got_cond} but sidecar cond {want_cond}")
 
     dist: dict[tuple, float] = defaultdict(float)
 
@@ -423,7 +437,8 @@ def random_circuit(rng: random.Random, n: int, n_gates: int) -> str:
             body.append(f"{rng.choice(['h', 's', 'sdg', 't', 'tdg', 'sx'])} q[{q}];")
         elif r < 0.55 and n > 1:
             a, b = rng.sample(range(n), 2)
-            body.append(f"cx q[{a}], q[{b}];")
+            g2 = rng.choice(["cx", "cx", "cx", "cz", "swap"])
+            body.append(f"{g2} q[{a}], q[{b}];")
         elif r < 0.70 and len(bits) < 6:
             name = f"m{len(bits)}"
             bits.append(name)
@@ -436,8 +451,15 @@ def random_circuit(rng: random.Random, n: int, n_gates: int) -> str:
             pool = bits + ([unwritten] if rng.random() < 0.15 else [])
             terms = [f"{b}=={rng.randrange(2)}"
                      for b in rng.sample(pool, min(len(pool), rng.choice([1, 1, 2])))]
-            g = rng.choice(["x", "y", "z", "h", "s", "sdg", "sx", "sxdg", "t", "tdg"])
-            body.append(f"if({' && '.join(terms)}) {g} q[{q}];")
+            g = rng.choice(["x", "y", "z", "h", "s", "sdg", "sx", "sxdg", "t", "tdg",
+                            "cx", "cz", "swap"])
+            if g in ("cx", "cz", "swap"):
+                if n < 2:
+                    continue
+                a, b = rng.sample(range(n), 2)
+                body.append(f"if({' && '.join(terms)}) {g} q[{a}], q[{b}];")
+            else:
+                body.append(f"if({' && '.join(terms)}) {g} q[{q}];")
         else:
             body.append(f"t q[{q}];")
     # creg declarations must precede use; hoist them.
@@ -446,6 +468,12 @@ def random_circuit(rng: random.Random, n: int, n_gates: int) -> str:
     # `if(...) y q[i];` is spelled `y`, and Paulis are spelled in lower case in QASM
     head = ["OPENQASM 2.0;", 'include "qelib1.inc";', f"qreg q[{n}];"]
     return "\n".join(head + decls + rest) + "\n"
+
+
+# The exact check simulates the full state, branching at every measurement: past ~10 qubits it is
+# too slow to be worth running, so wider circuits are skipped (stage A's sampled fidelity uses the
+# same cap).
+MAX_EXACT_QUBITS = 10
 
 
 def main() -> int:
@@ -459,6 +487,8 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--qubits", type=int, default=3)
     ap.add_argument("--gates", type=int, default=14)
+    ap.add_argument("--max-qubits", type=int, default=MAX_EXACT_QUBITS,
+                    help="skip circuits wider than this (the exact simulation is exponential)")
     a = ap.parse_args()
 
     binary = Path(a.transpile)
@@ -470,6 +500,8 @@ def main() -> int:
     defer_opts = [True] if a.defer_trailing else [False, True]
 
     if a.random:
+        if a.qubits > a.max_qubits:
+            ap.error(f"--qubits {a.qubits} exceeds --max-qubits {a.max_qubits}")
         rng = random.Random(a.seed)
         bad = 0
         with tempfile.TemporaryDirectory() as td:
@@ -486,6 +518,11 @@ def main() -> int:
 
     if not a.qasm:
         ap.error("give a .cliffordt.qasm file or --random N")
+    n_qubits, _ = parse_qasm(a.qasm)
+    if n_qubits > a.max_qubits:
+        print(f"SKIPPED: {n_qubits} qubits > --max-qubits {a.max_qubits}; the exact check is only "
+              f"run on small circuits (use plot_dynamic.py's schedule checks instead)")
+        return 0
     ok = check(Path(a.qasm), binary, modes, widths, defer_opts)
     print("ALL MATCH" if ok else "MISMATCH")
     return 0 if ok else 1

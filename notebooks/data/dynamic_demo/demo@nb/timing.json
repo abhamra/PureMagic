@@ -1,0 +1,16 @@
+{
+  "benchmark": "demo",
+  "epsilon": 1e-06,
+  "block_size": 3,
+  "backend": "jax",
+  "prefer": "first",
+  "ancillas_per_block": [
+    1
+  ],
+  "keep_alternatives": false,
+  "shapes": [
+    "all"
+  ],
+  "dc_compilation_seconds": 446.0863,
+  "bqskit_compilation_seconds": 3.7703
+}

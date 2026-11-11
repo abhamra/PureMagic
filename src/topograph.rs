@@ -39,6 +39,13 @@ pub(crate) struct TopoGraph {
     pub(crate) data_groups: Vec<DataGroup>,
     pub(crate) node_to_group: HashMap<u16, usize>,
     pub(crate) data_pos_map: HashMap<(i32, i32), u16>,
+    /// Logical qubits hosted on injection patches (`--ancilla-qubits`). Their data nodes
+    /// switch between Data (live) and Magic (dormant); see `host_qubits`.
+    pub(crate) hosted_qubits: Vec<u16>,
+    /// Per node: belongs to a hosted qubit. Empty unless qubits are hosted.
+    hosted: Vec<bool>,
+    /// Per node: a hosted node that never cultivates while dormant (only routes).
+    route_only: Vec<bool>,
 }
 
 impl TopoGraph {
@@ -66,6 +73,59 @@ impl TopoGraph {
             data_groups: Vec::new(),
             node_to_group: HashMap::new(),
             data_pos_map: HashMap::new(),
+            hosted_qubits: Vec::new(),
+            hosted: Vec::new(),
+            route_only: Vec::new(),
+        }
+    }
+
+    /// Hosts logical `qubits` on injection patches. Must be called after `set_topo` and
+    /// before scheduling; the scheduler flips each one's nodes between Data and Magic.
+    ///
+    /// A qubit's patch is one grid cell's worth of area, split into an X half-node and a
+    /// Z half-node. While dormant the patch is one cultivator, not two: the X node
+    /// cultivates and the Z node only routes (it is never a ready magic state).
+    pub(crate) fn host_qubits(&mut self, qubits: &[u16]) -> Result<(), String> {
+        self.hosted = vec![false; self.n_nodes];
+        self.route_only = vec![false; self.n_nodes];
+        self.hosted_qubits.clear();
+        for &q in qubits {
+            let ids = self
+                .data_ids
+                .get(q as usize)
+                .copied()
+                .filter(|ids| ids.iter().all(|&id| id != u16::MAX))
+                .ok_or_else(|| format!("ancilla qubit {} has no data patch in the layout", q))?;
+            if self.hosted_qubits.contains(&q) {
+                return Err(format!("ancilla qubit {} listed twice", q));
+            }
+            self.hosted[ids[0] as usize] = true;
+            self.hosted[ids[1] as usize] = true;
+            self.route_only[ids[1] as usize] = true;
+            self.hosted_qubits.push(q);
+        }
+        Ok(())
+    }
+
+    /// True if node `id` belongs to a hosted qubit (live or dormant).
+    #[inline]
+    pub(crate) fn is_hosted(&self, id: u16) -> bool {
+        self.hosted.get(id as usize).copied().unwrap_or(false)
+    }
+
+    /// True if node `id` is the non-cultivating half of a hosted qubit's patch.
+    #[inline]
+    pub(crate) fn is_route_only(&self, id: u16) -> bool {
+        self.route_only.get(id as usize).copied().unwrap_or(false)
+    }
+
+    /// Switches hosted qubit `q`'s nodes to Data (`live`) or Magic (dormant). Cultivation
+    /// state is the scheduler's job; this only changes the node types.
+    pub(crate) fn set_hosted_live(&mut self, q: u16, live: bool) {
+        debug_assert!(self.hosted_qubits.contains(&q));
+        let node_type = if live { NodeType::Data } else { NodeType::Magic };
+        for id in self.data_ids[q as usize] {
+            self.node_mut(id).node_type = node_type;
         }
     }
 

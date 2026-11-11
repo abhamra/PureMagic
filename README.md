@@ -59,10 +59,13 @@ Run with `-h` to see all options.
 | `-r, --rseed <N>` | `29` | Random seed for reproducible results |
 | `-R, --randomize-data-qubits` | off | Randomize data qubit numbering |
 | `-u, --use-magic-routing` | off | Use magic qubits for routing in addition to bus qubits |
+| `--ancilla-qubits <LIST>` | *(none)* | Host these logical qubits (e.g. `3,4`) on injection patches; needs `-u`. See [Hosted ancilla qubits](#hosted-ancilla-qubits) |
 | `-S, --sides_only` | off | Use only side edges of data patches (not top/bottom) |
 | `-F, --no-t-failures` | off | Disable T gate failures (every T gate succeeds on first attempt) |
 | `-C, --record-cultivation-dist` | off | Record normalized cultivation-time distribution to `<name>.cultivation_dist` |
-| `--reaction-latency <L>` | `0` | Dynamic circuits: lcycles a product with an `@id` classical dependency waits after the product it names completes (outcome decoding time) |
+| `--reaction-latency <L>` | `0` | Lcycles to decode an outcome and act on it: a product with an `@id` classical dependency waits this long after the product it names completes, and a T's correction is decided this long after injection |
+| `--t-correction <MODE>` | `litinski` | How a failed T injection (50%) is corrected: `litinski` (borrowed \|0⟩ helper patch, auto-corrected), `inplace-y` (magic patch measured in X or Y), or `legacy` (old per-qubit S record, incorrect; for comparison). See [docs/t-gate-corrections.md](docs/t-gate-corrections.md) |
+| `--y-meas-lcycles <N>` | `1` | Extra lcycles an in-place Y measurement of a magic patch takes |
 | `-a, --ancilla-rows <N>` | `1` | Number of ancilla rows between data patches (magic routing only) |
 | `-l, --log-scheduler <LEVEL>` | `none` | Scheduler trace log level: `none`, `info`, or `debug`; only populated in debug builds |
 | `-I, --show-product-ids` | off | Show product IDs instead of Pauli terms in circuit plots |
@@ -80,6 +83,33 @@ Run with `-h` to see all options.
 # Generate plots of topology, circuit layers, and scheduling paths
 ./target/release/puremagic --circuit circuit.trans --plot topo,circuit,cstats,paths
 ```
+
+### Hosted ancilla qubits
+
+`--ancilla-qubits 3,4` (pure-magic mode, `-u`, only) puts those logical qubits on patches that
+double as magic-state cultivators. A hosted patch is *live* (a data patch) while it holds state
+that matters, and *dormant* otherwise: it cultivates magic states and can be routed through.
+
+- It is dormant until one of its products is ready, and again after its last product.
+- It is also dormant **between uses**: after a product that leaves the patch in a known
+  single-patch state (a weight-1 X or Z `<M>`, or an `<R>`) until its next product is ready.
+  This is what a reused ancilla does after its reset. Re-preparing the patch when it goes live
+  again is taken as free, like every patch's initial |0>. Use `transpile --reset_mode flush` or
+  `init` so a reset's measurement is weight 1 on the ancilla's own patch; in `frame` mode it is
+  often spread over several patches and releases nothing.
+- A Y measurement does not release the patch (preparing a Y eigenstate needs an S gate).
+- A pending S correction on a released patch is dropped: the state it belonged to is gone.
+- A listed qubit that no product touches stays dormant for the whole run.
+- One patch is one cultivator. A data qubit's patch is split into an X and a Z half-node; while
+  dormant the X half cultivates and the Z half only routes.
+- Going live discards any cultivation in progress on the patch; going dormant starts a fresh one.
+- Hosted nodes are never used as root candidates or in the precomputed Clifford trees, since
+  either could go stale when the qubit goes live.
+- The layout is the stock one (same patch count and volume formula); hosting changes only what an
+  idle qubit's patch does. Without `--ancilla-qubits` the output is identical to before.
+
+The end of the run reports, per hosted qubit, how many lcycles it was live and in how many
+separate windows.
 
 ## Circuit Format
 

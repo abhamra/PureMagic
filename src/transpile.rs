@@ -68,24 +68,48 @@ enum ResetMode {
 
 #[derive(Debug, Clone)]
 enum QasmGate {
-    Clifford1Q { gate: Gate1Q, qubit: usize },
-    Clifford2Q { gate: Gate2Q, control: usize, target: usize },
-    T { qubit: usize },
-    Tdg { qubit: usize },
+    Clifford1Q {
+        gate: Gate1Q,
+        qubit: usize,
+    },
+    Clifford2Q {
+        gate: Gate2Q,
+        control: usize,
+        target: usize,
+    },
+    T {
+        qubit: usize,
+    },
+    Tdg {
+        qubit: usize,
+    },
     /// Z-basis measurement. `clbit` is the global classical-bit index it writes, if any.
-    Measure { qubit: usize, clbit: Option<usize> },
+    Measure {
+        qubit: usize,
+        clbit: Option<usize>,
+    },
     /// `reset q[i];` -- Z measurement followed by a classical X correction (Pauli frame).
-    Reset { qubit: usize },
+    Reset {
+        qubit: usize,
+    },
     /// A Pauli gate applied only when classical bit `clbit` equals `value`, i.e. the OpenQASM 2
     /// statement `if(c==value) x q[i];` on a 1-bit register. It never touches the layout: it is a
     /// classical Pauli-frame update that depends on an earlier measurement outcome.
-    CondPauli { gate: Gate1Q, qubit: usize, clbit: usize, value: bool },
+    CondPauli {
+        gate: Gate1Q,
+        qubit: usize,
+        clbit: usize,
+        value: bool,
+    },
     /// Any other single-qubit gate (Clifford or T) applied only when *every* `(clbit, value)` term
     /// holds, i.e. `if(c0==1 && c1==0) h q[i];` (the `&&` form is a PureMagic extension of
     /// OpenQASM 2; each register is 1 bit wide). A Pauli under a single term is a
     /// [`QasmGate::CondPauli`] instead. Unlike that, this gate is a *physical* operation whose
     /// execution depends on outcomes, so it cannot live in the Pauli frame.
-    CondGate { inner: Box<QasmGate>, terms: Vec<(usize, bool)> },
+    CondGate {
+        inner: Box<QasmGate>,
+        terms: Vec<(usize, bool)>,
+    },
     Barrier,
 }
 
@@ -169,8 +193,9 @@ struct PauliMeta {
     /// For a *conditional* product: it executes only if every `(outcome id, value)` holds, where
     /// outcome ids are true outcomes as defined above. Empty for an unconditional product.
     cond: Vec<(usize, bool)>,
-    /// Outcomes this product needs before it can start (its conditions, plus any owed Pauli that
-    /// was paid for physically just before it). Written to the `.trans` line as `@line,..` so the
+    /// Outcomes this product needs before it can start: its conditions, plus any owed Pauli that
+    /// was paid for physically just before it, or, for a T, the outcomes that decide whether it
+    /// is T or T† (its `frame_deps`). Written to the `.trans` line as `@line,..` so the
     /// scheduler orders it after the measurements that decide it.
     needs: Vec<usize>,
 }
@@ -449,7 +474,9 @@ fn resolve_clbit(text: &str, cregs: &Cregs, line_no: usize) -> io::Result<usize>
         .ok_or_else(|| invalid(line_no, format!("unknown classical register `{}`", name)))?;
     match idx {
         Some(i) if i < size => Ok(base + i),
-        Some(i) => Err(invalid(line_no, format!("bit {} out of range for `{}[{}]`", i, name, size))),
+        Some(i) => {
+            Err(invalid(line_no, format!("bit {} out of range for `{}[{}]`", i, name, size)))
+        }
         None if size == 1 => Ok(base),
         None => Err(invalid(
             line_no,
@@ -458,7 +485,7 @@ fn resolve_clbit(text: &str, cregs: &Cregs, line_no: usize) -> io::Result<usize>
     }
 }
 
-/// `if(c==1) <gate> q[i];` -> a conditional gate.
+/// `if(c==1) <gate> q[i];` (or a two-qubit `cx|cz|swap q[i],q[j];`) -> a conditional gate.
 ///
 /// The condition is one or more `reg==0|1` terms joined by `&&`, each on a 1-bit register (so a
 /// block that measures several ancillas into one register each can be conditioned on a
@@ -472,7 +499,8 @@ fn parse_conditional(line: &str, cregs: &Cregs, line_no: usize) -> io::Result<Qa
             line_no,
             format!(
                 "unsupported conditional `{}`: {}. Supported: `if(r==0|1 [&& r2==0|1 ...]) g q[i];` \
-                 with 1-bit registers and a single-qubit gate g in h,s,sdg,sx,sxdg,x,y,z,t,tdg",
+                 with 1-bit registers and g a single-qubit gate in h,s,sdg,sx,sxdg,x,y,z,t,tdg, \
+                 or `g q[i],q[j];` with g in cx,cz,swap",
                 line, why
             ),
         )
@@ -486,19 +514,23 @@ fn parse_conditional(line: &str, cregs: &Cregs, line_no: usize) -> io::Result<Qa
         let value = match val.trim() {
             "0" => false,
             "1" => true,
-            other => return Err(unsupported(&format!("condition value `{}` is not 0 or 1", other))),
+            other => {
+                return Err(unsupported(&format!("condition value `{}` is not 0 or 1", other)));
+            }
         };
         let reg_name = reg.trim();
-        let &(_, size) = cregs
-            .get(reg_name)
-            .ok_or_else(|| invalid(line_no, format!("unknown classical register `{}`", reg_name)))?;
+        let &(_, size) = cregs.get(reg_name).ok_or_else(|| {
+            invalid(line_no, format!("unknown classical register `{}`", reg_name))
+        })?;
         if size != 1 {
             return Err(unsupported("the register has more than one bit"));
         }
         terms.push((resolve_clbit(reg_name, cregs, line_no)?, value));
     }
     let rest = line[close + 1..].trim();
-    let inner = try_parse_1q(rest).ok_or_else(|| unsupported("the conditioned gate is not a supported single-qubit gate"))?;
+    let inner = try_parse_1q(rest).or_else(|| try_parse_2q(rest)).ok_or_else(|| {
+        unsupported("the conditioned gate is not a supported single- or two-qubit gate")
+    })?;
     match (&inner, terms.as_slice()) {
         (QasmGate::Clifford1Q { gate, qubit }, &[(clbit, value)])
             if matches!(gate, Gate1Q::X | Gate1Q::Y | Gate1Q::Z) =>
@@ -980,7 +1012,9 @@ fn inverse_1q(g: Gate1Q) -> Gate1Q {
 /// Pauli, which is all the scheduler reads, is unaffected).
 fn push_clifford(tableau: &mut Tableau, gate: &QasmGate) {
     match gate {
-        QasmGate::Clifford1Q { gate: g, qubit } => tableau.prepend_1q_correct(inverse_1q(*g), *qubit),
+        QasmGate::Clifford1Q { gate: g, qubit } => {
+            tableau.prepend_1q_correct(inverse_1q(*g), *qubit)
+        }
         QasmGate::Clifford2Q { gate: g, control, target } => {
             tableau.prepend_2q(*g, *control, *target)
         }
@@ -1047,6 +1081,33 @@ fn dropped_pauli(true_gates: &[QasmGate], n_qubits: usize) -> PauliString {
         }
     }
     g
+}
+
+/// Rewrites CZ and SWAP into gates the `.trans` format can express: CZ = H_t CX H_t and
+/// SWAP = CX CX CX (both exact). `TransClifford::from_qasm_gate` has no form for CZ or SWAP, so
+/// without this a flushed CZ or SWAP was silently dropped. Other gates pass through unchanged.
+fn expand_for_emit(gates: &[QasmGate]) -> Vec<QasmGate> {
+    let mut out = Vec::with_capacity(gates.len());
+    for g in gates {
+        match g {
+            QasmGate::Clifford2Q { gate: Gate2Q::CZ, control, target } => {
+                out.push(QasmGate::Clifford1Q { gate: Gate1Q::H, qubit: *target });
+                out.push(QasmGate::Clifford2Q {
+                    gate: Gate2Q::CX,
+                    control: *control,
+                    target: *target,
+                });
+                out.push(QasmGate::Clifford1Q { gate: Gate1Q::H, qubit: *target });
+            }
+            QasmGate::Clifford2Q { gate: Gate2Q::Swap, control: a, target: b } => {
+                for (c, t) in [(*a, *b), (*b, *a), (*a, *b)] {
+                    out.push(QasmGate::Clifford2Q { gate: Gate2Q::CX, control: c, target: t });
+                }
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    out
 }
 
 fn to_trans_cliffords(gates: &[QasmGate], n_qubits: usize) -> Vec<TransClifford> {
@@ -1290,7 +1351,7 @@ fn transpile_opts(
         clifford_queue: &mut Vec<QasmGate>, ops: &mut Vec<TransItem>, tableau: &mut Tableau,
         layers: &mut LayerModel, frame: &mut PauliFrame, n_qubits: usize, defer_trailing: bool,
     ) {
-        let (emitted, residual) = split_trailing_1q(clifford_queue, n_qubits);
+        let (emitted, residual) = split_trailing_1q(&expand_for_emit(clifford_queue), n_qubits);
         let mut to_emit = emitted;
         if !defer_trailing {
             to_emit.extend(residual.iter().cloned());
@@ -1341,6 +1402,12 @@ fn transpile_opts(
                 };
                 let mut emitted = TransPauli::from_pauli_string(&ps, "T");
                 emitted.apply_frame(frame.deps(&ps));
+                // A rotation whose sign depends on outcomes (it is T or T† depending on them)
+                // cannot be performed before those outcomes are known: it waits for them, like
+                // a conditional gate. A measurement's sign, by contrast, only relabels its
+                // outcome classically, so measurements get no such edge.
+                emitted.meta.needs =
+                    real_outcomes(&emitted.meta.frame_deps, &derived_defs).into_iter().collect();
                 layers.place(&pauli_support(&emitted), LAYER_COST_T);
                 ops.push(TransItem::Pauli(emitted));
             }
@@ -1437,10 +1504,8 @@ fn transpile_opts(
             QasmGate::CondGate { inner, terms } => {
                 // `resolve_static_conditions` left only terms whose bit an earlier measurement
                 // wrote, so each names a real outcome.
-                let mut cond: Vec<(usize, bool)> = terms
-                    .iter()
-                    .map(|(cb, v)| (clbit_meas[cb], *v))
-                    .collect();
+                let mut cond: Vec<(usize, bool)> =
+                    terms.iter().map(|(cb, v)| (clbit_meas[cb], *v)).collect();
                 cond.sort_unstable();
                 cond.dedup();
                 let q = inner.qubits()[0];
@@ -1449,7 +1514,8 @@ fn transpile_opts(
                         if matches!(g, Gate1Q::X | Gate1Q::Y | Gate1Q::Z) =>
                     {
                         // A Pauli under an AND of outcomes: a linear frame term on a derived bit.
-                        let id = derived_outcome(&cond, &mut next_derived, &mut derived_defs, &mut ops);
+                        let id =
+                            derived_outcome(&cond, &mut next_derived, &mut derived_defs, &mut ops);
                         let mut p = PauliString::identity(n_qubits);
                         p.x_bits[q] = matches!(g, Gate1Q::X | Gate1Q::Y);
                         p.z_bits[q] = matches!(g, Gate1Q::Z | Gate1Q::Y);
@@ -1467,14 +1533,19 @@ fn transpile_opts(
                             n_qubits,
                             false,
                         );
+                        // Every qubit the gate touches must be frame-free: a conditional Clifford
+                        // conjugating an owed Pauli only when its condition holds would make the
+                        // frame nonlinear in the outcomes.
                         let mut needs: BTreeSet<usize> = cond.iter().map(|&(m, _)| m).collect();
-                        if let Some(fix) = pay_frame(&mut frame, q) {
-                            if let Event::Fix { x_deps, z_deps, .. } = &fix {
-                                let all: Vec<usize> =
-                                    x_deps.iter().chain(z_deps.iter()).copied().collect();
-                                needs.extend(real_outcomes(&all, &derived_defs));
+                        for qq in inner.qubits() {
+                            if let Some(fix) = pay_frame(&mut frame, qq) {
+                                if let Event::Fix { x_deps, z_deps, .. } = &fix {
+                                    let all: Vec<usize> =
+                                        x_deps.iter().chain(z_deps.iter()).copied().collect();
+                                    needs.extend(real_outcomes(&all, &derived_defs));
+                                }
+                                ops.push(TransItem::Event(fix));
                             }
-                            ops.push(TransItem::Event(fix));
                         }
                         let needs: Vec<usize> = needs.into_iter().collect();
                         match inner.as_ref() {
@@ -1513,7 +1584,36 @@ fn transpile_opts(
                                     frame.add(&owed, id);
                                 }
                             }
-                            other => unreachable!("conditional {:?} is not a single-qubit gate", other),
+                            QasmGate::Clifford2Q { .. } => {
+                                // CX as is; CZ and SWAP through CX (and H, which becomes S/SX).
+                                // As for a single-qubit Clifford, the Pauli the emitted gates
+                                // differ by is owed only if the gate ran.
+                                let (mut seq, residual) = split_trailing_1q(
+                                    &expand_for_emit(std::slice::from_ref(inner.as_ref())),
+                                    n_qubits,
+                                );
+                                seq.extend(residual);
+                                let owed = dropped_pauli(&seq, n_qubits);
+                                for mut c in to_trans_cliffords(&seq, n_qubits) {
+                                    c.meta.cond = cond.clone();
+                                    c.meta.needs = needs.clone();
+                                    let (qubits, cost) = clifford_support(&c);
+                                    layers.place(&qubits, cost);
+                                    ops.push(TransItem::Clifford(c));
+                                }
+                                if owed.weight() > 0 {
+                                    let id = derived_outcome(
+                                        &cond,
+                                        &mut next_derived,
+                                        &mut derived_defs,
+                                        &mut ops,
+                                    );
+                                    frame.add(&owed, id);
+                                }
+                            }
+                            other => {
+                                unreachable!("conditional {:?} is not a supported gate", other)
+                            }
                         }
                     }
                 }
@@ -1601,30 +1701,35 @@ fn write_trans(output_path: &str, items: &[TransItem]) -> io::Result<(usize, usi
         }
     }
 
+    let line_of = |m: &usize| *meas_line.get(m).expect("a needed outcome comes from an emitted M");
     for item in items {
-        let needs = match item {
+        let (needs, cond) = match item {
             TransItem::Pauli(p) => {
                 if p.label == "T" {
                     n_ts += 1;
                 }
-                &p.meta.needs
+                (&p.meta.needs, &p.meta.cond)
             }
             TransItem::Clifford(c) => {
                 n_cliffords += 1;
-                &c.meta.needs
+                (&c.meta.needs, &c.meta.cond)
             }
             TransItem::Event(_) => continue,
         };
         write!(writer, "{}", item)?;
         if !needs.is_empty() {
-            let mut lines: Vec<usize> = needs
-                .iter()
-                .map(|m| *meas_line.get(m).expect("a needed outcome comes from an emitted M"))
-                .collect();
+            let mut lines: Vec<usize> = needs.iter().map(line_of).collect();
             lines.sort_unstable();
             lines.dedup();
             let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
             write!(writer, "@{}", lines.join(","))?;
+        }
+        // `?line=v,..`: the product runs only if the true outcome of every named measurement line
+        // equals v. Each named line is also in the `@` list (a condition is always needed).
+        if !cond.is_empty() {
+            let terms: Vec<String> =
+                cond.iter().map(|(m, v)| format!("{}={}", line_of(m), *v as u8)).collect();
+            write!(writer, "?{}", terms.join(","))?;
         }
         writeln!(writer)?;
     }
@@ -1679,19 +1784,26 @@ fn write_sidecar(
         ResetMode::Init => "init",
     };
     let cond_fields = |m: &PauliMeta| -> String {
-        if m.cond.is_empty() {
-            String::new()
-        } else {
-            format!(",\"cond\":{},\"needs\":{}", json_terms(&m.cond), json_usize_list(&m.needs))
+        let mut out = String::new();
+        if !m.cond.is_empty() {
+            out += &format!(",\"cond\":{}", json_terms(&m.cond));
         }
+        // Conditional products, and T products whose sign depends on outcomes, wait for these.
+        if !m.needs.is_empty() {
+            out += &format!(",\"needs\":{}", json_usize_list(&m.needs));
+        }
+        out
     };
     let (mut products, mut events, mut derived) = (Vec::new(), Vec::new(), Vec::new());
     let mut line = 0usize;
     for item in items {
         match item {
             TransItem::Clifford(c) => {
-                products
-                    .push(format!("{{\"i\":{},\"label\":\"C\"{}}}", line, cond_fields(&c.meta)));
+                products.push(format!(
+                    "{{\"i\":{},\"label\":\"C\"{}}}",
+                    line,
+                    cond_fields(&c.meta)
+                ));
                 line += 1;
             }
             TransItem::Pauli(p) => {
@@ -2075,7 +2187,11 @@ mod tests {
                 label: "T".to_string(),
                 meta: PauliMeta::default(),
             }),
-            TransItem::Clifford(TransClifford { ops: vec!['Z', '_'], name: "S".to_string(), meta: PauliMeta::default() }),
+            TransItem::Clifford(TransClifford {
+                ops: vec!['Z', '_'],
+                name: "S".to_string(),
+                meta: PauliMeta::default(),
+            }),
         ];
         let (n_cliffords, n_paulis, tot, avg_weight) = count_stats(&items);
         assert_eq!(n_cliffords, 1);
@@ -2087,8 +2203,16 @@ mod tests {
     #[test]
     fn count_stats_all_cliffords() {
         let items = vec![
-            TransItem::Clifford(TransClifford { ops: vec!['X', '_'], name: "CX".to_string(), meta: PauliMeta::default() }),
-            TransItem::Clifford(TransClifford { ops: vec!['Z', '_'], name: "S".to_string(), meta: PauliMeta::default() }),
+            TransItem::Clifford(TransClifford {
+                ops: vec!['X', '_'],
+                name: "CX".to_string(),
+                meta: PauliMeta::default(),
+            }),
+            TransItem::Clifford(TransClifford {
+                ops: vec!['Z', '_'],
+                name: "S".to_string(),
+                meta: PauliMeta::default(),
+            }),
         ];
         let (n_cliffords, n_paulis, tot, _avg_weight) = count_stats(&items);
         assert_eq!(n_cliffords, 2);
@@ -2346,16 +2470,26 @@ mod tests {
     /// which only changed signs (invisible to the scheduler) but corrupted outcome bits.
     #[test]
     fn single_qubit_lookup_rules_agree_with_tableau() {
-        let code = |ps: &PauliString| pauli_code(
-            match (ps.x_bits[0], ps.z_bits[0]) {
-                (true, false) => 0,
-                (true, true) => 1,
-                _ => 2,
-            },
-            ps.sign,
-        );
-        for g in [Gate1Q::H, Gate1Q::S, Gate1Q::Sdg, Gate1Q::SX, Gate1Q::SXdg,
-                  Gate1Q::X, Gate1Q::Y, Gate1Q::Z] {
+        let code = |ps: &PauliString| {
+            pauli_code(
+                match (ps.x_bits[0], ps.z_bits[0]) {
+                    (true, false) => 0,
+                    (true, true) => 1,
+                    _ => 2,
+                },
+                ps.sign,
+            )
+        };
+        for g in [
+            Gate1Q::H,
+            Gate1Q::S,
+            Gate1Q::Sdg,
+            Gate1Q::SX,
+            Gate1Q::SXdg,
+            Gate1Q::X,
+            Gate1Q::Y,
+            Gate1Q::Z,
+        ] {
             let mut t = Tableau::new(1);
             t.prepend_1q_correct(g, 0);
             let mut x = PauliString::identity(1);
@@ -2449,29 +2583,47 @@ mod tests {
             "if(a==1 && b==1) x q[0];",
             "if(a==1) z q[0];",
         ]);
-        let cond_h = gates.iter().filter(|g| matches!(g,
+        let cond_h = gates
+            .iter()
+            .filter(|g| {
+                matches!(g,
             QasmGate::CondGate { inner, terms } if terms.len() == 1
-                && matches!(**inner, QasmGate::Clifford1Q { gate: Gate1Q::H, .. }))).count();
-        let cond_t2 = gates.iter().filter(|g| matches!(g,
+                && matches!(**inner, QasmGate::Clifford1Q { gate: Gate1Q::H, .. }))
+            })
+            .count();
+        let cond_t2 = gates
+            .iter()
+            .filter(|g| {
+                matches!(g,
             QasmGate::CondGate { inner, terms } if terms.len() == 2
-                && matches!(**inner, QasmGate::T { .. }))).count();
-        let cond_x2 = gates.iter().filter(|g| matches!(g,
+                && matches!(**inner, QasmGate::T { .. }))
+            })
+            .count();
+        let cond_x2 = gates
+            .iter()
+            .filter(|g| {
+                matches!(g,
             QasmGate::CondGate { inner, terms } if terms.len() == 2
-                && matches!(**inner, QasmGate::Clifford1Q { gate: Gate1Q::X, .. }))).count();
-        let cond_z1 = gates.iter().filter(|g| matches!(g,
-            QasmGate::CondPauli { gate: Gate1Q::Z, value: true, .. })).count();
+                && matches!(**inner, QasmGate::Clifford1Q { gate: Gate1Q::X, .. }))
+            })
+            .count();
+        let cond_z1 = gates
+            .iter()
+            .filter(|g| matches!(g, QasmGate::CondPauli { gate: Gate1Q::Z, value: true, .. }))
+            .count();
         assert_eq!((cond_h, cond_t2, cond_x2, cond_z1), (1, 1, 1, 1));
     }
 
     #[test]
     fn parse_conditional_rejects_what_it_cannot_express() {
         for (bad, why) in [
-            ("if(c==1) cx q[0], q[1];", "single-qubit"),
+            ("if(c==1) ccx q[0], q[1], q[2];", "single- or two-qubit"),
+            ("if(c==1) measure q[0] -> c[0];", "single- or two-qubit"),
             ("if(c==2) h q[0];", "not 0 or 1"),
             ("if(w==1) h q[0];", "more than one bit"),
             ("if(c) h q[0];", "creg==value"),
         ] {
-            let f = write_qasm(&["qreg q[2];", "creg c[1];", "creg w[2];", bad]);
+            let f = write_qasm(&["qreg q[3];", "creg c[1];", "creg w[2];", bad]);
             let err = parse_qasm(&f.path().to_string_lossy()).unwrap_err().to_string();
             assert!(err.contains(why), "`{}` should fail with `{}`, got: {}", bad, why, err);
         }
@@ -2482,8 +2634,8 @@ mod tests {
         let h = Box::new(QasmGate::Clifford1Q { gate: Gate1Q::H, qubit: 0 });
         let cond = |terms: Vec<(usize, bool)>| QasmGate::CondGate { inner: h.clone(), terms };
         let gates = vec![
-            cond(vec![(0, true)]),             // bit 0 unwritten: reads 0, so never runs
-            cond(vec![(0, false)]),            // ...and `==0` always holds: plain H
+            cond(vec![(0, true)]),  // bit 0 unwritten: reads 0, so never runs
+            cond(vec![(0, false)]), // ...and `==0` always holds: plain H
             QasmGate::Measure { qubit: 1, clbit: Some(1) },
             cond(vec![(1, true), (0, false)]), // the unwritten term drops out
             cond(vec![(1, true), (1, false)]), // contradictory: never runs
@@ -2493,6 +2645,109 @@ mod tests {
         assert!(matches!(out[0], QasmGate::Clifford1Q { gate: Gate1Q::H, .. }));
         assert!(matches!(out[1], QasmGate::Measure { .. }));
         assert!(matches!(&out[2], QasmGate::CondGate { terms, .. } if terms == &vec![(1, true)]));
+    }
+
+    fn conditional_cliffords(items: &[TransItem]) -> Vec<&TransClifford> {
+        items
+            .iter()
+            .filter_map(|i| if let TransItem::Clifford(c) = i { Some(c) } else { None })
+            .filter(|c| !c.meta.cond.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn conditional_cx_is_a_physical_cx_carrying_its_condition() {
+        let (n, gates) = parse_lines(&[
+            "qreg q[2];",
+            "creg m[1];",
+            "h q[1];",
+            "t q[1];",
+            "measure q[1] -> m[0];",
+            "if(m==1) cx q[1],q[0];",
+            "t q[0];",
+        ]);
+        assert!(matches!(&gates[3], QasmGate::CondGate { inner, .. }
+            if matches!(inner.as_ref(), QasmGate::Clifford2Q { gate: Gate2Q::CX, .. })));
+        let items = transpile_opts(n, &gates, 0, false, ResetMode::Frame);
+        let conds = conditional_cliffords(&items);
+        assert_eq!(conds.len(), 1, "one conditional CX");
+        assert_eq!(conds[0].name, "CX");
+        assert_eq!(conds[0].ops, vec!['X', 'Z'], "control q1 (Z), target q0 (X)");
+        assert_eq!(conds[0].meta.cond, vec![(0, true)]);
+        let text = items_text(&items);
+        let m_line = text.lines().position(|l| l.ends_with("<M>")).unwrap();
+        assert!(text.contains(&format!("<CX>@{}?{}=1", m_line, m_line)), "{}", text);
+    }
+
+    #[test]
+    fn conditional_cz_and_swap_become_conditional_cx_sequences() {
+        let (n, gates) = parse_lines(&[
+            "qreg q[3];",
+            "creg m[1];",
+            "h q[2];",
+            "t q[2];",
+            "measure q[2] -> m[0];",
+            "if(m==0) cz q[0],q[1];",
+            "if(m==1) swap q[1],q[2];",
+            "t q[0];",
+        ]);
+        let items = transpile_opts(n, &gates, 0, false, ResetMode::Frame);
+        let conds = conditional_cliffords(&items);
+        let cz: Vec<_> = conds.iter().filter(|c| c.meta.cond == vec![(0, false)]).collect();
+        let sw: Vec<_> = conds.iter().filter(|c| c.meta.cond == vec![(0, true)]).collect();
+        assert_eq!(cz.iter().filter(|c| c.name == "CX").count(), 1, "CZ = H CX H");
+        assert!(cz.len() > 1, "the CZ's H gates are emitted (as S/SX) under the same condition");
+        assert_eq!(sw.len(), 3, "SWAP = three CX");
+        assert!(sw.iter().all(|c| c.name == "CX"));
+    }
+
+    #[test]
+    fn flushed_cz_and_swap_are_emitted_not_dropped() {
+        // A reset in flush mode emits the pending Cliffords; CZ and SWAP used to vanish here.
+        for (two_q, n_cx) in [("cz q[0],q[1];", 1usize), ("swap q[0],q[1];", 3)] {
+            let (n, gates) = parse_lines(&[
+                "qreg q[3];",
+                "creg m[1];",
+                "h q[0];",
+                two_q,
+                "measure q[2] -> m[0];",
+                "reset q[2];",
+                "t q[1];",
+            ]);
+            let items = transpile_opts(n, &gates, 0, false, ResetMode::Flush);
+            let cx = items
+                .iter()
+                .filter(|i| matches!(i, TransItem::Clifford(c) if c.name == "CX"))
+                .count();
+            assert_eq!(cx, n_cx, "{}", two_q);
+        }
+    }
+
+    #[test]
+    fn t_whose_sign_depends_on_an_outcome_waits_for_it() {
+        // The conditional X leaves X_1 owed on outcome 0; the later T (a Z_1 rotation)
+        // anticommutes with it, so it is T or T† depending on that outcome. The final
+        // measurement's sign also depends on it, but that only relabels its outcome.
+        let (n, gates) = parse_lines(&[
+            "qreg q[2];",
+            "creg c[1];",
+            "h q[0];",
+            "measure q[0] -> c[0];",
+            "if(c==1) x q[1];",
+            "t q[1];",
+        ]);
+        let items = transpile_opts(n, &gates, 0, false, ResetMode::Frame);
+        let paulis: Vec<&TransPauli> = items
+            .iter()
+            .filter_map(|i| if let TransItem::Pauli(p) = i { Some(p) } else { None })
+            .collect();
+        let t = paulis.iter().find(|p| p.label == "T").unwrap();
+        assert_eq!(t.meta.frame_deps, vec![0]);
+        assert_eq!(t.meta.needs, vec![0], "the T waits for the outcome deciding its sign");
+        for m in paulis.iter().filter(|p| p.label == "M") {
+            assert!(m.meta.needs.is_empty(), "a measurement's sign is classical bookkeeping");
+        }
+        assert!(items_text(&items).lines().any(|l| l.ends_with("<T>@0")));
     }
 
     #[test]
@@ -2522,7 +2777,13 @@ mod tests {
         let m_line = lines.iter().position(|l| l.ends_with("<M>")).unwrap();
         // An unconditional `<S>` may precede it (a flushed H), so pick the line with an edge.
         let s_line = lines.iter().find(|l| l.contains("<S>@")).expect("a conditional S line");
-        assert!(s_line.ends_with(&format!("<S>@{}", m_line)), "{} vs M at {}", s_line, m_line);
+        // ... and carries the condition itself: run only if that line's outcome is 1.
+        assert!(
+            s_line.ends_with(&format!("<S>@{}?{}=1", m_line, m_line)),
+            "{} vs M at {}",
+            s_line,
+            m_line
+        );
     }
 
     #[test]
@@ -2542,13 +2803,24 @@ mod tests {
             .collect();
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].sign, Sign::Minus, "tdg is a negative rotation");
-        assert_eq!(t[0].meta.cond, vec![(0, false)], "`m==0` is a condition on the outcome being 0");
+        assert_eq!(
+            t[0].meta.cond,
+            vec![(0, false)],
+            "`m==0` is a condition on the outcome being 0"
+        );
     }
 
     #[test]
     fn pauli_on_two_bits_is_a_derived_frame_term_not_a_line() {
-        let base = &["qreg q[2];", "creg a[1];", "creg b[1];", "t q[0];", "measure q[0] -> a[0];",
-                     "t q[1];", "measure q[1] -> b[0];"];
+        let base = &[
+            "qreg q[2];",
+            "creg a[1];",
+            "creg b[1];",
+            "t q[0];",
+            "measure q[0] -> a[0];",
+            "t q[1];",
+            "measure q[1] -> b[0];",
+        ];
         let mut with = base.to_vec();
         with.push("if(a==1 && b==0) x q[0];");
         with.push("t q[0];");
@@ -2558,15 +2830,20 @@ mod tests {
         let (_, g0) = parse_lines(&without);
         let a = transpile_opts(n, &g1, 0, false, ResetMode::Frame);
         let b = transpile_opts(n, &g0, 0, false, ResetMode::Frame);
-        let lines = |v: &[TransItem]| v.iter().filter(|i| !matches!(i, TransItem::Event(_))).count();
+        let lines =
+            |v: &[TransItem]| v.iter().filter(|i| !matches!(i, TransItem::Event(_))).count();
         assert_eq!(lines(&a), lines(&b), "a conditional Pauli adds no scheduled product");
         let derived: Vec<usize> = a
             .iter()
-            .filter_map(|i| if let TransItem::Event(Event::Derived { id, .. }) = i { Some(*id) } else { None })
+            .filter_map(|i| {
+                if let TransItem::Event(Event::Derived { id, .. }) = i { Some(*id) } else { None }
+            })
             .collect();
         assert_eq!(derived.len(), 1);
-        let used = a.iter().any(|i| matches!(i, TransItem::Pauli(p)
-            if p.meta.frame_deps.contains(&derived[0])));
+        let used = a.iter().any(|i| {
+            matches!(i, TransItem::Pauli(p)
+            if p.meta.frame_deps.contains(&derived[0]))
+        });
         assert!(used, "a later product's sign depends on the derived outcome");
     }
 
@@ -2594,7 +2871,11 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         let s_line = lines.iter().find(|l| l.contains("<S>@")).expect("a conditional S line");
         // needs both the condition's measurement (line of outcome 0) and the fix's (outcome 1)
-        assert!(s_line.contains('@') && s_line.split('@').nth(1).unwrap().contains(','), "{}", s_line);
+        assert!(
+            s_line.contains('@') && s_line.split('@').nth(1).unwrap().contains(','),
+            "{}",
+            s_line
+        );
     }
 
     #[test]

@@ -109,6 +109,22 @@ impl Circuit {
                     deps.push((pp.id, a));
                 }
             }
+            // A condition can only be decided once its outcomes are known, so every product it
+            // names must be a classical dependency, and a measurement.
+            for &(c, _) in &pp.cond {
+                assert!(
+                    pp.after.contains(&c),
+                    "product {} is conditioned on product {}, which is not in its @ list",
+                    pp.id,
+                    c
+                );
+                assert!(
+                    self.pps[c as usize].gate_type.is_m(),
+                    "product {} is conditioned on product {}, which is not a measurement",
+                    pp.id,
+                    c
+                );
+            }
         }
         for (child_id, parent_id) in deps {
             self.pps[child_id as usize].parents.push(parent_id);
@@ -122,6 +138,43 @@ impl Circuit {
 
     pub(crate) fn product(&self, id: i32) -> &PauliProduct {
         &self.pps[id as usize]
+    }
+
+    /// This circuit without the products in `skip` (conditional products the scheduler
+    /// skipped), renumbered, with dependencies rebuilt: the circuit that actually ran, for
+    /// estimates that should not count work that never happened. Only measurements are named
+    /// by `@`/`?` and a measurement is never skipped, so no classical edge is lost.
+    pub(crate) fn without(&self, skip: &HashSet<i32>) -> Circuit {
+        let mut new_id = vec![-1i32; self.pps.len()];
+        let mut pps = Vec::with_capacity(self.pps.len() - skip.len().min(self.pps.len()));
+        for pp in &self.pps {
+            if skip.contains(&pp.id) {
+                continue;
+            }
+            new_id[pp.id as usize] = pps.len() as i32;
+            let mut c = pp.clone();
+            c.id = pps.len() as i32;
+            c.parents.clear();
+            c.children.clear();
+            pps.push(c);
+        }
+        for c in &mut pps {
+            c.after = c.after.iter().map(|&a| new_id[a as usize]).filter(|&a| a >= 0).collect();
+            c.cond = c
+                .cond
+                .iter()
+                .map(|&(m, v)| (new_id[m as usize], v))
+                .filter(|&(m, _)| m >= 0)
+                .collect();
+        }
+        let mut out = Circuit {
+            pps,
+            layers: RefCell::new(None),
+            circuit_fname: self.circuit_fname.clone(),
+            n_qubits: self.n_qubits,
+        };
+        out.gen_deps();
+        out
     }
 
     pub(crate) fn n_products(&self) -> usize {
@@ -430,6 +483,7 @@ impl Circuit {
                                 parents: vec![],
                                 children: vec![],
                                 after: vec![],
+                                cond: vec![],
                                 max_qubit: op.qubit,
                             };
                             expanded.push(corr);
@@ -457,6 +511,7 @@ impl Circuit {
                                 parents: vec![],
                                 children: vec![],
                                 after: vec![],
+                                cond: vec![],
                                 max_qubit: op.qubit,
                             };
                             expanded.push(corr);
@@ -525,7 +580,8 @@ impl Circuit {
         for pp in &self.pps {
             for &a in &pp.after {
                 let child = first_id[pp.id as usize];
-                let parent = first_id.get(a as usize + 1).copied().unwrap_or(expanded.len() as i32) - 1;
+                let parent =
+                    first_id.get(a as usize + 1).copied().unwrap_or(expanded.len() as i32) - 1;
                 // A duplicate of a qubit-overlap edge is harmless: parents and children stay
                 // consistent, exactly as for a CX whose two qubits share a parent.
                 deps.push((child, parent));
@@ -806,6 +862,23 @@ mod tests {
         assert_eq!(c.circuit_fname, "test.trans");
         assert_eq!(c.n_qubits, 0);
         assert_eq!(c.n_products(), 0);
+    }
+
+    #[test]
+    fn without_drops_products_and_keeps_classical_edges() {
+        // 0: M on q0; 1: conditional S on q1 (skipped); 2: T on q1; 3: conditional T on q2 @0.
+        let f = make_circuit_file(&["+Z__<M>", "+_Z_<S>@0?0=1", "+_X_<T>", "+__Z<T>@0?0=0"]);
+        let mut c = Circuit::new(&f.path().to_string_lossy().to_string());
+        c.load_circuit().unwrap();
+        let r = c.without(&[1].into_iter().collect());
+        assert_eq!(r.n_products(), 3);
+        assert!(
+            r.product(1).gate_type.is_t() && r.product(1).parents.is_empty(),
+            "T on q1 is free"
+        );
+        assert_eq!(r.product(2).after, vec![0]);
+        assert_eq!(r.product(2).cond, vec![(0, false)]);
+        assert_eq!(r.product(2).parents, vec![0], "classical edge kept");
     }
 
     #[test]

@@ -9,8 +9,13 @@ Two parts:
 1. CHECKS (independent of the Rust scheduler: they re-derive the constraints from the .trans file
    and read only the .schedule output). Exit status 1 if any fails.
      * every product is scheduled once (CX: two consecutive lcycles; S/SX: 1-4 consecutive, they
-       take 3 normally, fewer or more when a T-failure correction is merged)
-     * qubit order: a product starts after the previous product on each shared qubit finished
+       take 3 normally, fewer or more when a T-failure correction is merged), except conditional
+       products the scheduler skipped
+     * conditions (`?id=v` in the .trans file; outcomes and skipped products from the schedule
+       header): a skipped product's condition is false under the logged outcomes, and with
+       `--cond-outcomes random` every conditional product that ran has a true condition
+     * qubit order: a product starts after the previous product that ran on each shared qubit
+       finished
      * classical order: a product with `@k` starts at least L+1 lcycles after product k finished
      * no two products use the same qubit in one lcycle
      * sidecar: every conditional product's `needs` are among its `@` deps; frame_deps and needs only
@@ -28,7 +33,7 @@ import sys
 from collections import defaultdict
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
-TRANS = re.compile(r"^([+-])([XYZ_]+)<(\w+)>(?:@([\d,]+))?\s*$")
+TRANS = re.compile(r"^([+-])([XYZ_]+)<(\w+)>(?:@([\d,]+))?(?:\?([\d=,]+))?\s*$")
 SCHED = re.compile(r"^\s*(\d+):\s+(\S+)((?:\s+\d+<\w+>)*)\s*$")
 ITEM = re.compile(r"(\d+)<(\w+)>")
 
@@ -43,13 +48,15 @@ def read_trans(path):
             m = TRANS.match(line)
             if not m:
                 raise SystemExit(f"{path}: cannot parse line {ln + 1}: {line!r}")
-            sign, ops, kind, after = m.groups()
+            sign, ops, kind, after, cond = m.groups()
             prods.append(
                 dict(
                     sign=sign,
                     qubits=[(q, c) for q, c in enumerate(ops) if c != "_"],
                     kind=kind,
                     after=[int(x) for x in after.split(",")] if after else [],
+                    cond=[(int(t.split("=")[0]), t.split("=")[1] == "1")
+                          for t in cond.split(",")] if cond else [],
                 )
             )
     return prods
@@ -61,6 +68,9 @@ class Schedule(defaultdict):
     def __init__(self):
         super().__init__(list)
         self.kinds = {}
+        self.cond_mode = None  # "random" | "worst"; None if the header has no cond_outcomes line
+        self.outcomes = {}  # measurement product id -> sampled true outcome (0/1)
+        self.skipped = set()  # conditional products the scheduler skipped
 
 
 def read_schedule(path):
@@ -72,6 +82,16 @@ def read_schedule(path):
     with open(path) as f:
         for line in f:
             line = ANSI.sub("", line.rstrip("\n"))
+            if line.startswith("# cond_outcomes:"):
+                when.cond_mode = line.split(":", 1)[1].split()[0]
+                continue
+            if line.startswith("# outcomes:"):
+                when.outcomes = {int(k): int(v) for k, v in
+                                 (t.split("=") for t in line.split(":", 1)[1].split())}
+                continue
+            if line.startswith("# skipped:"):
+                when.skipped = {int(t) for t in line.split(":", 1)[1].split()}
+                continue
             if not line or line.startswith("#"):
                 continue
             m = SCHED.match(line)
@@ -104,7 +124,29 @@ def check(prods, when, side, L):
 
     n = len(prods)
     start, end = {}, {}
+    skipped = when.skipped
+    # conditions: skipped exactly where a condition fails under the logged outcomes
+    if skipped and when.cond_mode != "random":
+        err(f"{len(skipped)} product(s) skipped, but the schedule is not in random cond mode")
     for i, p in enumerate(prods):
+        if not p["cond"]:
+            if i in skipped:
+                err(f"unconditional product {i} was skipped")
+            continue
+        missing = [j for j, _ in p["cond"] if j not in when.outcomes]
+        if when.cond_mode == "random" and missing:
+            err(f"conditional product {i}: no logged outcome for measurement(s) {missing}")
+            continue
+        holds = all(when.outcomes.get(j) == int(v) for j, v in p["cond"])
+        if i in skipped and holds:
+            err(f"product {i} was skipped although its condition {p['cond']} holds")
+        if i not in skipped and when.cond_mode == "random" and not holds:
+            err(f"product {i} ran although its condition {p['cond']} fails")
+    for i, p in enumerate(prods):
+        if i in skipped:
+            if when.get(i):
+                err(f"skipped product {i} also appears in the schedule at {when[i]}")
+            continue
         ls = sorted(when.get(i, []))
         kind = p["kind"]
         lo, hi = {"CX": (2, 2), "S": (1, 4), "SX": (1, 4), "Sdg": (1, 4), "SXdg": (1, 4)}.get(kind, (1, 1))
@@ -135,6 +177,8 @@ def check(prods, when, side, L):
     last = {}
     qdep = defaultdict(set)
     for i, p in enumerate(prods):
+        if i in skipped:  # never ran: the next product on its qubits follows the previous one
+            continue
         for q, _ in p["qubits"]:
             if q in last:
                 qdep[i].add(last[q])
@@ -350,7 +394,11 @@ def main():
     nq = max((q for p in prods for q, _ in p["qubits"]), default=-1) + 1
     nT = sum(p["kind"] == "T" for p in prods)
     nM = sum(p["kind"] == "M" for p in prods)
-    nC = len(side and [r for r in side["products"] if r.get("needs")] or [])
+    nC = len(side and [r for r in side["products"] if r.get("cond")] or [])
+    nK = sum(bool(p["cond"]) for p in prods)
+    if nK:
+        print(f"{nK} products carry a condition; cond mode {when.cond_mode or 'not logged'}, "
+              f"{len(when.skipped)} skipped, {len(when.outcomes)} outcome(s) logged")
     print(f"{len(prods)} products ({nT} T, {nM} M, {nC} conditional), {nq} qubits, "
           f"{max(end.values(), default=0)} lcycles, latency {L}"
           f"{'' if side else ', no sidecar found'}")

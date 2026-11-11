@@ -1,7 +1,7 @@
 use crate::accum_start;
 use crate::astar::{AStar, PathResult};
 use crate::circuit::Circuit;
-use crate::cultivation::CultivationManager;
+use crate::cultivation::{CultivationManager, NOT_CULTIVATING};
 use crate::debug_sched;
 use crate::fn_timer;
 use crate::info_sched;
@@ -165,6 +165,48 @@ impl SchedulerInput {
     }
 }
 
+/// Lcycles a Litinski injection waits for a free neighbour to borrow as its |0> helper before
+/// its magic patch is measured in place instead.
+const HELPER_MAX_WAIT: usize = 2;
+
+/// How a failed T injection is corrected (see docs/t-gate-corrections.md).
+///
+/// A T is a pi/8 rotation about a Pauli P, done by measuring P (x) Z_m with a magic patch m. Half
+/// the time it comes out as -pi/8 and owes a pi/4 rotation about P.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum TCorrection {
+    /// Auto-corrected pi/8 rotation (Litinski, Game of Surface Codes). In the injection lcycle a
+    /// free neighbour of the magic patch is borrowed as a |0> helper; Z_m (x) Y_helper is measured
+    /// alongside P (x) Z_m, then the magic patch in X, which frees it. Once the injection outcome
+    /// is decoded the helper is measured in X or Z, which applies the correction or not. No
+    /// Clifford ever reaches the data: later products are never changed and no S gate is
+    /// emitted. The helper is held until that decision (reaction latency, chained through
+    /// earlier T gates whose Paulis anticommute).
+    Litinski,
+    /// In-place Y measurement (Gidney, "Inplace Access to the Surface Code Y Basis", Quantum
+    /// 2024): no helper. After P (x) Z_m the magic patch itself is held until the correction is
+    /// decided, then measured in X (no correction) or Y (applies it). A Y measurement takes
+    /// floor(d/2)+2 rounds, modelled as `--y-meas-lcycles` extra lcycles on the magic patch, and
+    /// the frame bit it yields is known only after that. Single-patch injection, but the magic
+    /// patch cannot cultivate while it waits.
+    InplaceY,
+    /// The per-qubit S-correction record PureMagic used before (correction_power). Incorrect: it
+    /// splits the correction of a multi-qubit T into independent one-qubit corrections and
+    /// merges corrections about different axes into a Pauli. Kept to compare against.
+    Legacy,
+}
+
+/// How the scheduler treats conditional products (a `?id=v,..` suffix in the `.trans` file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum CondOutcomes {
+    /// Sample each measurement's true outcome when a condition first needs it (1 with
+    /// probability `cond_p1`), and skip every conditional product whose condition then fails:
+    /// the schedule is that of the circuit the sampled outcomes actually call for.
+    Random,
+    /// Ignore conditions and run every conditional product: an upper bound on the cost.
+    Worst,
+}
+
 /// Assigns Pauli products to lcycles and routes them through the topology.
 pub(crate) struct Scheduler {
     pub(crate) input: SchedulerInput,
@@ -235,6 +277,86 @@ pub(crate) struct Scheduler {
     /// `(due_lcycle, child_id)`: parent completions on classical edges whose release is held back
     /// by `reaction_latency`. Released at the start of the first lcycle after `due_lcycle`.
     delayed_unlocks: Vec<(usize, i32)>,
+    /// Conditional products: how they are decided, and P(outcome = 1) for `Random`.
+    cond_outcomes: CondOutcomes,
+    cond_p1: f64,
+    /// Separate stream for measurement outcomes, so sampling them leaves the cultivation and
+    /// T-failure draws (and hence an unconditional circuit's schedule) unchanged.
+    rng_outcomes: StdRng,
+    /// Sampled true outcome per measurement product id, in the order they were sampled.
+    pub(crate) outcomes: IndexMap<i32, bool>,
+    /// Conditional products skipped because their condition failed, in the order skipped.
+    pub(crate) skipped: Vec<i32>,
+    skipped_set: HashSet<i32>,
+    n_skipped_t: usize,
+    /// Hosted-ancilla state (`--ancilla-qubits`), indexed by logical qubit; empty when
+    /// nothing is hosted. A hosted patch is dormant (cultivating) until one of its products
+    /// is ready, and again after a product that leaves it in a known single-patch state
+    /// (see `releases_patch`) until its next product is ready, and after its last product.
+    hosted: HostedAncillas,
+    /// How failed T injections are corrected.
+    t_correction: TCorrection,
+    /// Patches held after a T injection until its correction is decided: (last lcycle, node).
+    held: Vec<(usize, u16)>,
+    /// Litinski injections whose magic patch had no free neighbour for the |0> helper yet:
+    /// (T product, magic node, decision lcycle, give-up lcycle). The magic patch is held until
+    /// a helper is found.
+    helper_wanted: Vec<(i32, u16, usize, usize)>,
+    /// Magic patches measured in place, by T product: (magic node, decision lcycle). If the T
+    /// failed, the patch is measured in Y, which takes `y_meas_lcycles` more.
+    inplace_pending: HashMap<i32, (u16, usize)>,
+    /// Failed T products still waiting for a helper (their measurement basis is not known yet).
+    failed_waiting: HashSet<i32>,
+    /// Extra lcycles an in-place Y measurement of a magic patch takes.
+    y_meas_lcycles: usize,
+    /// True if `hold_t_patches` occupied any patch in the current lcycle.
+    holding_now: bool,
+    /// Per qubit, recent T products and the lcycle their correction is decided (decision chain).
+    t_decisions: Vec<Vec<(i32, usize)>>,
+    pub(crate) t_stats: TCorrectionStats,
+}
+
+/// Counters for the T-correction model, reported after scheduling.
+#[derive(Default, Debug, Clone)]
+pub(crate) struct TCorrectionStats {
+    /// Injections handled by the auto-correction model.
+    pub(crate) injections: usize,
+    /// |0> helper patches borrowed (Litinski), and how many had to wait for a free neighbour.
+    pub(crate) helpers: usize,
+    pub(crate) helpers_deferred: usize,
+    /// Injections that found no helper within `HELPER_MAX_WAIT` lcycles (or whose magic patch
+    /// has no neighbour that could ever be one). Their magic patch is measured in place (the
+    /// in-place Y measurement) instead; see docs/t-gate-corrections.md.
+    pub(crate) helpers_missing: usize,
+    /// Magic patches measured in place, and how many of those needed the (slower) Y basis.
+    pub(crate) inplace: usize,
+    pub(crate) inplace_y: usize,
+    /// Patch-lcycles spent holding magic and helper patches after their injection lcycle.
+    pub(crate) hold_patch_lcycles: usize,
+    /// Largest gap between an injection and its correction decision, in lcycles.
+    pub(crate) max_decision_delay: usize,
+    /// One entry per injection: (lcycle, T product, magic patch, decision lcycle). Helpers are
+    /// logged separately as (lcycle, magic patch, helper), since a helper can come later.
+    pub(crate) injection_log: Vec<(usize, i32, u16, usize)>,
+    pub(crate) helper_log: Vec<(usize, u16, u16)>,
+}
+
+/// Bookkeeping for qubits hosted on injection patches.
+#[derive(Default)]
+pub(crate) struct HostedAncillas {
+    /// Products of the input circuit not yet completed, per hosted qubit.
+    remaining: Vec<usize>,
+    /// Products on each hosted qubit, in program order (a chain: each depends on the
+    /// previous one on the same qubit), and how many of them have completed.
+    chain: Vec<Vec<i32>>,
+    done: Vec<usize>,
+    pub(crate) live: Vec<bool>,
+    /// Lcycles each hosted qubit spent live, and how often it went live.
+    pub(crate) live_lcycles: Vec<usize>,
+    pub(crate) activations: Vec<usize>,
+    /// Products completed in the current lcycle (filled by `unlock_children`).
+    completed_buf: Vec<i32>,
+    n_initial_products: usize,
 }
 
 impl Scheduler {
@@ -303,7 +425,341 @@ impl Scheduler {
             free_merged_products: HashSet::new(),
             reaction_latency: 0,
             delayed_unlocks: Vec::new(),
+            cond_outcomes: CondOutcomes::Random,
+            cond_p1: 0.5,
+            rng_outcomes: StdRng::seed_from_u64(rseed as u64 ^ 0x6f75_7463_6f6d_6573),
+            outcomes: IndexMap::new(),
+            skipped: Vec::new(),
+            skipped_set: HashSet::new(),
+            n_skipped_t: 0,
+            hosted: HostedAncillas::default(),
+            t_correction: TCorrection::Litinski,
+            held: Vec::new(),
+            helper_wanted: Vec::new(),
+            inplace_pending: HashMap::new(),
+            failed_waiting: HashSet::new(),
+            y_meas_lcycles: 1,
+            holding_now: false,
+            t_decisions: Vec::new(),
+            t_stats: TCorrectionStats::default(),
         }
+    }
+
+    /// Sets how failed T injections are corrected (default: Litinski auto-correction).
+    pub(crate) fn set_t_correction(&mut self, mode: TCorrection) {
+        self.t_correction = mode;
+    }
+
+    /// Sets how many extra lcycles an in-place Y measurement of a magic patch takes (default 1:
+    /// floor(d/2)+2 rounds, rounded up to whole lcycles).
+    pub(crate) fn set_y_meas_lcycles(&mut self, lcycles: usize) {
+        self.y_meas_lcycles = lcycles;
+    }
+
+    /// True if the Paulis of products `a` and `b` anticommute (they differ on an odd number of
+    /// shared qubits).
+    fn anticommute(&self, a: i32, b: i32) -> bool {
+        let pa = &self.input.circuit.product(a).operators;
+        let pb = &self.input.circuit.product(b).operators;
+        let mut odd = false;
+        for oa in pa {
+            if let Some(ob) = pb.iter().find(|ob| ob.qubit == oa.qubit) {
+                odd ^= oa.basis != ob.basis;
+            }
+        }
+        odd
+    }
+
+    /// The lcycle in which the correction of T product `pp_id`, injected this lcycle, is decided.
+    ///
+    /// Its own injection outcome is decoded after the reaction latency L. Whether a correction is
+    /// owed also depends on the Pauli-frame bits of earlier T gates whose Paulis anticommute with
+    /// this one (their byproduct flips this rotation's sign), and those bits are known only L
+    /// lcycles after their own decision. So decisions chain: with L = 0 the decision is immediate.
+    fn decision_lcycle(&self, pp_id: i32) -> usize {
+        let now = self.current_lcycle;
+        let l = self.reaction_latency;
+        let mut decision = now + l;
+        if l == 0 {
+            return decision;
+        }
+        for op in &self.input.circuit.product(pp_id).operators {
+            for &(j, d) in self.t_decisions.get(op.qubit as usize).map_or(&[][..], |v| v) {
+                // An earlier decision binds until its frame bits are known (d + L).
+                if d + l > now && d + l > decision && self.anticommute(j, pp_id) {
+                    decision = d + l;
+                }
+            }
+        }
+        decision
+    }
+
+    /// Records T product `pp_id`'s decision lcycle on its qubits for later T gates.
+    fn record_decision(&mut self, pp_id: i32, decision: usize) {
+        let (now, l) = (self.current_lcycle, self.reaction_latency);
+        if l == 0 {
+            return;
+        }
+        for i in 0..self.input.circuit.product(pp_id).operators.len() {
+            let q = self.input.circuit.product(pp_id).operators[i].qubit as usize;
+            if self.t_decisions.len() <= q {
+                self.t_decisions.resize(q + 1, Vec::new());
+            }
+            // Entries whose frame bits are already known can no longer bind.
+            self.t_decisions[q].retain(|&(_, d)| d + l > now);
+            self.t_decisions[q].push((pp_id, decision));
+        }
+    }
+
+    /// Rank of node `nb` as a |0> helper for a T injection, lower is better, or None if it can
+    /// never be one (a data patch, a hosted patch, the route-only half of one). A free routing
+    /// (bus) patch comes first, then the cultivating magic patch with the least progress (its
+    /// cultivation restarts). With magic routing (-u) there are no bus patches, so the helper is
+    /// always a cultivating magic patch. A ready magic state is never borrowed: it would waste
+    /// the state, and a T waiting for it could find none left.
+    fn helper_rank(&self, nb: u16) -> Option<(u8, i32)> {
+        let topo = &self.input.topo;
+        if topo.is_hosted(nb) {
+            return None;
+        }
+        match topo.node(nb).node_type {
+            NodeType::Bus => Some((0, 0)),
+            NodeType::Magic if topo.cultivation_times[nb as usize] > 0 => {
+                Some((1, topo.busy_counts[nb as usize]))
+            }
+            _ => None,
+        }
+    }
+
+    /// A free neighbour of `magic` to borrow as a |0> helper (best `helper_rank`).
+    fn pick_helper(&self, magic: u16) -> Option<u16> {
+        let mut best: Option<((u8, i32), u16)> = None;
+        for &nb in self.input.topo.node(magic).nbs_slice() {
+            if self.used[nb as usize] {
+                continue;
+            }
+            if let Some(rank) = self.helper_rank(nb) {
+                if best.map_or(true, |(r, _)| rank < r) {
+                    best = Some((rank, nb));
+                }
+            }
+        }
+        best.map(|(_, nb)| nb)
+    }
+
+    /// True if some neighbour of `magic` could ever serve as its helper.
+    fn helper_possible(&self, magic: u16) -> bool {
+        self.input.topo.node(magic).nbs_slice().iter().any(|&nb| self.helper_rank(nb).is_some())
+    }
+
+    /// Keeps patch `node` occupied through lcycle `last` (nothing to do if `last` is now).
+    fn hold(&mut self, node: u16, last: usize) {
+        let now = self.current_lcycle;
+        if last > now {
+            self.held.push((last, node));
+            self.t_stats.hold_patch_lcycles += last - now;
+        }
+    }
+
+    /// Pushes T product `pp_id`'s recorded decision back by `by` lcycles: its frame bit comes
+    /// from a measurement that ends that much later.
+    fn delay_decision(&mut self, pp_id: i32, by: usize) {
+        for i in 0..self.input.circuit.product(pp_id).operators.len() {
+            let q = self.input.circuit.product(pp_id).operators[i].qubit as usize;
+            if let Some(v) = self.t_decisions.get_mut(q) {
+                for e in v.iter_mut().filter(|e| e.0 == pp_id) {
+                    e.1 += by;
+                }
+            }
+        }
+    }
+
+    /// The magic patch of T product `pp_id` is measured in place once the correction is decided
+    /// (lcycle `decision`): in X, or in Y if the T failed. `failed` is None while the injection
+    /// outcome has not been drawn yet (the injection lcycle); `process_t_gate_outcomes` then
+    /// adds the Y time if needed.
+    fn measure_in_place(&mut self, pp_id: i32, magic: u16, decision: usize, failed: Option<bool>) {
+        self.t_stats.inplace += 1;
+        let y = self.y_meas_lcycles;
+        match failed {
+            Some(true) => {
+                self.t_stats.inplace_y += 1;
+                self.delay_decision(pp_id, y);
+                self.hold(magic, decision + y);
+            }
+            Some(false) => self.hold(magic, decision),
+            None => {
+                self.hold(magic, decision);
+                self.inplace_pending.insert(pp_id, (magic, decision));
+            }
+        }
+    }
+
+    /// Bookkeeping for a T product injected this lcycle from magic patch `magic`.
+    ///
+    /// Litinski: P (x) Z_m and Z_m (x) Y_h are measured together, then the magic patch in X, so
+    /// the magic patch is free again after this lcycle. Only the helper h waits for the decision
+    /// (it is measured in X to apply the correction, in Z not to).
+    fn inject_t(&mut self, pp_id: i32, magic: u16) {
+        let now = self.current_lcycle;
+        let decision = self.decision_lcycle(pp_id);
+        self.record_decision(pp_id, decision);
+        self.t_stats.injections += 1;
+        self.t_stats.injection_log.push((now, pp_id, magic, decision));
+        self.t_stats.max_decision_delay = self.t_stats.max_decision_delay.max(decision - now);
+        info_sched!(
+            "  T {} injected from magic {}; correction decided in lcycle {}",
+            pp_id,
+            self.input.topo.label(magic),
+            decision
+        );
+        if self.t_correction == TCorrection::InplaceY {
+            self.measure_in_place(pp_id, magic, decision, None);
+            return;
+        }
+        match self.pick_helper(magic) {
+            Some(h) => {
+                info_sched!("    helper |0> patch {}", self.input.topo.label(h));
+                self.t_stats.helper_log.push((now, magic, h));
+                self.t_stats.helpers += 1;
+                self.mark_nodes_used(&[h]);
+                self.hold(h, decision);
+            }
+            None if self.helper_possible(magic) => {
+                // The magic patch keeps its state until a helper is free (hold_t_patches).
+                info_sched!("    no free neighbour for the helper yet");
+                self.t_stats.helpers_deferred += 1;
+                self.helper_wanted.push((pp_id, magic, decision, now + HELPER_MAX_WAIT));
+            }
+            None => {
+                info_sched!("    no neighbour can be a helper; magic patch measured in place");
+                self.t_stats.helpers_missing += 1;
+                self.measure_in_place(pp_id, magic, decision, None);
+            }
+        }
+    }
+
+    /// Start of an lcycle: release expired holds, mark the rest used, and give injections that
+    /// are still waiting for a |0> helper the first pick of free neighbours.
+    fn hold_t_patches(&mut self) {
+        let now = self.current_lcycle;
+        self.held.retain(|&(last, _)| last >= now);
+        let nodes: Vec<u16> = self.held.iter().map(|&(_, n)| n).collect();
+        self.holding_now = !nodes.is_empty() || !self.helper_wanted.is_empty();
+        if self.holding_now {
+            info_sched!(
+                "  held patches {:?}; waiting for a helper: {:?}",
+                nodes.iter().map(|&n| self.input.topo.label(n)).collect::<Vec<_>>(),
+                self.helper_wanted
+                    .iter()
+                    .map(|&(_, m, _, _)| self.input.topo.label(m))
+                    .collect::<Vec<_>>()
+            );
+        }
+        self.mark_nodes_used(&nodes);
+        let wanted = std::mem::take(&mut self.helper_wanted);
+        // Every waiting magic patch still holds its state: occupy them all before any helper is
+        // picked, so no waiting patch is borrowed as another one's helper.
+        for &(_, magic, _, _) in &wanted {
+            self.mark_nodes_used(&[magic]);
+            self.t_stats.hold_patch_lcycles += 1;
+        }
+        for (pp_id, magic, decision, give_up) in wanted {
+            match self.pick_helper(magic) {
+                Some(h) => {
+                    // Z_m (x) Y_h and X_m now; the magic patch is free from the next lcycle.
+                    self.t_stats.helper_log.push((now, magic, h));
+                    self.t_stats.helpers += 1;
+                    self.mark_nodes_used(&[h]);
+                    self.hold(h, decision);
+                    self.failed_waiting.remove(&pp_id);
+                }
+                None if now < give_up => self.helper_wanted.push((pp_id, magic, decision, give_up)),
+                None => {
+                    // Waiting longer could deadlock (two magic patches each waiting on the
+                    // other); measure the magic patch in place instead.
+                    info_sched!(
+                        "  no helper for {}; measured in place",
+                        self.input.topo.label(magic)
+                    );
+                    self.t_stats.helpers_missing += 1;
+                    let failed = self.failed_waiting.remove(&pp_id);
+                    self.measure_in_place(pp_id, magic, decision, Some(failed));
+                }
+            }
+        }
+    }
+
+    /// Sets how conditional products are decided (default: `Random` with `p1` = 0.5).
+    pub(crate) fn set_cond_outcomes(&mut self, mode: CondOutcomes, p1: f64) {
+        assert!((0.0..=1.0).contains(&p1), "outcome probability {} is not in [0, 1]", p1);
+        self.cond_outcomes = mode;
+        self.cond_p1 = p1;
+    }
+
+    /// Number of products with a condition.
+    pub(crate) fn n_conditional(&self) -> usize {
+        self.input.circuit.pps.iter().filter(|pp| !pp.cond.is_empty()).count()
+    }
+
+    /// The true outcome of measurement product `m`, sampled the first time it is asked for.
+    fn outcome(&mut self, m: i32) -> bool {
+        if let Some(&o) = self.outcomes.get(&m) {
+            return o;
+        }
+        let o = self.rng_outcomes.gen_bool(self.cond_p1);
+        self.outcomes.insert(m, o);
+        o
+    }
+
+    /// True if product `id` runs: it has no condition, conditions are ignored (`Worst`), or
+    /// every term holds. Only called once the product is ready, so every outcome it names has
+    /// been measured (a condition's products are always in its `@` list).
+    fn cond_holds(&mut self, id: i32) -> bool {
+        if self.cond_outcomes == CondOutcomes::Worst {
+            return true;
+        }
+        let cond = self.input.circuit.product(id).cond.clone();
+        // Sample every term (no short-circuit), so the outcomes drawn do not depend on order.
+        let values: Vec<bool> = cond.iter().map(|&(m, _)| self.outcome(m)).collect();
+        cond.iter().zip(values).all(|(&(_, want), got)| got == want)
+    }
+
+    /// Filters products that just became ready. A conditional product whose condition fails
+    /// is skipped: it completes at once without being scheduled (no lcycle, no magic state, no
+    /// T-failure draw, no S correction), and its children are unlocked and admitted in turn.
+    /// Returns, in order, the products that should run.
+    fn admit(&mut self, ready: Vec<i32>) -> Vec<i32> {
+        let mut run = Vec::with_capacity(ready.len());
+        let mut work: std::collections::VecDeque<i32> = ready.into();
+        while let Some(id) = work.pop_front() {
+            if self.input.circuit.product(id).cond.is_empty() || self.cond_holds(id) {
+                run.push(id);
+                continue;
+            }
+            info_sched!("  conditional product {} skipped: condition false", id);
+            self.skipped.push(id);
+            self.skipped_set.insert(id);
+            if self.input.circuit.product(id).gate_type.is_t() {
+                self.n_skipped_t += 1;
+                self.cultivation.t_products_remaining =
+                    self.cultivation.t_products_remaining.saturating_sub(1);
+            }
+            if !self.hosted.live.is_empty() {
+                self.hosted.completed_buf.push(id);
+            }
+            // A skipped product has no outcome, so no child waits on it through the reaction
+            // latency (only measurements are named by `@`, and a measurement is never
+            // conditional); every edge from it releases at once.
+            let children = self.input.circuit.product(id).children.clone();
+            for child in children {
+                self.remaining_parents[child as usize] -= 1;
+                if self.remaining_parents[child as usize] == 0 {
+                    work.push_back(child);
+                }
+            }
+        }
+        run
     }
 
     /// Sets the classical reaction latency (lcycles) applied to `@`-dependency edges.
@@ -319,6 +775,7 @@ impl Scheduler {
         }
         let now = self.current_lcycle;
         let mut still_waiting = Vec::with_capacity(self.delayed_unlocks.len());
+        let mut ready = Vec::new();
         for (due, child_id) in std::mem::take(&mut self.delayed_unlocks) {
             if due >= now {
                 still_waiting.push((due, child_id));
@@ -326,11 +783,216 @@ impl Scheduler {
             }
             self.remaining_parents[child_id as usize] -= 1;
             if self.remaining_parents[child_id as usize] == 0 {
-                let child = self.input.circuit.product(child_id).clone();
-                self.pps_pending.push(child);
+                ready.push(child_id);
             }
         }
         self.delayed_unlocks = still_waiting;
+        for child_id in self.admit(ready) {
+            let child = self.input.circuit.product(child_id).clone();
+            self.pps_pending.push(child);
+            if self.hosting() {
+                self.activate_hosted_for(&[child_id]);
+            }
+        }
+    }
+
+    pub(crate) fn hosted_live_lcycles(&self, q: u16) -> usize {
+        self.hosted.live_lcycles.get(q as usize).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn hosted_activations(&self, q: u16) -> usize {
+        self.hosted.activations.get(q as usize).copied().unwrap_or(0)
+    }
+
+    /// Debug check of one lcycle: a product on a hosted qubit runs only while it is live,
+    /// and a live hosted patch is used only by products on that qubit (scheduled, carried
+    /// forward, or blocked and holding its terminals).
+    #[cfg(debug_assertions)]
+    fn check_hosted_lcycle(&self) -> io::Result<()> {
+        let err = |m: String| Err(io::Error::new(io::ErrorKind::Other, m));
+        let touches = |pp: &PauliProduct, q: u16| pp.operators.iter().any(|op| op.qubit == q);
+        for &q in &self.input.topo.hosted_qubits {
+            let live = self.hosted.live[q as usize];
+            let scheduled_on_q =
+                self.pp_paths.iter().any(|(id, _)| touches(self.input.circuit.product(*id), q));
+            if scheduled_on_q && !live {
+                return err(format!(
+                    "lcycle {}: product on hosted q{} scheduled while dormant",
+                    self.current_lcycle, q
+                ));
+            }
+            let [x_id, z_id] = self.input.topo.data_ids[q as usize];
+            if live && (self.used[x_id as usize] || self.used[z_id as usize]) {
+                let pending_on_q = self.pps_pending.iter().any(|pp| touches(pp, q));
+                if !scheduled_on_q && !pending_on_q {
+                    return err(format!(
+                        "lcycle {}: live hosted q{}'s patch used by another product",
+                        self.current_lcycle, q
+                    ));
+                }
+            }
+            if live
+                && self.cultivation.ready_magic_positions.contains(&self.input.topo.node(x_id).pos)
+            {
+                return err(format!(
+                    "lcycle {}: live hosted q{} counted as a ready magic state",
+                    self.current_lcycle, q
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn hosting(&self) -> bool {
+        !self.input.topo.hosted_qubits.is_empty()
+    }
+
+    /// Counts each hosted qubit's products and makes every hosted qubit dormant. Runs after
+    /// the terminal/root/Clifford-tree precomputation, which therefore saw hosted nodes as
+    /// Data: no precomputed tree or root ever relies on a hosted node.
+    fn init_hosted(&mut self) {
+        let n_products = self.input.circuit.n_products();
+        let hosted_qubits = self.input.topo.hosted_qubits.clone();
+        // A hosted qubit no product touches can lie past the circuit's highest used qubit.
+        let n_qubits = hosted_qubits
+            .iter()
+            .map(|&q| q as usize + 1)
+            .fold(self.input.circuit.n_qubits, usize::max);
+        let h = &mut self.hosted;
+        h.n_initial_products = n_products;
+        h.remaining = vec![0; n_qubits];
+        h.chain = vec![Vec::new(); n_qubits];
+        h.done = vec![0; n_qubits];
+        h.live = vec![false; n_qubits];
+        h.live_lcycles = vec![0; n_qubits];
+        h.activations = vec![0; n_qubits];
+        for id in 0..n_products {
+            for op in &self.input.circuit.product(id as i32).operators {
+                if hosted_qubits.contains(&op.qubit) {
+                    h.remaining[op.qubit as usize] += 1;
+                    h.chain[op.qubit as usize].push(id as i32);
+                }
+            }
+        }
+        for &q in &hosted_qubits {
+            self.input.topo.set_hosted_live(q, false);
+        }
+    }
+
+    /// Route-only halves never cultivate. Called after `init_magic_nodes`.
+    fn mark_route_only_nodes(&mut self) {
+        for &q in &self.input.topo.hosted_qubits.clone() {
+            let z_id = self.input.topo.data_ids[q as usize][1];
+            self.input.topo.cultivation_times[z_id as usize] = NOT_CULTIVATING;
+            self.input.topo.busy_counts[z_id as usize] = 0;
+        }
+    }
+
+    /// Makes dormant hosted qubits touched by products `ids` live: their nodes become
+    /// Data and any cultivation in progress on them is discarded. Runs between lcycles,
+    /// as soon as such a product is ready, so a hosted node is Data whenever a product
+    /// could use it as a terminal.
+    fn activate_hosted_for(&mut self, ids: &[i32]) {
+        for &id in ids {
+            let qubits: Vec<u16> =
+                self.input.circuit.product(id).operators.iter().map(|op| op.qubit).collect();
+            for q in qubits {
+                if !self.input.topo.is_hosted(self.input.topo.data_ids[q as usize][0])
+                    || self.hosted.live[q as usize]
+                {
+                    continue;
+                }
+                self.hosted.live[q as usize] = true;
+                self.hosted.activations[q as usize] += 1;
+                self.input.topo.set_hosted_live(q, true);
+                for node_id in self.input.topo.data_ids[q as usize] {
+                    self.input.topo.cultivation_times[node_id as usize] = NOT_CULTIVATING;
+                    self.input.topo.busy_counts[node_id as usize] = 0;
+                }
+                info_sched!("  hosted ancilla q{} live", q);
+            }
+        }
+    }
+
+    /// True if product `pp`, once complete, leaves patch `q` in a known state that a fresh
+    /// patch can reproduce: a single-patch X or Z measurement (re-prepare the measured
+    /// eigenstate; the outcome goes to the Pauli frame) or a re-initialization `<R>`.
+    /// A Y measurement does not count: preparing a Y eigenstate needs an S gate.
+    fn releases_patch(pp: &PauliProduct, q: u16) -> bool {
+        match pp.operators.as_slice() {
+            [op] if op.qubit == q => {
+                pp.gate_type.is_r() || (pp.gate_type.is_m() && matches!(op.basis, 'X' | 'Z'))
+            }
+            _ => false,
+        }
+    }
+
+    /// Makes hosted qubits dormant after products completed this lcycle: after the qubit's
+    /// last product, or after a product that releases the patch (`releases_patch`) when the
+    /// next product on the qubit is not ready yet. The nodes become Magic, the X node starts
+    /// a fresh cultivation, and any pending S correction is dropped (the state it belonged
+    /// to is gone; the patch is re-prepared when the qubit goes live again).
+    fn retire_hosted(&mut self) {
+        let completed = std::mem::take(&mut self.hosted.completed_buf);
+        for &id in &completed {
+            if id as usize >= self.hosted.n_initial_products {
+                continue; // a scheduler-added S correction, not part of any chain
+            }
+            let qubits: Vec<u16> =
+                self.input.circuit.product(id).operators.iter().map(|op| op.qubit).collect();
+            for q in qubits {
+                let qi = q as usize;
+                if !self.hosted.live.get(qi).copied().unwrap_or(false) {
+                    // A skipped product on a dormant qubit: it is done, but there was no work,
+                    // so the patch stays dormant.
+                    if self.skipped_set.contains(&id) && qi < self.hosted.done.len() {
+                        debug_assert_eq!(
+                            self.hosted.chain[qi].get(self.hosted.done[qi]).copied(),
+                            Some(id),
+                            "hosted q{}: skipped product out of program order",
+                            q
+                        );
+                        self.hosted.done[qi] += 1;
+                        self.hosted.remaining[qi] -= 1;
+                    }
+                    continue;
+                }
+                debug_assert_eq!(
+                    self.hosted.chain[qi].get(self.hosted.done[qi]).copied(),
+                    Some(id),
+                    "hosted q{}: products completed out of program order",
+                    q
+                );
+                self.hosted.done[qi] += 1;
+                self.hosted.remaining[qi] -= 1;
+                let dormant = match self.hosted.chain[qi].get(self.hosted.done[qi]) {
+                    None => true,
+                    Some(&next) => {
+                        self.releases_patch_now(id, q)
+                            && !self.pps_pending.iter().any(|pp| pp.id == next)
+                    }
+                };
+                if !dormant {
+                    continue;
+                }
+                let [x_id, z_id] = self.input.topo.data_ids[qi];
+                debug_assert!(
+                    self.clifford_paths.values().all(|(_, _, nodes, _)| {
+                        !nodes.contains(&x_id) && !nodes.contains(&z_id)
+                    }),
+                    "hosted q{} retired while a Clifford still holds its patch",
+                    q
+                );
+                self.hosted.live[qi] = false;
+                self.input.topo.set_hosted_live(q, false);
+                self.cultivation.restart(&mut self.input.topo, x_id);
+                self.input.topo.cultivation_times[z_id as usize] = NOT_CULTIVATING;
+                self.correction_power[qi] = 0;
+                info_sched!("  hosted ancilla q{} dormant", q);
+            }
+        }
+        self.hosted.completed_buf = completed;
+        self.hosted.completed_buf.clear();
     }
 
     pub(crate) fn count_t_products(&self) -> usize {
@@ -345,14 +1007,31 @@ impl Scheduler {
         self.cultivation
             .set_lambda(self.magic_state_lambda)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let hosting = self.hosting();
+        if hosting {
+            // Precompute while hosted nodes are still Data, then make them dormant (Magic)
+            // so `init_magic_nodes` picks up their cultivators.
+            self.precompute_terminals_and_roots();
+            self.precompute_multi_term_clifford_trees();
+            self.init_hosted();
+        }
         self.init_magic_nodes();
+        if hosting {
+            self.mark_route_only_nodes();
+        }
         let n_t_products = self.count_t_products();
         self.cultivation.t_products_remaining = n_t_products;
         // Pre-generate a large pool: ~120 samples per T gate plus one per topology node.
         self.cultivation.fill_pool(120 * n_t_products.max(1) + self.input.topo.n_nodes);
-        self.precompute_terminals_and_roots();
-        self.precompute_multi_term_clifford_trees();
+        if !hosting {
+            self.precompute_terminals_and_roots();
+            self.precompute_multi_term_clifford_trees();
+        }
         self.pps_pending = self.input.circuit.initial_products().cloned().collect();
+        if hosting {
+            let initial: Vec<i32> = self.pps_pending.iter().map(|pp| pp.id).collect();
+            self.activate_hosted_for(&initial);
+        }
         self.remaining_parents = (0..self.input.circuit.n_products())
             .map(|id| self.input.circuit.product(id as i32).parents.len())
             .collect();
@@ -377,6 +1056,11 @@ impl Scheduler {
             self.timers.start(self.loop_timer);
             self.current_lcycle += 1;
             self.release_delayed_unlocks();
+            for (q, &live) in self.hosted.live.iter().enumerate() {
+                if live {
+                    self.hosted.live_lcycles[q] += 1;
+                }
+            }
             info_sched!(
                 "{}",
                 format!(
@@ -459,7 +1143,10 @@ impl Scheduler {
                 // Only error if T gates are pending: pending Cliffords may just be waiting on a
                 // temporarily-blocked correction S gate and don't need magic to make progress.
                 let has_pending_t = self.pps_pending.iter().any(|pp| pp.gate_type.is_t());
+                let holds_outstanding =
+                    self.holding_now || !self.held.is_empty() || !self.helper_wanted.is_empty();
                 if has_pending_t
+                    && !holds_outstanding
                     && !(0..self.input.topo.n_nodes)
                         .any(|node_i| self.input.topo.is_cultivating(node_i as u16))
                 {
@@ -622,7 +1309,8 @@ impl Scheduler {
                 let is_x = topo.label(term_id).contains('X');
                 for &nb_id in node.nbs_slice() {
                     let nb = topo.node(nb_id);
-                    if !nb.is_routing() {
+                    // A dormant hosted node routes, but can go live at any time: never a root.
+                    if !nb.is_routing() || topo.is_hosted(nb_id) {
                         continue;
                     }
                     if (is_x && nb.pos.1 < node.pos.1) || (!is_x && nb.pos.1 > node.pos.1) {
@@ -634,7 +1322,11 @@ impl Scheduler {
             } else {
                 for &nb_id in node.nbs_slice() {
                     let nb = topo.node(nb_id);
-                    if nb.is_routing() && nb.pos.0 != node.pos.0 && nb.pos.1 == node.pos.1 {
+                    if nb.is_routing()
+                        && !topo.is_hosted(nb_id)
+                        && nb.pos.0 != node.pos.0
+                        && nb.pos.1 == node.pos.1
+                    {
                         preferred.push(nb_id);
                     }
                 }
@@ -662,6 +1354,59 @@ impl Scheduler {
     /// `precomputed_terminals`/`precomputed_root_info` and returning any (qubit, new_basis) swaps.
     /// Always recomputes from the circuit's original operators so changing correction_power
     /// between lcycles is reflected correctly.
+    /// True if product `pp_id`'s basis must be (re)computed against the pending S corrections:
+    /// one of its qubits has an odd correction power, or it was conjugated before and the
+    /// correction has since been resolved.
+    fn conjugation_due(&self, pp_id: i32) -> bool {
+        self.input
+            .circuit
+            .product(pp_id)
+            .operators
+            .iter()
+            .any(|op| self.correction_power[op.qubit as usize] % 2 == 1)
+            || self.conjugated_t_products.contains(&pp_id)
+    }
+
+    /// Re-derives product `pp_id`'s terminals from the pending corrections (`apply_t_conjugation`)
+    /// and records whether it is now conjugated. Returns the qubits whose basis changed.
+    fn refresh_conjugation(&mut self, pp_id: i32) -> Vec<(u16, char)> {
+        let swapped = self.apply_t_conjugation(pp_id);
+        if swapped.is_empty() {
+            self.conjugated_t_products.remove(&pp_id);
+        } else {
+            self.conjugated_t_products.insert(pp_id);
+        }
+        swapped
+    }
+
+    /// True if product `id`, once complete, leaves patch `q` in a state a fresh patch can
+    /// reproduce (`releases_patch`), judged in the basis it was actually measured in: a pending
+    /// odd S correction on `q` turns an X measurement into Y, which does not release the patch.
+    fn releases_patch_now(&self, id: i32, q: u16) -> bool {
+        let pp = self.input.circuit.product(id);
+        if !Self::releases_patch(pp, q) {
+            return false;
+        }
+        if pp.gate_type.is_r() || self.correction_power[q as usize] % 2 == 0 {
+            return true;
+        }
+        let basis =
+            Self::conjugate_pauli_label(pp.operators[0].basis, self.correction_basis[q as usize]);
+        matches!(basis, 'X' | 'Z')
+    }
+
+    /// A re-initialization `<R>` replaces the patch's state, so any S correction still owed to
+    /// the old state is void.
+    fn clear_corrections_on_reinit(&mut self) {
+        for i in 0..self.pp_paths.len() {
+            let pp = self.input.circuit.product(self.pp_paths[i].0);
+            if pp.gate_type.is_r() {
+                let q = pp.operators[0].qubit as usize;
+                self.correction_power[q] = 0;
+            }
+        }
+    }
+
     fn apply_t_conjugation(&mut self, pp_id: i32) -> Vec<(u16, char)> {
         // Copy original operator data to release the borrow on self.input.circuit.
         let orig_ops: Vec<(u16, char)> = self
@@ -734,7 +1479,7 @@ impl Scheduler {
                     let is_x = self.input.topo.label(term_id).contains('X');
                     for &nb_id in node.nbs_slice() {
                         let nb = self.input.topo.node(nb_id);
-                        if !nb.is_routing() {
+                        if !nb.is_routing() || self.input.topo.is_hosted(nb_id) {
                             continue;
                         }
                         if (is_x && nb.pos.1 < node.pos.1) || (!is_x && nb.pos.1 > node.pos.1) {
@@ -747,7 +1492,11 @@ impl Scheduler {
                     // Unpaired terminal: only same-row side nbs are valid roots.
                     for &nb_id in node.nbs_slice() {
                         let nb = self.input.topo.node(nb_id);
-                        if nb.is_routing() && nb.pos.0 != node.pos.0 && nb.pos.1 == node.pos.1 {
+                        if nb.is_routing()
+                            && !self.input.topo.is_hosted(nb_id)
+                            && nb.pos.0 != node.pos.0
+                            && nb.pos.1 == node.pos.1
+                        {
                             preferred.push(nb_id);
                         }
                     }
@@ -798,6 +1547,9 @@ impl Scheduler {
         for (pp_id, node_ids, opt_tree) in clifford_carry {
             self.carry_forward_path(pp_id, &node_ids, opt_tree);
         }
+        if self.t_correction != TCorrection::Legacy {
+            self.hold_t_patches();
+        }
         let carry_forward_count = self.clifford_paths.len();
         let tot_available = carry_forward_count + self.pps_pending.len();
         info_sched!("  Remaining to schedule: {}", self.pps_pending.len());
@@ -817,7 +1569,11 @@ impl Scheduler {
                 // Only panic when T gates couldn't consume available magic; pending Cliffords
                 // whose correction S gate emission failed will simply retry next lcycle.
                 let has_pending_t = self.pps_pending.iter().any(|pp| pp.gate_type.is_t());
-                if has_pending_t {
+                // Patches held after earlier injections can block every route for a few
+                // lcycles; that resolves itself when the holds expire.
+                let holds_outstanding =
+                    self.holding_now || !self.held.is_empty() || !self.helper_wanted.is_empty();
+                if has_pending_t && !holds_outstanding {
                     panic!(
                         "{}",
                         format!(
@@ -860,6 +1616,43 @@ impl Scheduler {
         // before the loop body calls `&mut self` methods.
         let ids_to_process: Vec<i32> = self.remaining_ids_buf.clone();
         for &pp_id in &ids_to_process {
+            // A multi-qubit measurement whose basis a pending S correction changes cannot use
+            // its tree (precomputed for the original basis): route it now, on its conjugated
+            // terminals.
+            if self.input.circuit.product(pp_id).gate_type.is_m()
+                && self.precomputed_clifford_trees.contains_key(&pp_id)
+                && self.conjugation_due(pp_id)
+            {
+                self.refresh_conjugation(pp_id);
+                if self.conjugated_t_products.contains(&pp_id) {
+                    let result = if self.terminal_nodes(pp_id) {
+                        self.sched_t_or_multi(pp_id, plotting)
+                    } else {
+                        PathResult::NoPath
+                    };
+                    match result {
+                        PathResult::PathFound(opt_graph) => {
+                            to_remove.push(pp_id);
+                            if let Some(ref g) = opt_graph {
+                                let node_ids: Vec<u16> = g.iter_nodes().collect();
+                                self.mark_nodes_used(&node_ids);
+                            }
+                            let keep = if plotting { opt_graph.map(Rc::new) } else { None };
+                            self.pp_paths.push((pp_id, keep));
+                        }
+                        PathResult::NoPath => {
+                            let pp = self.input.circuit.product(pp_id);
+                            Self::mark_blocked_product_as_used(
+                                &mut self.used,
+                                &self.input.topo,
+                                pp,
+                            );
+                        }
+                    }
+                    continue;
+                }
+                // The correction no longer changes its basis: the precomputed tree applies.
+            }
             // Clone the Rc to end the immutable borrow on `precomputed_clifford_trees`.
             let Some(tree) = self.precomputed_clifford_trees.get(&pp_id).map(Rc::clone) else {
                 continue;
@@ -937,6 +1730,7 @@ impl Scheduler {
             parents: vec![],
             children: vec![],
             after: Vec::new(),
+            cond: Vec::new(),
             max_qubit: qubit,
         };
         self.input.circuit.pps.push(s_pp);
@@ -1105,23 +1899,12 @@ impl Scheduler {
             }
             // Apply just-in-time S^k conjugation (X<->Y swap for odd power) only when needed;
             // skipping the common case avoids Vec allocations and topology lookups every lcycle.
-            if gate_type.is_t() {
-                let any_odd_correction = self
-                    .input
-                    .circuit
-                    .product(pp_id)
-                    .operators
-                    .iter()
-                    .any(|op| self.correction_power[op.qubit as usize] % 2 == 1);
-                let was_conjugated = self.conjugated_t_products.contains(&pp_id);
-                if any_odd_correction || was_conjugated {
-                    let swapped = self.apply_t_conjugation(pp_id);
-                    if swapped.is_empty() {
-                        self.conjugated_t_products.remove(&pp_id);
-                    } else {
-                        self.conjugated_t_products.insert(pp_id);
-                        self.t_conjugated_bases.insert(pp_id, swapped);
-                    }
+            // A measurement is conjugated like a T: measuring P on the state before a pending
+            // correction S is measuring S^dag P S, and the correction stays pending afterwards.
+            if (gate_type.is_t() || gate_type.is_m()) && self.conjugation_due(pp_id) {
+                let swapped = self.refresh_conjugation(pp_id);
+                if gate_type.is_t() && !swapped.is_empty() {
+                    self.t_conjugated_bases.insert(pp_id, swapped);
                 }
             }
             if *n_avail_magic > 0 || !gate_type.is_t() {
@@ -1147,10 +1930,19 @@ impl Scheduler {
                         let node_ids: Vec<u16> = pp_graph.iter_nodes().collect();
                         self.mark_nodes_used(&node_ids);
                     }
+                    let magic = opt_graph
+                        .as_ref()
+                        .and_then(|g| g.root_node_id)
+                        .unwrap_or(self.astar.last_goal);
                     self.pp_paths.push((pp_id, opt_graph.map(Rc::new)));
                     if gate_type.is_t() {
                         *n_avail_magic -= 1;
                         self.stats.inc_t();
+                        // With T failures switched off (-F) no correction is ever owed, so the
+                        // auto-correction needs no helper and no hold.
+                        if self.t_correction != TCorrection::Legacy && !self.no_t_failures {
+                            self.inject_t(pp_id, magic);
+                        }
                     }
                     continue;
                 }
@@ -1211,19 +2003,12 @@ impl Scheduler {
                     self.input.topo.label(nb_id)
                 );
                 if !self.used[nb_id as usize] {
-                    if !plotting {
-                        self.used[node_id as usize] = true;
-                        self.used[nb_id as usize] = true;
-                        self.stats.inc_with_cultivation(
-                            node.node_type,
-                            self.input.topo.cultivation_times[node_id as usize],
-                        );
-                        self.stats.inc_with_cultivation(
-                            nb.node_type,
-                            self.input.topo.cultivation_times[nb_id as usize],
-                        );
-                        return PathResult::PathFound(None);
-                    }
+                    // Always return the two-node tree, plotting or not: an S/SX holds its
+                    // data node and this ancilla for all 3 of its lcycles, and
+                    // advance_clifford_state takes the nodes to hold from this tree. (A
+                    // single-qubit S/SX has no precomputed tree, so returning None here left
+                    // its nodes free in lcycles 2-3 whenever paths were not being plotted.)
+                    let _ = plotting;
                     let mut g = TreeGraph::new(self.input.topo.n_nodes);
                     g.add_node(node, self.input.topo.label(node_id));
                     g.add_node(nb, self.input.topo.label(nb_id));
@@ -1257,7 +2042,8 @@ impl Scheduler {
             )
         } else {
             debug_assert!(
-                !Self::should_precompute(self.input.circuit.product(pp_id)),
+                !Self::should_precompute(self.input.circuit.product(pp_id))
+                    || self.conjugated_t_products.contains(&pp_id),
                 "should_precompute product {:?} reached Steiner path",
                 pp_id
             );
@@ -1283,6 +2069,10 @@ impl Scheduler {
     /// advance Clifford state, and process T-gate coin-flip outcomes.
     fn complete_lcycle(&mut self) -> io::Result<()> {
         let _timer = accum_start!(self.timers);
+        #[cfg(debug_assertions)]
+        if self.hosting() {
+            self.check_hosted_lcycle()?;
+        }
         self.scheduled_ids_buf.clear();
         self.scheduled_ids_buf.extend(self.pp_paths.iter().map(|(id, _)| *id));
         self.pps_pending.retain(|pp| !self.scheduled_ids_buf.contains(&pp.id));
@@ -1295,7 +2085,10 @@ impl Scheduler {
         self.cultivation.t_products_remaining =
             self.cultivation.t_products_remaining.saturating_sub(t_newly_scheduled);
         self.process_t_gate_outcomes();
+        self.clear_corrections_on_reinit();
         self.unlock_children();
+        let ready = std::mem::take(&mut self.children_buf);
+        self.children_buf = self.admit(ready);
         self.advance_clifford_state();
         debug_sched!(
             "After inserting previous lcycle cliffords, pps_to_sched len {}",
@@ -1303,6 +2096,13 @@ impl Scheduler {
         );
         self.pps_pending
             .extend(self.children_buf.iter().map(|&id| self.input.circuit.product(id).clone()));
+        if self.hosting() {
+            // advance_clifford_state has released finished Cliffords' paths, so a hosted
+            // patch whose last product just completed is free to go dormant.
+            self.retire_hosted();
+            let children = self.children_buf.clone();
+            self.activate_hosted_for(&children);
+        }
         debug_sched!(
             "After adding {} children, pps_to_sched len {}",
             self.children_buf.len(),
@@ -1330,8 +2130,28 @@ impl Scheduler {
             }
             if self.no_t_failures || self.rng_uniform.gen_bool(0.5) {
                 info_sched!("  T gate {} succeeded", pp_id);
+                self.inplace_pending.remove(&pp_id);
             } else {
                 self.t_gate_failures += 1;
+                if self.t_correction != TCorrection::Legacy {
+                    // Auto-corrected: the correction is a choice of ancilla measurement basis, so
+                    // nothing is owed on the data. A magic patch measured in place needs the
+                    // slower Y basis; one still waiting for a helper remembers the failure.
+                    info_sched!("  T gate {} failed (50% probability), auto-corrected", pp_id);
+                    if let Some((magic, decision)) = self.inplace_pending.remove(&pp_id) {
+                        let y = self.y_meas_lcycles;
+                        self.t_stats.inplace_y += 1;
+                        self.delay_decision(pp_id, y);
+                        // Already held through `decision`; extend by the Y measurement.
+                        let now = self.current_lcycle;
+                        let start = decision.max(now);
+                        self.held.push((decision + y, magic));
+                        self.t_stats.hold_patch_lcycles += decision + y - start;
+                    } else if self.helper_wanted.iter().any(|w| w.0 == pp_id) {
+                        self.failed_waiting.insert(pp_id);
+                    }
+                    continue;
+                }
                 info_sched!("  T gate {} failed (50% probability), S correction tracked", pp_id);
                 // Each failed qubit's S^k power increments, using the conjugated basis
                 // recorded in sched_remaining.
@@ -1383,6 +2203,9 @@ impl Scheduler {
             }
             // Free-merged S products (see try_merge_s_correction) are single-lcycle,
             // zero-node events - fall straight through to unlocking their children.
+            if !self.hosted.live.is_empty() {
+                self.hosted.completed_buf.push(pp_id); // pp_id completes this lcycle
+            }
             let children: Vec<i32> = self.input.circuit.product(pp_id).children.clone();
             for child_id in children {
                 // A classical edge (the child's `@` list names this product) is held back by the
@@ -1390,7 +2213,8 @@ impl Scheduler {
                 if self.reaction_latency > 0
                     && self.input.circuit.product(child_id).after.contains(&pp_id)
                 {
-                    self.delayed_unlocks.push((self.current_lcycle + self.reaction_latency, child_id));
+                    self.delayed_unlocks
+                        .push((self.current_lcycle + self.reaction_latency, child_id));
                     continue;
                 }
                 self.remaining_parents[child_id as usize] -= 1;
@@ -1447,7 +2271,7 @@ impl Scheduler {
 
     fn print_sched_stats(&mut self, n_lcycles: usize) {
         self.stats.summarize(n_lcycles);
-        let tot_t = self.count_t_products();
+        let tot_t = self.count_t_products() - self.n_skipped_t;
         let fail_pct =
             if tot_t > 0 { 100.0 * self.t_gate_failures as f64 / tot_t as f64 } else { 0.0 };
         println!("Magic state cultivation time:");
@@ -1460,6 +2284,39 @@ impl Scheduler {
         println!("  min:     {}", min);
         println!("  max:     {}", max);
         println!("T gate failures: {}/{} ({:.1}%)", self.t_gate_failures, tot_t, fail_pct);
+        match self.t_correction {
+            TCorrection::Legacy => println!("T correction: legacy (per-qubit S record)"),
+            mode => println!(
+                "T correction: {:?}; {} injections, {} helper patches ({} waited for one, {} \
+                 found none), {} patch-lcycles held, max decision delay {} lcycles, {} measured \
+                 in place ({} in Y)",
+                mode,
+                self.t_stats.injections,
+                self.t_stats.helpers,
+                self.t_stats.helpers_deferred,
+                self.t_stats.helpers_missing,
+                self.t_stats.hold_patch_lcycles,
+                self.t_stats.max_decision_delay,
+                self.t_stats.inplace,
+                self.t_stats.inplace_y
+            ),
+        }
+        let n_cond = self.n_conditional();
+        if n_cond > 0 {
+            match self.cond_outcomes {
+                CondOutcomes::Worst => {
+                    println!("Conditional products: {} (all run: --cond-outcomes worst)", n_cond)
+                }
+                CondOutcomes::Random => println!(
+                    "Conditional products: {}, skipped {} ({} T) on {} sampled outcome(s), p1={}",
+                    n_cond,
+                    self.skipped.len(),
+                    self.n_skipped_t,
+                    self.outcomes.len(),
+                    self.cond_p1
+                ),
+            }
+        }
         println!("Steiner tree computation called {} times", self.stree_computation.n_calls);
         println!("A* computation called {} times", self.astar.n_calls);
 
@@ -1505,7 +2362,10 @@ impl Scheduler {
                 ));
             }
             for &parent_id in &pp.parents {
-                if !self.scheduled_products.contains(&parent_id) {
+                // A skipped conditional parent completed without being scheduled.
+                if !self.scheduled_products.contains(&parent_id)
+                    && !self.skipped_set.contains(&parent_id)
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
                         format!("product {} scheduled before parent {}", pp_id, parent_id),
@@ -1625,8 +2485,14 @@ impl Scheduler {
         let n_products = self.input.circuit.n_products();
         let mut errors: Vec<String> = Vec::new();
         for pp_id in 0..n_products as i32 {
-            if !self.scheduled_products.contains(&pp_id) {
+            let scheduled = self.scheduled_products.contains(&pp_id);
+            let skipped = self.skipped_set.contains(&pp_id);
+            if !scheduled && !skipped {
                 errors.push(format!("  product {} was never scheduled", pp_id));
+            } else if scheduled && skipped {
+                errors.push(format!("  product {} was both scheduled and skipped", pp_id));
+            } else if skipped && self.input.circuit.product(pp_id).cond.is_empty() {
+                errors.push(format!("  unconditional product {} was skipped", pp_id));
             }
         }
         if !errors.is_empty() {
@@ -1635,7 +2501,11 @@ impl Scheduler {
                 format!("Completeness errors:\n{}", errors.join("\n")),
             ));
         }
-        println!("Schedule check passed: all {} products scheduled", n_products);
+        println!(
+            "Schedule check passed: all {} products scheduled or skipped ({} skipped)",
+            n_products,
+            self.skipped.len()
+        );
         Ok(())
     }
 
@@ -1656,6 +2526,23 @@ impl Scheduler {
         writeln!(buf_f, "# Total logical cycles: {}", max_lcycle)?;
         writeln!(buf_f, "# Total products: {}", tot_products)?;
         writeln!(buf_f, "# Parallelism: {:.2}", tot_products as f64 / max_lcycle as f64)?;
+        if self.n_conditional() > 0 {
+            // Read by plot_dynamic.py to check that exactly the failing conditions were skipped.
+            let mode = match self.cond_outcomes {
+                CondOutcomes::Random => "random",
+                CondOutcomes::Worst => "worst",
+            };
+            writeln!(buf_f, "# cond_outcomes: {} p1={}", mode, self.cond_p1)?;
+            let mut outs: Vec<(i32, bool)> = self.outcomes.iter().map(|(&m, &o)| (m, o)).collect();
+            outs.sort_unstable();
+            let outs: Vec<String> =
+                outs.iter().map(|(m, o)| format!("{}={}", m, *o as u8)).collect();
+            writeln!(buf_f, "# outcomes: {}", outs.join(" "))?;
+            let mut skipped = self.skipped.clone();
+            skipped.sort_unstable();
+            let skipped: Vec<String> = skipped.iter().map(|id| id.to_string()).collect();
+            writeln!(buf_f, "# skipped: {}", skipped.join(" "))?;
+        }
 
         let colors = [
             Color::Green,
@@ -2052,6 +2939,62 @@ mod tests {
         }
     }
 
+    // ── hosted ancillas (--ancilla-qubits) ────────────────────────────────────────
+
+    fn hosted_scheduler(lines: &[&str], hosted: &[u16], rseed: u32) -> Scheduler {
+        Node::set_magic_routing(true);
+        let mut f = NamedTempFile::new().unwrap();
+        for line in lines {
+            writeln!(f, "{}", line).unwrap();
+        }
+        let fname = f.path().to_string_lossy().to_string();
+        let mut circuit = Circuit::new(&fname);
+        circuit.load_circuit().expect("circuit load failed");
+        let mut topo = TopoGraph::new();
+        topo.set_topo(4, &"dummy".to_string(), &"".to_string(), &0, true, 1, false);
+        topo.host_qubits(hosted).expect("host_qubits failed");
+        Scheduler::new(circuit, topo, 0.0387396, "none", String::new(), rseed, false, false)
+    }
+
+    /// The first steps of `sched_circuit` with hosting on, without the scheduling loop.
+    fn init_hosting_only(sched: &mut Scheduler) {
+        sched.cultivation.set_lambda(sched.magic_state_lambda).unwrap();
+        sched.precompute_terminals_and_roots();
+        sched.precompute_multi_term_clifford_trees();
+        sched.init_hosted();
+        sched.init_magic_nodes();
+        sched.mark_route_only_nodes();
+        sched.cultivation.t_products_remaining = sched.count_t_products();
+        sched.cultivation.fill_pool(1000);
+    }
+
+    const HOSTED_LINES: &[&str] = &[
+        "+X___<T>",
+        "-___X<T>",
+        "+_X__<T>",
+        "+XX__<CX>",
+        "-__X_<T>",
+        "+___Z<T>",
+        "+_X_X<T>",
+        "+X___<T>",
+        "-_Z__<S>",
+        "+__XX<CX>",
+        "+X___<T>",
+        "-_X__<T>",
+        "+__Y_<T>",
+    ];
+
+    #[test]
+    fn hosting_nothing_matches_stock_schedule() {
+        let lines = HOSTED_LINES;
+        for rseed in [0u32, 7, 29] {
+            let stock = run_scheduler(lines, rseed);
+            let mut empty = hosted_scheduler(lines, &[], rseed);
+            empty.sched_circuit().unwrap();
+            assert_eq!(stock.lcycle_scheduled, empty.lcycle_scheduled, "rseed {}", rseed);
+        }
+    }
+
     #[test]
     fn reaction_latency_leaves_independent_products_alone() {
         // Product 1 has no `@`: the latency must not touch it, nor a plain qubit-overlap edge.
@@ -2082,5 +3025,515 @@ mod tests {
         let (tot, n) = sched.sched_circuit().expect("sched_circuit failed");
         assert_eq!(n, 2);
         assert_eq!(tot, 12);
+    }
+
+    #[test]
+    fn dormant_hosted_qubit_cultivates_with_one_node() {
+        // q3 has no products: hosted, it is a cultivator for the whole run.
+        let lines = &["+X___<T>", "-_X__<T>", "+XX__<CX>", "+__X_<T>", "-X___<T>"];
+        let mut sched = hosted_scheduler(lines, &[3], 1);
+        sched.sched_circuit().unwrap();
+        let [x_id, z_id] = sched.input.topo.data_ids[3];
+        assert!(sched.cultivation.magic_node_ids.contains(&x_id), "X half must cultivate");
+        assert!(!sched.cultivation.magic_node_ids.contains(&z_id), "Z half only routes");
+        assert_eq!(sched.input.topo.node(x_id).node_type, NodeType::Magic);
+        assert_eq!(sched.input.topo.node(z_id).node_type, NodeType::Magic);
+        assert_eq!(sched.input.topo.cultivation_times[z_id as usize], NOT_CULTIVATING);
+        assert_eq!(sched.hosted_activations(3), 0);
+        assert_eq!(sched.hosted_live_lcycles(3), 0);
+    }
+
+    #[test]
+    fn live_hosted_qubit_is_never_a_ready_magic_state() {
+        let mut sched = hosted_scheduler(HOSTED_LINES, &[3], 2);
+        init_hosting_only(&mut sched);
+        let [x_id, z_id] = sched.input.topo.data_ids[3];
+        // Let q3's cultivator become ready while dormant, then make q3 live.
+        sched.input.topo.cultivation_times[x_id as usize] = 0;
+        let n_ready_dormant = sched.update_cultivators();
+        let x_pos = sched.input.topo.node(x_id).pos;
+        assert!(sched.cultivation.ready_magic_positions.contains(&x_pos));
+        sched.activate_hosted_for(&[1]); // product 1 is on q3
+        assert!(sched.hosted.live[3]);
+        assert_eq!(sched.input.topo.node(x_id).node_type, NodeType::Data);
+        assert_eq!(sched.input.topo.node(z_id).node_type, NodeType::Data);
+        for _ in 0..50 {
+            let n_ready = sched.update_cultivators();
+            assert!(!sched.cultivation.ready_magic_positions.contains(&x_pos));
+            assert!(n_ready < sched.cultivation.magic_node_ids.len());
+        }
+        assert!(n_ready_dormant >= 1);
+        assert!(!sched.input.topo.is_cultivating(x_id) && !sched.input.topo.is_cultivating(z_id));
+    }
+
+    #[test]
+    fn retiring_hosted_qubit_restarts_cultivation() {
+        let mut sched = hosted_scheduler(HOSTED_LINES, &[3], 3);
+        init_hosting_only(&mut sched);
+        let [x_id, z_id] = sched.input.topo.data_ids[3];
+        sched.activate_hosted_for(&[1]);
+        // Complete every product on q3 except the last: still live.
+        let on_q3: Vec<i32> = (0..HOSTED_LINES.len() as i32)
+            .filter(|&id| sched.input.circuit.product(id).operators.iter().any(|op| op.qubit == 3))
+            .collect();
+        sched.hosted.completed_buf.extend_from_slice(&on_q3[..on_q3.len() - 1]);
+        sched.retire_hosted();
+        assert!(sched.hosted.live[3]);
+        sched.hosted.completed_buf.push(*on_q3.last().unwrap());
+        sched.retire_hosted();
+        assert!(!sched.hosted.live[3]);
+        assert_eq!(sched.input.topo.node(x_id).node_type, NodeType::Magic);
+        assert_eq!(sched.input.topo.busy_counts[x_id as usize], 0);
+        assert!(sched.input.topo.cultivation_times[x_id as usize] >= 0, "fresh draw on X");
+        assert_eq!(sched.input.topo.cultivation_times[z_id as usize], NOT_CULTIVATING);
+    }
+
+    const T_HEAVY_LINES: &[&str] = &[
+        "+ZZ__<T>", "+X___<T>", "+_XX_<T>", "-Z__Z<T>", "+_Y__<T>", "+XXXX<T>", "+Z___<T>",
+        "+__ZZ<T>", "-_X__<T>", "+X__X<T>", "+ZZZZ<T>", "+_Z_X<T>", "+X___<M>", "+_Z__<M>",
+        "+__X_<M>", "+___Z<M>",
+    ];
+
+    #[test]
+    fn litinski_leaves_every_later_product_unchanged() {
+        for rseed in 0u32..8 {
+            let mut sched = build_scheduler(T_HEAVY_LINES, rseed);
+            sched.set_reaction_latency(2);
+            let n_products = sched.input.circuit.n_products();
+            let (_, n) = sched.sched_circuit().expect("sched_circuit failed");
+            assert!(sched.t_gate_failures > 0, "seed {}: want some failures", rseed);
+            assert_eq!(n, n_products, "seed {}: no correction products may be added", rseed);
+            assert!(
+                sched.t_conjugated_bases.is_empty(),
+                "seed {}: a product was relabelled",
+                rseed
+            );
+            assert!(sched.correction_power.iter().all(|&p| p == 0));
+            assert_eq!(sched.t_stats.injections, 12);
+        }
+    }
+
+    #[test]
+    fn litinski_helpers_are_free_neighbours_and_holds_are_respected() {
+        for latency in [0usize, 1, 3] {
+            for rseed in 0u32..8 {
+                let mut sched = build_scheduler(T_HEAVY_LINES, rseed);
+                sched.set_reaction_latency(latency);
+                sched.sched_circuit().expect("sched_circuit failed");
+                let st = &sched.t_stats;
+                assert_eq!(st.helpers + st.helpers_missing, st.injections);
+                let topo = &sched.input.topo;
+                for &(t, magic, h) in &st.helper_log {
+                    assert!(topo.node(magic).nbs_slice().contains(&h), "helper not adjacent");
+                    assert_ne!(topo.node(h).node_type, NodeType::Data, "helper on a data patch");
+                    // The magic patch is held until its helper arrives (lcycle t); the helper
+                    // until the decision d. Neither may serve another T as its magic state then.
+                    let (t0, _, _, d) =
+                        *st.injection_log.iter().rev().find(|e| e.2 == magic && e.0 <= t).unwrap();
+                    for &(t1, pp, m1, _) in &st.injection_log {
+                        if t1 > t0 && t1 <= t {
+                            assert_ne!(m1, magic, "magic patch reused while held (T {})", pp);
+                        }
+                        if t1 >= t && t1 <= d {
+                            assert_ne!(m1, h, "helper used as a magic state while held");
+                        }
+                    }
+                }
+                // Holds: one helper per injection for its decision delay, plus the lcycles a
+                // magic patch waited for a helper (or held in place when none was found).
+                let min_hold: usize = st.injection_log.iter().map(|&(t, _, _, d)| d - t).sum();
+                assert!(
+                    st.hold_patch_lcycles >= min_hold,
+                    "L={} seed={} held {} < {} (helpers {} waited {} missing {})",
+                    latency,
+                    rseed,
+                    st.hold_patch_lcycles,
+                    min_hold,
+                    st.helpers,
+                    st.helpers_deferred,
+                    st.helpers_missing
+                );
+                for &(t, pp, magic, d) in &st.injection_log {
+                    assert!(d >= t + latency, "T {} decided before its outcome is decoded", pp);
+                    assert_eq!(topo.node(magic).node_type, NodeType::Magic);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inplace_y_holds_the_magic_patch_and_adds_y_time_for_failures() {
+        for (latency, y) in [(0usize, 1usize), (1, 1), (3, 2)] {
+            for rseed in 0u32..8 {
+                let mut sched = build_scheduler(T_HEAVY_LINES, rseed);
+                sched.set_t_correction(TCorrection::InplaceY);
+                sched.set_reaction_latency(latency);
+                sched.set_y_meas_lcycles(y);
+                let n_products = sched.input.circuit.n_products();
+                let (_, n) = sched.sched_circuit().expect("sched_circuit failed");
+                let st = &sched.t_stats;
+                assert_eq!(n, n_products);
+                assert!(sched.t_conjugated_bases.is_empty());
+                assert_eq!(st.helpers, 0, "in-place Y never borrows a helper");
+                assert_eq!(st.inplace, st.injections);
+                assert_eq!(st.inplace_y, sched.t_gate_failures, "one Y measurement per failure");
+                // Each magic patch is held from injection to decision, plus y if it failed.
+                let base: usize = st.injection_log.iter().map(|&(t, _, _, d)| d - t).sum();
+                assert_eq!(st.hold_patch_lcycles, base + y * st.inplace_y);
+                // A held magic patch never serves another T before its decision.
+                for &(t0, _, m0, d0) in &st.injection_log {
+                    for &(t1, pp, m1, _) in &st.injection_log {
+                        if t1 > t0 && t1 <= d0 {
+                            assert_ne!(m1, m0, "magic patch reused while held (T {})", pp);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inplace_y_failure_delays_the_next_anticommuting_decision() {
+        // Z then X on qubit 0: X's decision waits for Z's frame bit, which a Y measurement
+        // (a failed Z) delivers y lcycles later.
+        for rseed in 0u32..16 {
+            let mut sched = build_scheduler(&["+Z___<T>", "+X___<T>"], rseed);
+            sched.set_t_correction(TCorrection::InplaceY);
+            sched.set_reaction_latency(2);
+            sched.set_y_meas_lcycles(3);
+            sched.sched_circuit().expect("sched_circuit failed");
+            let log = &sched.t_stats.injection_log;
+            let (t0, _, _, d0) = log[0];
+            let (t1, _, _, d1) = log[1];
+            assert_eq!(d0, t0 + 2);
+            assert!(d1 == (t1 + 2).max(d0 + 2) || d1 == (t1 + 2).max(d0 + 3 + 2));
+        }
+    }
+
+    #[test]
+    fn litinski_decisions_chain_only_through_anticommuting_t_gates() {
+        // Z then X on qubit 0 anticommute: X's correction depends on Z's frame bit.
+        let mut sched = build_scheduler(&["+Z___<T>", "+X___<T>"], 3);
+        sched.set_reaction_latency(2);
+        sched.sched_circuit().expect("sched_circuit failed");
+        let log = &sched.t_stats.injection_log;
+        assert_eq!(log.len(), 2);
+        let (t0, _, _, d0) = log[0];
+        let (t1, _, _, d1) = log[1];
+        assert_eq!(d0, t0 + 2);
+        assert_eq!(d1, (t1 + 2).max(d0 + 2));
+        // Z then Z commute: each decision is just its own decoding delay.
+        let mut sched = build_scheduler(&["+Z___<T>", "+Z___<T>"], 3);
+        sched.set_reaction_latency(2);
+        sched.sched_circuit().expect("sched_circuit failed");
+        for &(t, _, _, d) in &sched.t_stats.injection_log {
+            assert_eq!(d, t + 2);
+        }
+    }
+
+    #[test]
+    fn legacy_mode_still_tracks_per_qubit_corrections() {
+        // The old model stays available for comparison: some seed must relabel a product.
+        let relabelled = (0u32..16).any(|rseed| {
+            let lines = &["+Z___<T>", "+X___<T>", "+Y___<T>", "+Z___<T>"];
+            let mut sched = build_scheduler(lines, rseed);
+            sched.set_t_correction(TCorrection::Legacy);
+            sched.sched_circuit().expect("sched_circuit failed");
+            assert_eq!(sched.t_stats.injections, 0);
+            !sched.t_conjugated_bases.is_empty()
+        });
+        assert!(relabelled);
+    }
+
+    #[test]
+    fn hosted_schedules_satisfy_invariants() {
+        // check_lcycle, check_schedule and check_hosted_lcycle all run in debug builds.
+        for hosted in [&[0u16][..], &[3], &[1, 3], &[0, 1, 2, 3]] {
+            for rseed in 0u32..6 {
+                let mut sched = hosted_scheduler(HOSTED_LINES, hosted, rseed);
+                let (lcycles, n) = sched.sched_circuit().expect("hosted schedule failed");
+                assert!(n >= HOSTED_LINES.len());
+                for &q in hosted {
+                    assert!(!sched.hosted.live[q as usize], "q{} still live at the end", q);
+                    assert_eq!(sched.hosted.remaining[q as usize], 0);
+                    assert_eq!(sched.hosted_activations(q), 1, "static circuit: one live window");
+                    assert!(sched.hosted_live_lcycles(q) <= lcycles);
+                }
+                let mut seen = std::collections::HashSet::new();
+                for (_, ids) in &sched.lcycle_scheduled {
+                    for &id in ids {
+                        if (id as usize) < HOSTED_LINES.len()
+                            && !sched.input.circuit.product(id).gate_type.is_clifford()
+                        {
+                            assert!(seen.insert(id), "product {} scheduled twice", id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hosted_qubit_goes_dormant_after_its_last_product() {
+        // q3 is used only at the start; the rest of the circuit runs long after.
+        let mut lines = vec!["+___X<T>", "-___Z<T>"];
+        lines.extend(std::iter::repeat("+X___<T>").take(30));
+        let mut sched = hosted_scheduler(&lines, &[3], 4);
+        let (lcycles, _) = sched.sched_circuit().unwrap();
+        let live = sched.hosted_live_lcycles(3);
+        assert!(live > 0 && live < lcycles / 2, "live {} of {} lcycles", live, lcycles);
+    }
+
+    #[test]
+    fn hosted_patch_sleeps_between_a_measurement_and_its_next_use() {
+        // q3: T, Z-measure (releases the patch), then reused only after q0's long chain.
+        let mut lines = vec!["+___X<T>", "+___Z<M>"];
+        lines.extend(std::iter::repeat("+X___<T>").take(30));
+        lines.push("+X__X<T>");
+        let mut sched = hosted_scheduler(&lines, &[3], 5);
+        let (lcycles, _) = sched.sched_circuit().expect("hosted schedule failed");
+        assert_eq!(sched.hosted_activations(3), 2, "one window per use");
+        let live = sched.hosted_live_lcycles(3);
+        assert!(live < lcycles / 2, "live {} of {} lcycles", live, lcycles);
+        assert!(!sched.hosted.live[3]);
+    }
+
+    #[test]
+    fn hosted_patch_stays_live_through_a_y_or_multi_patch_measurement() {
+        for meas in ["+___Y<M>", "+__ZZ<M>"] {
+            let mut lines = vec!["+___X<T>", meas];
+            lines.extend(std::iter::repeat("+X___<T>").take(30));
+            lines.push("+X__X<T>");
+            let mut sched = hosted_scheduler(&lines, &[3], 5);
+            sched.sched_circuit().expect("hosted schedule failed");
+            assert_eq!(sched.hosted_activations(3), 1, "{} must not release q3", meas);
+        }
+    }
+
+    #[test]
+    fn hosted_patch_stays_live_when_the_next_product_is_already_ready() {
+        // The T after the measurement is ready as soon as the measurement completes.
+        let lines = &["+___Z<M>", "+___X<T>", "+X___<T>"];
+        let mut sched = hosted_scheduler(lines, &[3], 6);
+        sched.sched_circuit().expect("hosted schedule failed");
+        assert_eq!(sched.hosted_activations(3), 1);
+    }
+
+    #[test]
+    fn hosted_patch_sleeps_through_reaction_latency_and_wakes_on_release() {
+        // q3's next product needs q0's outcome: it is held back by the latency.
+        let lines = &["+___Z<M>", "+Z___<M>", "+___X<T>@1"];
+        let mut sched = hosted_scheduler(lines, &[3], 7);
+        sched.set_reaction_latency(6);
+        sched.sched_circuit().expect("hosted schedule failed");
+        assert_eq!(sched.hosted_activations(3), 2);
+        assert!(!sched.hosted.live[3]);
+    }
+
+    #[test]
+    fn releasing_a_hosted_patch_drops_its_pending_correction() {
+        let lines = &["+___X<T>", "+___Z<M>", "+X___<T>", "+X__X<T>"];
+        let mut sched = hosted_scheduler(lines, &[3], 8);
+        init_hosting_only(&mut sched);
+        sched.activate_hosted_for(&[0]);
+        // About Z, so the Z measurement stays a Z measurement and still releases the patch
+        // (an S_X correction would make it a Y measurement, which does not).
+        sched.correction_power[3] = 1;
+        sched.correction_basis[3] = 'Z';
+        sched.hosted.completed_buf.extend_from_slice(&[0, 1]); // T, then the releasing M
+        sched.retire_hosted();
+        assert!(!sched.hosted.live[3]);
+        assert_eq!(sched.correction_power[3], 0);
+    }
+
+    // ── conditional products (`?id=v` suffix, --cond-outcomes) ────────────────────
+
+    /// q0 is measured; q1 then gets an S if the outcome is 1, or a T if it is 0; an
+    /// unconditional T on q1 follows both.
+    const COND_CIRCUIT: [&str; 5] =
+        ["+X___<T>", "+Z___<M>", "+_Z__<S>@1?1=1", "+_Z__<T>@1?1=0", "+_X__<T>"];
+
+    fn cond_run(
+        lines: &[&str], mode: CondOutcomes, p1: f64, latency: usize, rseed: u32,
+    ) -> Scheduler {
+        let mut sched = build_scheduler(lines, rseed);
+        sched.set_reaction_latency(latency);
+        sched.set_cond_outcomes(mode, p1);
+        sched.sched_circuit().expect("sched_circuit failed");
+        sched
+    }
+
+    fn ran(sched: &Scheduler, id: i32) -> bool {
+        sched.lcycle_scheduled.iter().any(|(_, ids)| ids.contains(&id))
+    }
+
+    #[test]
+    fn worst_mode_runs_every_conditional_product() {
+        let sched = cond_run(&COND_CIRCUIT, CondOutcomes::Worst, 0.5, 2, 3);
+        assert!(sched.skipped.is_empty());
+        assert!(sched.outcomes.is_empty(), "worst mode samples nothing");
+        assert!((0..5).all(|id| ran(&sched, id)));
+    }
+
+    #[test]
+    fn random_mode_skips_exactly_the_failing_branch() {
+        // p1 = 1: the outcome is 1, so the S (=1) runs and the T (=0) is skipped; p1 = 0: reverse.
+        for (p1, runs, skips) in [(1.0, 2, 3), (0.0, 3, 2)] {
+            let sched = cond_run(&COND_CIRCUIT, CondOutcomes::Random, p1, 2, 3);
+            assert_eq!(sched.outcomes.get(&1).copied(), Some(p1 == 1.0));
+            assert_eq!(sched.skipped, vec![skips], "p1 {}", p1);
+            assert!(ran(&sched, runs) && !ran(&sched, skips), "p1 {}", p1);
+            assert!(ran(&sched, 4), "the unconditional successor still runs");
+        }
+    }
+
+    #[test]
+    fn skipped_product_releases_its_successor_at_once() {
+        // The conditional S takes 3 lcycles when it runs; skipped, the measurement after it on
+        // q1 starts the lcycle the S is released (no lcycle is spent on the S).
+        let lines = ["+Z___<M>", "+_Z__<S>@0?0=1", "+_X__<M>"];
+        for latency in [0usize, 4] {
+            let skip = cond_run(&lines, CondOutcomes::Random, 0.0, latency, 1);
+            let worst = cond_run(&lines, CondOutcomes::Worst, 0.5, latency, 1);
+            assert_eq!(skip.skipped, vec![1]);
+            assert_eq!(lcycle_of(&worst, 1), 2 + latency);
+            assert_eq!(lcycle_of(&skip, 2), 2 + latency, "latency {}", latency);
+            assert_eq!(lcycle_of(&worst, 2), 5 + latency, "latency {}", latency);
+        }
+    }
+
+    #[test]
+    fn outcome_sampling_leaves_an_unconditional_schedule_unchanged() {
+        // Outcomes use their own random stream, so cultivation and T-failure draws (and hence
+        // the schedule of a circuit without conditions) are the same in every mode.
+        let lines = ["+X___<T>", "+Z___<M>", "+_Z__<T>@1", "+XZ__<T>", "+__X_<T>", "+_Z_Z<T>"];
+        let a = cond_run(&lines, CondOutcomes::Worst, 0.5, 2, 9);
+        let b = cond_run(&lines, CondOutcomes::Random, 0.3, 2, 9);
+        assert_eq!(a.lcycle_scheduled, b.lcycle_scheduled);
+        assert_eq!(a.t_gate_failures, b.t_gate_failures);
+    }
+
+    #[test]
+    fn random_outcomes_are_deterministic_per_seed() {
+        let lines = ["+Z___<M>", "+_Z__<M>", "+__Z_<S>@0?0=1", "+___Z<S>@1?1=0", "+__X_<T>"];
+        let a = cond_run(&lines, CondOutcomes::Random, 0.5, 1, 11);
+        let b = cond_run(&lines, CondOutcomes::Random, 0.5, 1, 11);
+        assert_eq!(a.outcomes, b.outcomes);
+        assert_eq!(a.skipped, b.skipped);
+        assert_eq!(a.lcycle_scheduled, b.lcycle_scheduled);
+    }
+
+    #[test]
+    fn multi_term_condition_needs_every_term_and_samples_them_all() {
+        // Runs only if q0 gave 1 and q1 gave 0. With p1 = 1 or 0 one term always fails.
+        let lines = ["+Z___<M>", "+_Z__<M>", "+__Z_<S>@0,1?0=1,1=0", "+__X_<M>"];
+        for p1 in [0.0, 1.0] {
+            let sched = cond_run(&lines, CondOutcomes::Random, p1, 1, 2);
+            assert_eq!(sched.skipped, vec![2], "p1 {}", p1);
+            assert_eq!(sched.outcomes.len(), 2, "both terms sampled");
+            assert!(ran(&sched, 3));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "not in its @ list")]
+    fn condition_outside_the_at_list_is_rejected() {
+        build_scheduler(&["+Z___<M>", "+_Z__<S>?0=1"], 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a measurement")]
+    fn condition_on_a_non_measurement_is_rejected() {
+        build_scheduler(&["+Z___<T>", "+_Z__<S>@0?0=1"], 0);
+    }
+
+    #[test]
+    fn skipped_product_on_a_dormant_hosted_qubit_keeps_it_dormant() {
+        // q3's only product is a conditional S that is skipped: q3 never goes live.
+        let mut lines = vec!["+Z___<M>", "+___Z<S>@0?0=1"];
+        lines.extend(std::iter::repeat("+X___<T>").take(10));
+        let mut sched = hosted_scheduler(&lines, &[3], 6);
+        sched.set_cond_outcomes(CondOutcomes::Random, 0.0);
+        sched.sched_circuit().expect("hosted schedule failed");
+        assert_eq!(sched.skipped, vec![1]);
+        assert_eq!(sched.hosted_activations(3), 0);
+        assert_eq!(sched.hosted.remaining[3], 0);
+    }
+
+    #[test]
+    fn hosted_qubit_wakes_for_the_product_after_a_skipped_one() {
+        // q3: a skipped conditional S, then a real T: one live window, for the T only.
+        let mut lines = vec!["+Z___<M>", "+___Z<S>@0?0=1", "+___X<T>"];
+        lines.extend(std::iter::repeat("+X___<T>").take(10));
+        let mut sched = hosted_scheduler(&lines, &[3], 6);
+        sched.set_cond_outcomes(CondOutcomes::Random, 0.0);
+        sched.sched_circuit().expect("hosted schedule failed");
+        assert_eq!(sched.skipped, vec![1]);
+        assert!(ran(&sched, 2));
+        assert_eq!(sched.hosted_activations(3), 1);
+        assert_eq!(sched.hosted.remaining[3], 0);
+        assert!(!sched.hosted.live[3]);
+    }
+
+    // ── measurements under a pending T-failure correction ───────────────────────────
+
+    /// Runs `lines` with a pending S correction (power 1, about `axis`) on qubit `q` at the start.
+    fn run_with_pending(lines: &[&str], q: usize, axis: char) -> Scheduler {
+        let mut sched = build_scheduler(lines, 0);
+        sched.correction_power[q] = 1;
+        sched.correction_basis[q] = axis;
+        sched.sched_circuit().expect("sched_circuit failed");
+        sched
+    }
+
+    #[test]
+    fn pending_correction_turns_an_x_measurement_into_y_and_stays_pending() {
+        let sched = run_with_pending(&["+X___<M>"], 0, 'Z');
+        assert!(sched.conjugated_t_products.contains(&0), "S_Z conjugates X to Y");
+        assert_eq!(sched.precomputed_terminals[0].len(), 2, "a Y measurement uses both nodes");
+        assert_eq!(lcycle_of(&sched, 0), 1);
+        assert_eq!(sched.correction_power[0], 1, "measuring does not discharge the correction");
+    }
+
+    #[test]
+    fn pending_correction_about_the_same_axis_leaves_a_measurement_alone() {
+        let sched = run_with_pending(&["+Z___<M>"], 0, 'Z');
+        assert!(!sched.conjugated_t_products.contains(&0));
+        assert_eq!(sched.precomputed_terminals[0].len(), 1);
+    }
+
+    #[test]
+    fn multi_qubit_measurement_is_routed_live_on_its_conjugated_basis() {
+        // Its precomputed tree is for X⊗Z; with S_Z pending on q0 it is measured as Y⊗Z.
+        let sched = run_with_pending(&["+XZ__<M>"], 0, 'Z');
+        assert!(sched.conjugated_t_products.contains(&0));
+        assert_eq!(sched.precomputed_terminals[0].len(), 3, "Y on q0 (2 nodes) + Z on q1");
+        assert_eq!(lcycle_of(&sched, 0), 1);
+    }
+
+    #[test]
+    fn reinitialization_voids_a_pending_correction() {
+        let sched = run_with_pending(&["+Z___<M>", "+Z___<R>"], 0, 'X');
+        assert_eq!(sched.correction_power[0], 0);
+    }
+
+    #[test]
+    fn hosted_patch_is_not_released_by_an_effective_y_measurement() {
+        // q3: X measurement, then a T after q0's long chain. Plain, the measurement releases the
+        // patch (two live windows); with S_Z pending on q3 it is a Y measurement and does not.
+        let mut lines = vec!["+___X<M>"];
+        lines.extend(std::iter::repeat("+X___<T>").take(30));
+        lines.push("+X__X<T>");
+        let run = |pending: bool| {
+            let mut sched = hosted_scheduler(&lines, &[3], 5);
+            if pending {
+                sched.correction_power[3] = 1;
+                sched.correction_basis[3] = 'Z';
+            }
+            sched.sched_circuit().expect("hosted schedule failed");
+            sched.hosted_activations(3)
+        };
+        assert_eq!(run(false), 2);
+        assert_eq!(run(true), 1);
     }
 }

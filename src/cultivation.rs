@@ -11,6 +11,11 @@ use rand_simple::Exponential;
 /// with parameter `lambda`. The node becomes "ready" (cultivation_time = 0) after
 /// `busy_count` reaches `cultivation_time`. Once consumed by a T gate, a new
 /// cultivation time is drawn and the cycle restarts.
+/// `cultivation_times` value of a node that is not cultivating at all: a live hosted
+/// ancilla, or the route-only half of a dormant one. It is never a ready magic state
+/// (`== 0`) and never counts as cultivating (`> 0`).
+pub(crate) const NOT_CULTIVATING: i32 = -1;
+
 pub(crate) struct CultivationManager {
     rng_exp: Exponential,
     cultivation_time_pool: Vec<i32>,
@@ -76,9 +81,10 @@ impl CultivationManager {
     }
 
     pub(crate) fn init_magic_nodes(&mut self, topo: &mut TopoGraph) {
+        // Route-only halves of hosted patches never cultivate (see TopoGraph::host_qubits).
         self.magic_node_ids = topo
             .iter_nodes()
-            .filter(|node| node.node_type == NodeType::Magic)
+            .filter(|node| node.node_type == NodeType::Magic && !topo.is_route_only(node.id))
             .map(|node| node.id)
             .collect();
         self.magic_node_positions =
@@ -97,9 +103,11 @@ impl CultivationManager {
     pub(crate) fn update_cultivators(&mut self, topo: &mut TopoGraph, used: &[bool]) -> usize {
         let n_topo_nodes = topo.n_nodes;
         self.new_cultivation_times.clear();
+        // A hosted ancilla's cultivator is a Data node while the ancilla is live: it neither
+        // cultivates nor counts as ready. (Without hosted qubits every id here is Magic.)
         for i in 0..self.magic_node_ids.len() {
             let id = self.magic_node_ids[i];
-            if used[id as usize] {
+            if used[id as usize] && topo.node(id).node_type == NodeType::Magic {
                 let t = self.draw(n_topo_nodes);
                 self.new_cultivation_times.push(t);
             }
@@ -109,6 +117,9 @@ impl CultivationManager {
         self.ready_magic_positions.clear();
         for i in 0..self.magic_node_ids.len() {
             let id = self.magic_node_ids[i];
+            if topo.node(id).node_type != NodeType::Magic {
+                continue;
+            }
             if used[id as usize] {
                 // Node was consumed this lcycle: assign a fresh cultivation time.
                 topo.cultivation_times[id as usize] =
@@ -131,6 +142,13 @@ impl CultivationManager {
         self.ready_magic_positions
             .sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         n_ready
+    }
+
+    /// Starts a fresh cultivation on node `id` (a hosted ancilla going dormant).
+    pub(crate) fn restart(&mut self, topo: &mut TopoGraph, id: u16) {
+        let n_topo_nodes = topo.n_nodes;
+        topo.cultivation_times[id as usize] = self.draw(n_topo_nodes);
+        topo.busy_counts[id as usize] = 0;
     }
 }
 
