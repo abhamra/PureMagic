@@ -140,6 +140,24 @@ its letters change:
 Like `frame`, it does not support `--ancilla-qubits` yet. With a local frame this would only need
 the release rule to use the executed letter, and the frame cleared when a patch is re-prepared.
 
+## 3c. Choosing `--reaction-latency`
+
+L is the time to decode an outcome and act on it, in logical cycles, rounded up. A logical cycle
+is about d syndrome-extraction rounds, so
+
+    L = ceil( t_reaction / (d * t_round) )
+
+| Setting | Round time | Reaction time | L at d = 25 | Source |
+|---|---|---|---|---|
+| Superconducting, fault-tolerance assumption | 1 µs | 10 µs | 1 (0.4, rounded up) | Gidney & Ekerå 2019 (RSA-2048 estimate); reused in later resource estimates |
+| Superconducting, measured today | 1.1 µs | 63 µs mean decoder latency (d = 5, real time) | 3 (2.3); 12 at d = 5 | Google, "Quantum error correction below the surface code threshold" (Nature 2025) |
+| Trapped ions, neutral atoms | ~100 µs to ~1 ms (mostly projections) | small next to a logical cycle | 0–1 | e.g. trapped-ion lattice-surgery and neutral-atom architecture estimates |
+
+Litinski's *Game of Surface Codes* assumes the 1 µs code cycle; the 10 µs reaction time is Gidney
+and Ekerå's. Google's 63 µs is a mean measured at d = 5; a larger-distance decoder would be slower,
+but the logical cycle grows with d too. Use **L = 1** as the main setting (the standard
+fault-tolerance assumption) and L = 2–5 as a sensitivity range for today's decoders.
+
 ## 4. Approximations
 
 - **Correction needed = injection failed.** The true condition is (injection outcome) XOR (frame

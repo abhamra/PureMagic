@@ -3,8 +3,35 @@
 This is the specification of everything the MCM work adds to PureMagic: the model, the file
 formats, each component's changes, the timing model, what is verified, what it costs and what
 is not done yet. `docs/dynamic-circuits.md` is the user guide (how to run it); this document is
-the reference for how it works. Branch: `mcm-ancilla`, which contains `mcm-support` and
-`ancilla-patch`.
+the reference for how it works. Branch: `mcm-support`, which now contains everything below
+(`ancilla-patch`, `mcm-ancilla`, `t-autocorrect-litinski` and `t-correction-frame` were merged
+into it).
+
+### Where everything is
+
+In this repository (`PureMagic/`, branch `mcm-support`):
+
+| File | What it holds |
+|---|---|
+| `docs/mcm-changes.md` | This file: change log (commit table below), MCM specification, scheduler notes, known limitations, plans |
+| `docs/t-gate-corrections.md` | Failed-T corrections: the two bugs in the old model, the five `--t-correction` models, their comparisons, approximations, choosing `--reaction-latency` |
+| `docs/dynamic-circuits.md` | User guide for dynamic circuits (how to run them) |
+| `README.md` | Every command-line flag |
+| `notebooks/dynamic_circuit_tutorial.ipynb` | Walkthrough of a small dynamic circuit end to end |
+| `src/frame.rs`, `src/scheduler.rs` | Clifford frame; the T-correction models live in the scheduler |
+
+Next to it, in `../bench_results/` (benchmark data, not in the repository):
+
+| Path | What it holds |
+|---|---|
+| `REPORT.md` | All benchmark results and findings, including the corrected-T rerun and the frame/hybrid comparisons |
+| `ERROR_LOG.md` | Every bug found, with evidence and status |
+| `scripts/CHANGES.md` | Change log of the benchmark harness; the scripts are in `scripts/` |
+| `t_correction_bug/` | Reproduction of the T-correction bug, exact checker (`check.py`), frame/hybrid fuzzer (`fuzz_frame.py`) |
+| `t_correction_cmp/` | Model comparisons: `results_*.csv`, `summary_*.txt`, `frame_detail.txt`, frozen binaries |
+| `out_*_tfix/` | The report's result sets rescheduled with the corrected T model |
+| `patches/README.md` | How the branches were consolidated into `mcm-support` |
+| `notes/t-correction-proof.html` | Typeset proof that the old T correction is wrong (also published as a private page) |
 
 | Commit | Branch | What |
 |---|---|---|
@@ -253,17 +280,39 @@ the flushes that conditional gates cause at transpile time (§8), which is Level
     DC-opt: mean T/M weight 1.24 → 7.31). Long runs of non-commuting T gates stall the data from
     L = 1. Because DC circuits carry the physical Cliffords, it penalizes DC more than Orig. It
     wins only on circuits without physical Cliffords at low latency (9 of 24 at L = 0).
-- **Hybrid model** (`--t-correction hybrid`, 5634c69, opt-in). Keeps the frame local so products
-  never grow:
-  - **Failures:** a failed one-qubit T is folded into the frame; a failed multi-qubit T goes to a
-    Litinski helper.
-  - **Cliffords:** S/SX pass through. Before a CX the frame does not commute with, one or two π/4
-    one-qubit rotations are applied physically, as scheduler-added S-type products (`S`, `SX`, or
-    `SY` on both data nodes), and the CX waits for them and for undecoded one-qubit outcomes on its
-    qubits.
-  - **Cost:** matches Litinski at L = 0 (+4.1% vs +4.1%; +2.7% vs +3.2% at `-m 1`) and runs as
-    fast, but loses from L = 1 (+14.1% vs +6.7%), because runs of one-qubit T gates wait on the
-    data path.
+- **Hybrid model** (`--t-correction hybrid`, 5634c69, opt-in). Why it exists: the exact frame
+  spreads through every physical CX (W ← CX·W·CX† turns a one-qubit S into an entangling π/4
+  rotation), so at `-m 1` a one-qubit T ended up running on 45–90 qubits. The hybrid keeps the
+  frame *local*, one one-qubit Clifford per qubit (one of 24, up to Paulis), so no product grows.
+  What it does, step by step:
+  1. **A failed one-qubit T** (say about Z₃) is folded into the frame: nothing physical happens
+     and no helper is used. The frame now records "S about Z pending on qubit 3".
+  2. **A failed multi-qubit T** (say about Z₀Z₁) would put an entangling correction in the frame,
+     so it is auto-corrected on a borrowed helper patch exactly as in `litinski` instead.
+  3. **Every T and measurement about Q** runs about W·Q·W†. A local frame only changes letters:
+     with S_Z pending on qubit 3, a T about X₃ runs as a T about Y₃, on the same patch (a Y
+     uses both of the qubit's data nodes).
+  4. **Physical S and SX lines** run as written and the frame is conjugated by them; it stays
+     local.
+  5. **Physical CX lines** are where a frame would spread. A CX commutes with the frame (up to
+     Paulis) when the control's pending Clifford fixes Z and the target's fixes X; then it just
+     runs. Otherwise the scheduler first applies, physically, one π/4 one-qubit rotation (when the
+     pending Clifford swaps two axes) or two (when it cycles X, Y, Z) on that qubit, about X, Y or
+     Z, which brings its frame back to the identity. These are scheduler-added S-type products
+     (an S, an SX, or a rotation about Y on both data nodes, routed like a Y measurement), and
+     the CX runs after them.
+  6. **Waiting.** A one-qubit T's outcome is decoded L lcycles after injection
+     (`--reaction-latency`). Until then, a T or measurement that anticommutes with it waits (its
+     letters depend on the outcome), and so does a CX on that qubit (the outcome decides whether a
+     clearing rotation is needed). Multi-qubit T gates only hold their helper, as in `litinski`.
+
+  Verified against exact unitaries on 960 random circuits (including that no CX ever runs while
+  the frame does not commute with it, whatever an undecoded outcome turns out to be). Cost against
+  the old model, geomean lcycles: at L = 0 it ties Litinski (+4.1% vs +4.1%; +2.7% vs +3.2% at
+  `-m 1`) and runs as fast, with no helper patch for one-qubit T gates. From L = 1 it loses (+14.1%
+  vs +6.7%; +45.9% vs +4.8% on the large `-m 1` benchmarks): synthesized one-qubit rotations are
+  runs of T gates about alternating axes, and each one waits L lcycles for the previous outcome on
+  the data path, where Litinski only holds helpers. Not supported with `--ancilla-qubits`.
 - **Legacy model.** The S correction is tracked per qubit (`correction_power`) and applied
   lazily: it is merged into the next Clifford on that qubit, or later T bases are conjugated
   (`t_conjugated_bases`).
