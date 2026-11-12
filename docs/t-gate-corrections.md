@@ -4,11 +4,11 @@ A T gate in the Pauli-based circuit is a π/8 rotation R_P(π/8) = e^{−iπ/8·
 product P. It is injected by measuring P⊗Z_m jointly with a magic-state patch m. Half the time
 the rotation comes out as R_P(−π/8), and the circuit then owes the Clifford correction
 R_P(π/4). This document covers how PureMagic used to account for that correction, why that was
-wrong, and the two models that replace it.
+wrong, the two models that replace it, and a third that was tried and is kept as an option.
 
 | Flag | Values | Default |
 |---|---|---|
-| `--t-correction` | `litinski`, `inplace-y`, `legacy` | `litinski` |
+| `--t-correction` | `litinski`, `inplace-y`, `frame`, `legacy` | `litinski` |
 | `--y-meas-lcycles` | extra lcycles for an in-place Y measurement | 1 |
 | `--reaction-latency` | lcycles to decode an outcome and act on it (also used for `@` edges) | 0 |
 
@@ -94,6 +94,31 @@ arrives that much later, which moves the decisions of later anticommuting T gate
 The trade-off: it needs no helper, but the magic patch cannot cultivate while it waits, and Y
 measurements lengthen the decision chain.
 
+## 3a. Exact Clifford frame (`--t-correction frame`)
+
+Never apply the correction at all. R_P(π/4) is a Clifford, so it can be folded into a frame W
+(`src/frame.rs`): the hardware state is W·(ideal state), and every later T or measurement about
+Q runs about W·Q·W†. A failed T about P sets W ← W·R_P(−π/4). Physical S, SX and CX lines in the
+`.trans` run unchanged and set W ← G·W·G†. The frame merges into measurements for free (they
+stay Pauli measurements), but not into T gates:
+
+- **Supports change.** W·Q·W† can act on more qubits than Q, or on fewer: after a failed T about
+  Z₀Z₁, X₀ runs as Y₀Z₁. A rewritten product gets new terminals, and a multi-qubit measurement
+  leaves its precomputed tree.
+- **Data-side waits.** Whether a later Q is rewritten depends on whether the earlier T failed, and
+  that is known only L lcycles after injection. So a T or measurement that anticommutes with a T
+  injected in the last L lcycles waits. (With Litinski only the helper waits.)
+- **No helper and no hold.** At L = 0 nothing waits at all.
+- **No hosted ancillas.** A hosted patch is released after a single-patch X/Z measurement as
+  written; under the frame that measurement can run on several patches, leaving the ancilla
+  entangled, and products of other qubits can be rewritten onto it. Supporting this needs the
+  hosting bookkeeping to follow the executed supports; `frame` rejects `--ancilla-qubits`.
+- **Resets** (`<R>`) need no physical re-initialization: the measurement before them fixes the
+  ideal qubit, so the reset is a Pauli, which the frame absorbs.
+
+The frame keeps signs out (only supports and letters affect scheduling). It is a GF(2) tableau on
+64-qubit words, so rewriting a product costs O(weight · n/64) word operations.
+
 ## 4. Approximations
 
 - **Correction needed = injection failed.** The true condition is (injection outcome) XOR (frame
@@ -166,6 +191,66 @@ L = 1, per circuit (lcycle change relative to `legacy`; T is the number of T gat
 | vqe_6.dc_opt | 255347 | 533023 | +9.9% | +10.1% | +8.3% |
 | vqe_6.orig | 11862 | 18762 | +6.8% | +16.9% | +5.6% |
 
+### The frame model
+
+Same 24 circuits, with every ancilla as a data patch (the frame model cannot host them) for all
+models: 1,920 runs, all passing the checker. Geomean lcycles relative to `legacy`, with the range:
+
+| L | litinski | inplace-y | frame | frame beats litinski on |
+|---|---|---|---|---|
+| 0 | +4.1% [+0, +10] | +3.3% [+1, +9] | +9.6% [−4, +72] | 9 of 24 |
+| 1 | +6.7% [+1, +11] | +14.7% [+3, +54] | +23.2% [−2, +97] | 7 of 24 |
+| 2 | +25.3% [+7, +103] | +37.0% [+7, +154] | +40.4% [−1, +194] | 8 of 24 |
+| 4 | +74.3% [+15, +303] | +89.9% [+16, +352] | +79.8% [+3, +389] | 10 of 24 |
+
+Per circuit at L = 0 and L = 1 (relative to `legacy`), with the frame's mean T/measurement weight
+as written and as executed, and the largest executed weight (seed 0, L = 0):
+
+| circuit | L0 litinski | L0 frame | L1 litinski | L1 frame | weight written → executed | max |
+|---|---|---|---|---|---|---|
+| cdkm_ripple_carry_adder.m1 | +5.0% | +5.7% | +6.5% | +5.7% | 1.00 → 17.92 | 143 |
+| cdkm_ripple_carry_adder.m0 | +6.8% | +10.5% | +6.9% | +10.9% | 81.44 → 78.56 | 200 |
+| dnn_n51.m1 | +1.2% | +33.1% | +3.0% | +76.1% | 1.00 → 2.94 | 38 |
+| dnn_n51.m0 | +3.2% | +7.1% | +6.4% | +58.6% | 2.47 → 2.70 | 42 |
+| ising_n98.m1 | +1.2% | +3.0% | +3.7% | +4.2% | 1.00 → 1.72 | 6 |
+| ising_n98.m0 | +2.1% | +0.7% | +5.3% | +0.7% | 1.75 → 1.78 | 4 |
+| knn_n129.m1 | +0.5% | +2.3% | +5.3% | +2.6% | 1.00 → 1.05 | 90 |
+| knn_n129.m0 | +8.3% | +2.2% | +10.9% | +2.3% | 1.05 → 1.08 | 99 |
+| qugan_n111.m1 | +0.0% | +5.2% | +1.2% | +76.7% | 1.00 → 2.80 | 86 |
+| qugan_n111.m0 | +2.3% | +0.7% | +3.9% | +97.3% | 2.47 → 2.87 | 90 |
+| grover_6.orig | +3.4% | +1.8% | +6.8% | +21.8% | 2.90 → 3.80 | 6 |
+| grover_6.dc_opt | +5.6% | +15.5% | +8.1% | +21.1% | 2.29 → 4.79 | 7 |
+| vqe_6.orig | +3.0% | +0.0% | +6.8% | +30.2% | 4.14 → 4.19 | 6 |
+| vqe_6.dc_opt | +8.6% | +24.8% | +9.8% | +25.4% | 1.55 → 5.00 | 7 |
+| qaoa_8.orig | +2.8% | -3.9% | +6.2% | -2.5% | 2.83 → 2.34 | 6 |
+| qaoa_8.dc_opt | +3.8% | +0.7% | +7.7% | +2.2% | 2.83 → 2.32 | 5 |
+| qnn_4.orig | +4.7% | -0.4% | +7.1% | +2.2% | 2.63 → 2.49 | 4 |
+| qnn_4.dc_opt | +3.8% | +6.9% | +6.5% | +9.6% | 1.93 → 2.65 | 5 |
+| ae_5.orig | +2.1% | -0.8% | +4.7% | +21.1% | 2.51 → 2.26 | 4 |
+| ae_5.dc_opt | +6.4% | +17.9% | +9.2% | +20.0% | 1.86 → 3.54 | 6 |
+| qaoa_16.orig | +2.3% | +9.9% | +5.2% | +12.9% | 1.34 → 2.16 | 5 |
+| qaoa_16.dc_opt | +8.7% | +30.3% | +9.7% | +29.2% | 1.32 → 2.66 | 7 |
+| tfim_20.orig | +4.5% | +8.0% | +9.2% | +17.9% | 6.45 → 2.94 | 9 |
+| tfim_20.dc_opt | +9.8% | +72.4% | +10.6% | +76.3% | 1.24 → 7.31 | 20 |
+
+- **Physical Cliffords spread the frame.** Every S/SX/CX line conjugates W, so circuits with many
+  of them see weights grow: DC-opt variants (which have physical Cliffords from the transpiler's
+  flushes) and `-m 1` transpilations. tfim_20 DC-opt goes from weight 1.24 to 7.31 (+72% lcycles
+  at L = 0), dnn_n51 `-m 1` from 1 to 2.94, cdkm `-m 1` from 1 to 17.9 (max 143).
+- **Without physical Cliffords the frame can win.** Folding P into an overlapping Q can lower the
+  weight (tfim_20 Orig: 6.45 → 2.94), and there is no helper. At L = 0 it beats Litinski on 9
+  circuits, by up to 7 points (knn_n129 `-m 0`: +2.2% vs +8.3%; qaoa_8 Orig: −3.9%).
+- **Data-side waits dominate from L = 1.** Long runs of non-commuting T gates stall the data:
+  dnn_n51 and qugan_n111 cost +59% to +97% at L = 1, against +1% to +6% with Litinski.
+- **It would bias the DC/Orig comparison.** DC circuits have the physical Cliffords, so the frame
+  penalizes them more than Orig (vqe_6 at L = 0: Orig +0%, DC-opt +25%). Litinski charges both
+  alike.
+
+`litinski` stays the default. `frame` is kept for circuits without physical Cliffords at low
+latency, and as the reference for an exact frame.
+
+### DC-opt vs Orig
+
 DC-opt has more T gates per lcycle than Orig, so it pays slightly more. At L = 1 with Litinski,
 the DC-opt/Orig lcycle ratio rises by +0.1% (qnn_4) to +4.3% (qaoa_16). Absolute lcycle counts
 from before this change are optimistic by the amounts above.
@@ -180,7 +265,17 @@ from before this change are optimistic by the amounts above.
   - `litinski_decisions_chain_only_through_anticommuting_t_gates`;
   - `inplace_y_holds_the_magic_patch_and_adds_y_time_for_failures`;
   - `inplace_y_failure_delays_the_next_anticommuting_decision`;
-  - `legacy_mode_still_tracks_per_qubit_corrections`.
+  - `legacy_mode_still_tracks_per_qubit_corrections`;
+  - frame mode: `frame_mode_runs_every_product_once_and_rewrites_after_failures`,
+    `frame_mode_waits_for_an_anticommuting_outcome`, `frame_mode_without_failures_matches_legacy`,
+    `frame_mode_rejects_hosted_ancillas`; `src/frame.rs` checks the tableau against a slow
+    event-list reference on random histories (up to 130 qubits) and its gate rules against the
+    transpiler's signed tableau.
+- Frame mode against exact unitaries: 900 random circuits × seeds × L ∈ {0, 2} of 2–4 qubits
+  (T gates and measurements of weight 1–3, physical S/Sdg/SX/SXdg/CX), replayed from the trace in
+  execution order (`bench_results/t_correction_bug/fuzz_frame.py`, `check.py`). Every executed T
+  and measurement matches, and flipping the outcome of any T not yet decoded never changes a
+  product that already ran.
 - The schedule checker (`data_processing/plot_dynamic.py`) passes on every comparison run.
 - A two-qubit circuit that shows both problems, and the one-qubit circuit above, were run with
   every model and compared with an exact Clifford-tableau calculation. `legacy` executes 4 and 2
