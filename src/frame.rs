@@ -134,6 +134,11 @@ impl SPauli {
                 let (x, z) = self.bits(q);
                 self.put(q, x ^ z, z);
             }
+            FrameGate::SY(q) => {
+                // R_Y(pi/4): X -> Z, Z -> X, Y -> Y.
+                let (x, z) = self.bits(q);
+                self.put(q, z, x);
+            }
             FrameGate::CX(c, t) => {
                 // X_c -> X_c X_t, Z_t -> Z_c Z_t.
                 let (xc, zc) = self.bits(c);
@@ -166,13 +171,15 @@ impl SPauli {
 pub(crate) enum FrameGate {
     S(usize),
     SX(usize),
+    /// R_Y(pi/4): X <-> Z. Only used for the hybrid model's flush rotations.
+    SY(usize),
     CX(usize, usize),
 }
 
 impl FrameGate {
     fn qubits(&self) -> Vec<usize> {
         match *self {
-            FrameGate::S(q) | FrameGate::SX(q) => vec![q],
+            FrameGate::S(q) | FrameGate::SX(q) | FrameGate::SY(q) => vec![q],
             FrameGate::CX(c, t) => vec![c, t],
         }
     }
@@ -238,6 +245,66 @@ impl CliffordFrame {
             }
         }
         self.nontrivial = true;
+    }
+
+    /// Letters of W·X_q·W† and W·Z_q·W† on qubit q.
+    pub(crate) fn local_letters(&self, q: usize) -> (char, char) {
+        (self.rows[2 * q].letter(q), self.rows[2 * q + 1].letter(q))
+    }
+
+    /// True if W acts on qubit q alone: the images of X_q and Z_q have no other qubit, and no
+    /// other generator's image touches q. (Then W = W_q ⊗ W_rest.)
+    #[cfg(test)]
+    pub(crate) fn is_local_on(&self, q: usize) -> bool {
+        if !self.nontrivial {
+            return true;
+        }
+        for (r, row) in self.rows.iter().enumerate() {
+            let own = r / 2 == q;
+            let support = row.support();
+            if own && support.iter().any(|&o| o != q) {
+                return false;
+            }
+            if !own && support.contains(&q) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// True if W is a product of one-qubit Cliffords.
+    pub(crate) fn is_local(&self) -> bool {
+        !self.nontrivial
+            || self.rows.iter().enumerate().all(|(r, row)| row.support() == vec![r / 2])
+    }
+
+    /// A physical one-qubit Clifford V was applied to the hardware: W ← V·W.
+    pub(crate) fn apply_physical(&mut self, gate: FrameGate) {
+        for row in &mut self.rows {
+            row.conjugate_by(gate);
+        }
+        self.nontrivial = true;
+    }
+
+    /// For a frame local on qubit q: one pi/4 rotation to apply physically that brings W_q
+    /// closer to a Pauli (the identity up to the Pauli frame), or None if W_q already is one.
+    /// A transposition of X, Y, Z needs one rotation, a 3-cycle two.
+    pub(crate) fn flush_step(&self, q: usize) -> Option<FrameGate> {
+        let (ix, iz) = self.local_letters(q);
+        if (ix, iz) == ('X', 'Z') {
+            return None;
+        }
+        let after = |g: FrameGate| {
+            let mut a = SPauli::identity(self.words);
+            a.set(q, ix);
+            a.conjugate_by(g);
+            let mut b = SPauli::identity(self.words);
+            b.set(q, iz);
+            b.conjugate_by(g);
+            (a.letter(q), b.letter(q))
+        };
+        let gates = [FrameGate::S(q), FrameGate::SX(q), FrameGate::SY(q)];
+        Some(gates.into_iter().find(|&g| after(g) == ('X', 'Z')).unwrap_or(FrameGate::S(q)))
     }
 
     /// A physical Clifford G ran unchanged: W ← G·W·G†. New image of a generator g is
@@ -431,6 +498,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn flush_steps_bring_a_local_frame_to_the_identity() {
+        // Every one-qubit Clifford (mod Pauli) is reached by failures about X, Y, Z; each needs
+        // at most two flush rotations.
+        let mut rng = StdRng::seed_from_u64(5);
+        for _ in 0..200 {
+            let mut f = CliffordFrame::new(3);
+            for _ in 0..rng.gen_range(1..6) {
+                let q = rng.gen_range(0..3);
+                let mut p = SPauli::identity(1);
+                p.set(q, ['X', 'Y', 'Z'][rng.gen_range(0..3)]);
+                f.absorb_failed_t(&p);
+            }
+            assert!(f.is_local());
+            for q in 0..3 {
+                let mut steps = 0;
+                while let Some(g) = f.flush_step(q) {
+                    f.apply_physical(g);
+                    steps += 1;
+                    assert!(steps <= 2, "more than two rotations");
+                }
+                assert_eq!(f.local_letters(q), ('X', 'Z'));
+            }
+            assert!(f.is_local());
+        }
+    }
+
+    #[test]
+    fn locality_detects_entangling_corrections() {
+        let mut f = CliffordFrame::new(2);
+        f.absorb_failed_t(&sp("Z_"));
+        assert!(f.is_local() && f.is_local_on(0) && f.is_local_on(1));
+        f.absorb_failed_t(&sp("ZZ"));
+        assert!(!f.is_local() && !f.is_local_on(0));
     }
 
     #[test]
