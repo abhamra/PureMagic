@@ -24,6 +24,8 @@ the reference for how it works. Branch: `mcm-ancilla`, which contains `mcm-suppo
 | d94a740 | mcm-ancilla | A T whose sign depends on measurement outcomes waits for them (`@` needs) |
 | 2f84ec0, a673091 | t-autocorrect-litinski | Failed T injections auto-corrected (Litinski), default `--t-correction litinski`; see `docs/t-gate-corrections.md` |
 | 563a4ef | t-autocorrect-litinski | `--t-correction inplace-y` (Gidney in-place Y) and `--y-meas-lcycles` |
+| a76ea98 | mcm-support | Merge of t-autocorrect-litinski: `mcm-support` now holds all of the above |
+| e563b71, 4c53671 | t-correction-frame | `--t-correction frame`: failed T corrections folded into an exact Clifford frame (opt-in; loses to `litinski`, see §5 and `docs/t-gate-corrections.md` §3a) |
 
 ## 1. Model
 
@@ -229,6 +231,27 @@ the flushes that conditional gates cause at transpile time (§8), which is Level
   held until the correction is decided (reaction latency, chained through earlier anticommuting
   T gates). See `docs/t-gate-corrections.md`. The two bullets below describe only
   `--t-correction legacy`, which is kept to compare against.
+- **Exact-frame model** (`--t-correction frame`, e563b71, opt-in). No correction is ever applied.
+  The scheduler keeps an exact Clifford frame W (`src/frame.rs`, a GF(2) tableau without signs)
+  with hardware state = W·(ideal state):
+  - **Updates.** A failed T about P sets W ← W·R_P(−π/4). A physical S/SX/CX line runs as written
+    and sets W ← G·W·G†.
+  - **Rewriting.** Every T and measurement about Q runs about W·Q·W†, whose support can be larger
+    or smaller than Q's. It is routed on the rewritten terminals, and a multi-qubit measurement
+    leaves its precomputed tree.
+  - **Waiting.** A T or measurement whose Pauli anticommutes with a T injected in the last L lcycles
+    waits until that outcome is decoded, because only then is its rewritten Pauli known. This is
+    the reaction limit, paid on the data path instead of on a helper.
+  - **Not supported with `--ancilla-qubits`** (a hosted patch could be released while the frame
+    still entangles it). `<R>` stays correct without a physical reset: after the preceding
+    measurement it is a Pauli, which the frame absorbs.
+  - **Verified** against exact unitaries on 900 random circuits, including that no product ever ran
+    on a Pauli that depended on an undecoded outcome.
+  - **Cost** (24 circuits, ancillas as data patches): geomean +9.6% / +23.2% lcycles over legacy at
+    L = 0 / 1, against +4.1% / +6.7% for `litinski`. Physical Cliffords spread the frame (tfim_20
+    DC-opt: mean T/M weight 1.24 → 7.31). Long runs of non-commuting T gates stall the data from
+    L = 1. Because DC circuits carry the physical Cliffords, it penalizes DC more than Orig. It
+    wins only on circuits without physical Cliffords at low latency (9 of 24 at L = 0).
 - **Legacy model.** The S correction is tracked per qubit (`correction_power`) and applied
   lazily: it is merged into the next Clifford on that qubit, or later T bases are conjugated
   (`t_conjugated_bases`).
