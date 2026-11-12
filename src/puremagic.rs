@@ -5,6 +5,7 @@ use rand::rngs::StdRng;
 mod astar;
 mod circuit;
 mod cultivation;
+mod frame;
 mod node;
 mod pauliproduct;
 mod scheduler;
@@ -76,7 +77,11 @@ struct Args {
     /// How a failed T injection is corrected: `litinski` (auto-corrected pi/8 rotation: a borrowed
     /// |0> helper next to the magic patch, held until the correction is decided; nothing owed on
     /// the data), `inplace-y` (no helper: the magic patch is held until the decision and then
-    /// measured in X, or in Y for a failed T) or `legacy` (the old per-qubit S record, which is
+    /// measured in X, or in Y for a failed T), `frame` (no correction: an exact Clifford frame
+    /// rewrites every later T and measurement; they wait for undecoded outcomes they depend on),
+    /// `hybrid` (frame for one-qubit T gates, kept local by rotations before CX; helper for
+    /// multi-qubit T gates)
+    /// or `legacy` (the old per-qubit S record, which is
     /// incorrect for multi-qubit T gates and for failures about different axes; kept to compare
     /// against).
     #[arg(long = "t-correction", value_enum, default_value_t = scheduler::TCorrection::Litinski)]

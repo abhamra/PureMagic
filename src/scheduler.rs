@@ -4,6 +4,7 @@ use crate::circuit::Circuit;
 use crate::cultivation::{CultivationManager, NOT_CULTIVATING};
 use crate::debug_sched;
 use crate::fn_timer;
+use crate::frame::{CliffordFrame, FrameGate, SPauli};
 use crate::info_sched;
 use crate::node::NodeType;
 use crate::pauliproduct::{GateType, Operator, PauliProduct};
@@ -190,6 +191,23 @@ pub(crate) enum TCorrection {
     /// the frame bit it yields is known only after that. Single-patch injection, but the magic
     /// patch cannot cultivate while it waits.
     InplaceY,
+    /// Exact Clifford frame (src/frame.rs): a failed T's correction R_P(pi/4) is never applied.
+    /// It is folded into a frame W, and every later T and measurement about Q runs about
+    /// W.Q.W^dag, possibly on more qubits than Q. Physical S/SX/CX run unchanged and
+    /// conjugate the frame. No helper and no hold, but a T or measurement whose rewritten
+    /// Pauli depends on an undecoded injection outcome (it anticommutes with a T injected in
+    /// the last L lcycles) waits until that outcome is known. Not supported with hosted
+    /// ancillas.
+    Frame,
+    /// Hybrid of `frame` and `litinski` that keeps the frame local (one one-qubit Clifford per
+    /// qubit), so products never grow. A failed one-qubit T is folded into the frame; a failed
+    /// multi-qubit T, whose correction would entangle, is auto-corrected on a helper as in
+    /// `litinski`. Physical S/SX pass through the frame. Before a physical CX whose qubits' frame
+    /// does not commute with it, one or two pi/4 one-qubit rotations are applied physically to
+    /// bring that qubit's frame to the identity. A CX also waits for undecoded one-qubit T
+    /// outcomes on its qubits (they decide whether a rotation is needed). Not supported with
+    /// hosted ancillas.
+    Hybrid,
     /// The per-qubit S-correction record PureMagic used before (correction_power). Incorrect: it
     /// splits the correction of a multi-qubit T into independent one-qubit corrections and
     /// merges corrections about different axes into a Pauli. Kept to compare against.
@@ -314,6 +332,38 @@ pub(crate) struct Scheduler {
     /// Per qubit, recent T products and the lcycle their correction is decided (decision chain).
     t_decisions: Vec<Vec<(i32, usize)>>,
     pub(crate) t_stats: TCorrectionStats,
+    /// Frame mode: the Clifford frame (None in other modes and with -F).
+    frame: Option<CliffordFrame>,
+    /// Frame mode: T injections whose outcome is not decoded yet, as (last undecided lcycle,
+    /// ideal axis conjugated by the physical Cliffords run since).
+    frame_undecided: Vec<(usize, SPauli)>,
+    /// Frame mode: rewritten Paulis of products currently routed on them.
+    frame_exec: HashMap<i32, Vec<Operator>>,
+    /// Frame mode: physical Cliffords already folded into the frame (they span several lcycles).
+    frame_applied: HashSet<i32>,
+    pub(crate) frame_stats: FrameStats,
+}
+
+/// Counters for `--t-correction frame`, reported after scheduling.
+#[derive(Default, Debug, Clone)]
+pub(crate) struct FrameStats {
+    /// Failed T gates folded into the frame, and physical Cliffords that conjugated it.
+    pub(crate) failures: usize,
+    pub(crate) cliffords: usize,
+    /// Product-lcycles T gates and measurements waited for an undecoded outcome.
+    pub(crate) waits: usize,
+    /// Hybrid: pi/4 one-qubit rotations applied physically to clear the frame before a CX.
+    pub(crate) flushes: usize,
+    /// Executed T gates and measurements, how many ran rewritten, their total weight as written
+    /// and as executed, and the largest executed weight.
+    pub(crate) products: usize,
+    pub(crate) rewritten: usize,
+    pub(crate) ideal_weight: usize,
+    pub(crate) exec_weight: usize,
+    pub(crate) max_exec_weight: usize,
+    /// One entry per executed T or measurement: (lcycle, product, executed operators). Kept in
+    /// test and debug builds only.
+    pub(crate) log: Vec<(usize, i32, Vec<Operator>)>,
 }
 
 /// Counters for the T-correction model, reported after scheduling.
@@ -442,12 +492,241 @@ impl Scheduler {
             holding_now: false,
             t_decisions: Vec::new(),
             t_stats: TCorrectionStats::default(),
+            frame: None,
+            frame_undecided: Vec::new(),
+            frame_exec: HashMap::new(),
+            frame_applied: HashSet::new(),
+            frame_stats: FrameStats::default(),
         }
     }
 
     /// Sets how failed T injections are corrected (default: Litinski auto-correction).
     pub(crate) fn set_t_correction(&mut self, mode: TCorrection) {
         self.t_correction = mode;
+    }
+
+    /// True if a failure of T product `pp_id` is folded into the frame (frame: every T; hybrid:
+    /// one-qubit T gates). Otherwise it is auto-corrected on a helper.
+    fn frame_owns(&self, pp_id: i32) -> bool {
+        match self.t_correction {
+            TCorrection::Frame => true,
+            TCorrection::Hybrid => self.input.circuit.product(pp_id).operators.len() == 1,
+            _ => false,
+        }
+    }
+
+    /// Hybrid: makes CX `pp_id` safe to run without spreading the frame. Returns true if it can
+    /// run now. Otherwise it waits for an undecoded outcome on its qubits, or a flush rotation
+    /// was placed (or could not be) on a qubit whose frame does not commute with the CX.
+    fn hybrid_cx_ready(&mut self, pp_id: i32, plotting: bool) -> bool {
+        let pp = self.input.circuit.product(pp_id);
+        let c = pp.operators.iter().find(|op| op.basis == 'Z').unwrap().qubit;
+        let t = pp.operators.iter().find(|op| op.basis == 'X').unwrap().qubit;
+        if self
+            .frame_undecided
+            .iter()
+            .any(|(_, ax)| ax.letter(c as usize) != '_' || ax.letter(t as usize) != '_')
+        {
+            info_sched!("  CX {} waits for an undecoded T outcome on its qubits", pp_id);
+            self.frame_stats.waits += 1;
+            self.holding_now = true;
+            return false;
+        }
+        // CX commutes with a Z-diagonal Clifford on the control and an X-diagonal one on the
+        // target (up to Paulis); anything else would spread the frame.
+        let mut ready = true;
+        if self.frame.as_ref().unwrap().local_letters(c as usize).1 != 'Z' {
+            ready = false;
+            self.emit_frame_flush(c, plotting);
+        }
+        if self.frame.as_ref().unwrap().local_letters(t as usize).0 != 'X' {
+            ready = false;
+            self.emit_frame_flush(t, plotting);
+        }
+        ready
+    }
+
+    /// Hybrid: physically applies one pi/4 rotation on qubit `q` that moves its frame toward
+    /// the identity, as a scheduler-added S-type product. Returns true if it was placed.
+    fn emit_frame_flush(&mut self, q: u16, plotting: bool) -> bool {
+        let Some(gate) = self.frame.as_ref().unwrap().flush_step(q as usize) else {
+            return true;
+        };
+        let (basis, name) = match gate {
+            FrameGate::S(_) => ('Z', "S"),
+            FrameGate::SX(_) => ('X', "SX"),
+            FrameGate::SY(_) => ('Y', "SY"),
+            FrameGate::CX(..) => unreachable!(),
+        };
+        let s_id = self.next_correction_id;
+        self.input.circuit.pps.push(PauliProduct {
+            id: s_id,
+            gate_type: GateType::S,
+            operators: vec![Operator { qubit: q, basis }],
+            parents: vec![],
+            children: vec![],
+            after: Vec::new(),
+            cond: Vec::new(),
+            max_qubit: q,
+        });
+        let ops = vec![Operator { qubit: q, basis }];
+        let terminals = operators_to_node_ids(&self.input.topo, &ops);
+        let root_info = Self::compute_root_info_for_terminals(&self.input.topo, &terminals);
+        self.precomputed_terminals.push(terminals);
+        self.precomputed_root_info.push(root_info);
+        let placed = if self.terminal_nodes(s_id) {
+            self.sched_s_sx(s_id, plotting)
+        } else {
+            PathResult::NoPath
+        };
+        match placed {
+            PathResult::PathFound(opt_graph) => {
+                info_sched!("  frame flush {} on q{} as product {}", name, q, s_id);
+                self.next_correction_id += 1;
+                self.correction_gates_emitted += 1;
+                if let Some(ref g) = opt_graph {
+                    let node_ids: Vec<u16> = g.iter_nodes().collect();
+                    self.mark_nodes_used(&node_ids);
+                }
+                self.pp_paths.push((s_id, opt_graph.map(Rc::new)));
+                self.frame.as_mut().unwrap().apply_physical(gate);
+                self.frame_applied.insert(s_id);
+                self.frame_stats.flushes += 1;
+                true
+            }
+            PathResult::NoPath => {
+                self.input.circuit.pps.pop();
+                self.precomputed_terminals.pop();
+                self.precomputed_root_info.pop();
+                false
+            }
+        }
+    }
+
+    /// Frame mode, start of an lcycle: forget injections whose outcome is now decoded.
+    fn frame_begin_lcycle(&mut self) {
+        let now = self.current_lcycle;
+        self.frame_undecided.retain(|&(last, _)| last >= now);
+    }
+
+    /// Frame mode: prepares T or measurement `pp_id` to run in the current frame. Returns false
+    /// if it must wait (its rewritten Pauli depends on an undecoded outcome). Otherwise its
+    /// terminals and root candidates are those of W.Q.W^dag.
+    fn frame_prepare(&mut self, pp_id: i32) -> bool {
+        let Some(frame) = self.frame.as_ref() else {
+            return true;
+        };
+        let ideal = SPauli::from_ops(frame.words, &self.input.circuit.product(pp_id).operators);
+        if self.frame_undecided.iter().any(|(_, axis)| axis.anticommutes(&ideal)) {
+            info_sched!("  {} waits for an undecoded T outcome", pp_id);
+            self.frame_stats.waits += 1;
+            self.holding_now = true; // not a dead end: the outcome arrives
+            return false;
+        }
+        let exec = frame.image(&ideal);
+        if exec == ideal {
+            if self.frame_exec.remove(&pp_id).is_some() {
+                // Back to the Pauli as written (the frame changed since the last attempt).
+                let ops = self.input.circuit.product(pp_id).operators.clone();
+                self.set_terminals(pp_id, &ops);
+                self.conjugated_t_products.remove(&pp_id);
+            }
+            return true;
+        }
+        let ops = exec.to_ops();
+        if self.frame_exec.get(&pp_id) != Some(&ops) {
+            self.set_terminals(pp_id, &ops);
+            self.frame_exec.insert(pp_id, ops);
+            self.conjugated_t_products.insert(pp_id);
+        }
+        true
+    }
+
+    /// Routes product `pp_id` on the data patches of `ops` instead of its own operators.
+    fn set_terminals(&mut self, pp_id: i32, ops: &[Operator]) {
+        let terminals = operators_to_node_ids(&self.input.topo, ops);
+        let root_info = Self::compute_root_info_for_terminals(&self.input.topo, &terminals);
+        self.precomputed_terminals[pp_id as usize] = terminals;
+        self.precomputed_root_info[pp_id as usize] = root_info;
+    }
+
+    /// Frame mode: the operators product `pp_id` runs on (its own unless rewritten).
+    fn exec_ops(&self, pp_id: i32) -> &[Operator] {
+        match self.frame_exec.get(&pp_id) {
+            Some(ops) => ops,
+            None => &self.input.circuit.product(pp_id).operators,
+        }
+    }
+
+    /// Frame mode: bookkeeping for T or measurement `pp_id`, scheduled this lcycle.
+    fn frame_executed(&mut self, pp_id: i32) {
+        if self.frame.is_none() {
+            return;
+        }
+        let ideal_w = self.input.circuit.product(pp_id).operators.len();
+        let ops = self.exec_ops(pp_id).to_vec();
+        let st = &mut self.frame_stats;
+        st.products += 1;
+        st.ideal_weight += ideal_w;
+        st.exec_weight += ops.len();
+        st.max_exec_weight = st.max_exec_weight.max(ops.len());
+        if self.frame_exec.contains_key(&pp_id) {
+            st.rewritten += 1;
+        }
+        #[cfg(debug_assertions)]
+        {
+            let frame = self.frame.as_ref().unwrap();
+            let label = SPauli::from_ops(frame.words, &ops).to_label(frame.n);
+            info_sched!("  product {} executed as {}", pp_id, label);
+        }
+        if cfg!(any(test, debug_assertions)) {
+            self.frame_stats.log.push((self.current_lcycle, pp_id, ops));
+        }
+        if self.input.circuit.product(pp_id).gate_type.is_t() && self.frame_owns(pp_id) {
+            // Until decoded, its outcome decides the Pauli of anything that anticommutes with it.
+            let frame = self.frame.as_ref().unwrap();
+            let axis = SPauli::from_ops(frame.words, &self.input.circuit.product(pp_id).operators);
+            self.frame_undecided.push((self.current_lcycle + self.reaction_latency, axis));
+        }
+    }
+
+    /// Frame mode, end of an lcycle: fold failed T gates and newly started physical Cliffords
+    /// into the frame.
+    fn frame_end_lcycle(&mut self, failed: &[i32]) {
+        let Some(frame) = self.frame.as_mut() else {
+            return;
+        };
+        for &pp_id in failed {
+            let axis = SPauli::from_ops(frame.words, &self.input.circuit.product(pp_id).operators);
+            frame.absorb_failed_t(&axis);
+            self.frame_stats.failures += 1;
+        }
+        for i in 0..self.pp_paths.len() {
+            let pp_id = self.pp_paths[i].0;
+            if pp_id as usize >= self.input.circuit.n_products()
+                || self.frame_applied.contains(&pp_id)
+            {
+                continue;
+            }
+            let pp = self.input.circuit.product(pp_id);
+            let gate = match pp.gate_type {
+                GateType::S => FrameGate::S(pp.operators[0].qubit as usize),
+                GateType::SX => FrameGate::SX(pp.operators[0].qubit as usize),
+                GateType::CX => {
+                    let c = pp.operators.iter().find(|op| op.basis == 'Z').unwrap().qubit;
+                    let t = pp.operators.iter().find(|op| op.basis == 'X').unwrap().qubit;
+                    FrameGate::CX(c as usize, t as usize)
+                }
+                _ => continue,
+            };
+            frame.absorb_physical_clifford(gate);
+            info_sched!("  physical Clifford {} folded into the frame", pp_id);
+            for (_, axis) in &mut self.frame_undecided {
+                axis.conjugate_by(gate);
+            }
+            self.frame_applied.insert(pp_id);
+            self.frame_stats.cliffords += 1;
+        }
     }
 
     /// Sets how many extra lcycles an in-place Y measurement of a magic patch takes (default 1:
@@ -1008,6 +1287,18 @@ impl Scheduler {
             .set_lambda(self.magic_state_lambda)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         let hosting = self.hosting();
+        if matches!(self.t_correction, TCorrection::Frame | TCorrection::Hybrid) {
+            if hosting {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "--t-correction frame/hybrid does not support --ancilla-qubits: a hosted \
+                     patch cannot be released while the frame still acts on it",
+                ));
+            }
+            if !self.no_t_failures {
+                self.frame = Some(CliffordFrame::new(self.input.circuit.n_qubits));
+            }
+        }
         if hosting {
             // Precompute while hosted nodes are still Data, then make them dormant (Magic)
             // so `init_magic_nodes` picks up their cultivators.
@@ -1547,8 +1838,17 @@ impl Scheduler {
         for (pp_id, node_ids, opt_tree) in clifford_carry {
             self.carry_forward_path(pp_id, &node_ids, opt_tree);
         }
-        if self.t_correction != TCorrection::Legacy {
+        if matches!(
+            self.t_correction,
+            TCorrection::Litinski | TCorrection::InplaceY | TCorrection::Hybrid
+        ) {
             self.hold_t_patches();
+        }
+        if self.frame.is_some() {
+            if self.t_correction == TCorrection::Frame {
+                self.holding_now = false; // hold_t_patches resets it in the other modes
+            }
+            self.frame_begin_lcycle();
         }
         let carry_forward_count = self.clifford_paths.len();
         let tot_available = carry_forward_count + self.pps_pending.len();
@@ -1619,16 +1919,25 @@ impl Scheduler {
             // A multi-qubit measurement whose basis a pending S correction changes cannot use
             // its tree (precomputed for the original basis): route it now, on its conjugated
             // terminals.
-            if self.input.circuit.product(pp_id).gate_type.is_m()
-                && self.precomputed_clifford_trees.contains_key(&pp_id)
-                && self.conjugation_due(pp_id)
+            let is_tree_m = self.input.circuit.product(pp_id).gate_type.is_m()
+                && self.precomputed_clifford_trees.contains_key(&pp_id);
+            if is_tree_m && self.frame.is_some() && !self.frame_prepare(pp_id) {
+                continue;
+            }
+            if is_tree_m
+                && (self.frame.is_some()
+                    || (self.t_correction == TCorrection::Legacy && self.conjugation_due(pp_id)))
             {
-                self.refresh_conjugation(pp_id);
+                if self.frame.is_none() {
+                    self.refresh_conjugation(pp_id);
+                }
                 if self.conjugated_t_products.contains(&pp_id) {
-                    let result = if self.terminal_nodes(pp_id) {
-                        self.sched_t_or_multi(pp_id, plotting)
-                    } else {
+                    let result = if !self.terminal_nodes(pp_id) {
                         PathResult::NoPath
+                    } else if self.terminals_buf.len() == 1 {
+                        self.sched_measurement(pp_id, plotting)
+                    } else {
+                        self.sched_t_or_multi(pp_id, plotting)
                     };
                     match result {
                         PathResult::PathFound(opt_graph) => {
@@ -1639,6 +1948,7 @@ impl Scheduler {
                             }
                             let keep = if plotting { opt_graph.map(Rc::new) } else { None };
                             self.pp_paths.push((pp_id, keep));
+                            self.frame_executed(pp_id);
                         }
                         PathResult::NoPath => {
                             let pp = self.input.circuit.product(pp_id);
@@ -1652,6 +1962,15 @@ impl Scheduler {
                     continue;
                 }
                 // The correction no longer changes its basis: the precomputed tree applies.
+            }
+            if self.t_correction == TCorrection::Hybrid
+                && self.frame.is_some()
+                && self.input.circuit.product(pp_id).gate_type.is_cx()
+                && !self.hybrid_cx_ready(pp_id, plotting)
+            {
+                let pp = self.input.circuit.product(pp_id);
+                Self::mark_blocked_product_as_used(&mut self.used, &self.input.topo, pp);
+                continue;
             }
             // Clone the Rc to end the immutable borrow on `precomputed_clifford_trees`.
             let Some(tree) = self.precomputed_clifford_trees.get(&pp_id).map(Rc::clone) else {
@@ -1674,6 +1993,9 @@ impl Scheduler {
                     _tree_n_edges
                 );
                 self.pp_paths.push((pp_id, opt_tree));
+                if self.input.circuit.product(pp_id).gate_type.is_m() {
+                    self.frame_executed(pp_id);
+                }
             } else {
                 let pp = self.input.circuit.product(pp_id);
                 Self::mark_blocked_product_as_used(&mut self.used, &self.input.topo, pp);
@@ -1901,7 +2223,14 @@ impl Scheduler {
             // skipping the common case avoids Vec allocations and topology lookups every lcycle.
             // A measurement is conjugated like a T: measuring P on the state before a pending
             // correction S is measuring S^dag P S, and the correction stays pending afterwards.
-            if (gate_type.is_t() || gate_type.is_m()) && self.conjugation_due(pp_id) {
+            if (gate_type.is_t() || gate_type.is_m()) && self.frame.is_some() {
+                if !self.frame_prepare(pp_id) {
+                    continue;
+                }
+            } else if (gate_type.is_t() || gate_type.is_m())
+                && self.t_correction == TCorrection::Legacy
+                && self.conjugation_due(pp_id)
+            {
                 let swapped = self.refresh_conjugation(pp_id);
                 if gate_type.is_t() && !swapped.is_empty() {
                     self.t_conjugated_bases.insert(pp_id, swapped);
@@ -1935,12 +2264,20 @@ impl Scheduler {
                         .and_then(|g| g.root_node_id)
                         .unwrap_or(self.astar.last_goal);
                     self.pp_paths.push((pp_id, opt_graph.map(Rc::new)));
+                    if gate_type.is_t() || gate_type.is_m() {
+                        self.frame_executed(pp_id);
+                    }
                     if gate_type.is_t() {
                         *n_avail_magic -= 1;
                         self.stats.inc_t();
                         // With T failures switched off (-F) no correction is ever owed, so the
                         // auto-correction needs no helper and no hold.
-                        if self.t_correction != TCorrection::Legacy && !self.no_t_failures {
+                        let helper_corrected = match self.t_correction {
+                            TCorrection::Litinski | TCorrection::InplaceY => true,
+                            TCorrection::Hybrid => !self.frame_owns(pp_id),
+                            _ => false,
+                        };
+                        if helper_corrected && !self.no_t_failures {
                             self.inject_t(pp_id, magic);
                         }
                     }
@@ -1948,8 +2285,15 @@ impl Scheduler {
                 }
             }
             info_sched!("  Could not schedule {} on graph", pp_id);
-            let pp = self.input.circuit.product(pp_id);
-            Self::mark_blocked_product_as_used(&mut self.used, &self.input.topo, pp);
+            if self.frame_exec.contains_key(&pp_id) {
+                for i in 0..self.precomputed_terminals[pp_id as usize].len() {
+                    let nid = self.precomputed_terminals[pp_id as usize][i];
+                    self.used[nid as usize] = true;
+                }
+            } else {
+                let pp = self.input.circuit.product(pp_id);
+                Self::mark_blocked_product_as_used(&mut self.used, &self.input.topo, pp);
+            }
         }
     }
 
@@ -1981,6 +2325,9 @@ impl Scheduler {
     /// S/SX require two adjacent nodes in the same row (the data qubit and its
     /// horizontal routing nb).
     fn sched_s_sx(&mut self, pp_id: i32, plotting: bool) -> PathResult {
+        if self.terminals_buf.len() == 2 {
+            return self.sched_s_y(pp_id, plotting);
+        }
         let node_id = self.terminals_buf[0];
         let node = self.input.topo.node(node_id);
         if self.used[node.id as usize] {
@@ -2021,6 +2368,17 @@ impl Scheduler {
         PathResult::NoPath
     }
 
+    /// Schedules a pi/4 rotation about Y on one qubit (a scheduler-added correction or flush):
+    /// like a Y measurement it needs both of the qubit's data nodes, joined by a routing tree
+    /// that serves as its ancilla, held for the same lcycles as an S.
+    fn sched_s_y(&mut self, pp_id: i32, plotting: bool) -> PathResult {
+        if self.terminals_buf.iter().any(|&t| self.used[t as usize]) {
+            info_sched!("    Cannot schedule Y rotation {}: a data node is used", pp_id);
+            return PathResult::NoPath;
+        }
+        self.sched_t_or_multi(pp_id, plotting)
+    }
+
     fn sched_t_or_multi(&mut self, pp_id: i32, plotting: bool) -> PathResult {
         debug_assert!(!self.terminals_buf.iter().any(|node_id| self.used[*node_id as usize]));
         let root_ids = self.root_nodes(pp_id as usize, &self.terminals_buf[..]);
@@ -2030,7 +2388,7 @@ impl Scheduler {
         }
         let pp = self.input.circuit.product(pp_id);
         let gate_type = pp.gate_type;
-        let n_operators = pp.operators.len();
+        let n_operators = self.exec_ops(pp_id).len();
         let result = if gate_type.is_t() && n_operators == 1 {
             self.astar.compute(
                 &self.terminals_buf[..],
@@ -2121,8 +2479,53 @@ impl Scheduler {
     /// T gates complete in one lcycle regardless of outcome. A failed T gate
     /// increments `correction_power` for each of its qubits (tracked classically);
     /// no recovery lcycle is needed.
+    /// A T corrected on an ancilla failed: nothing is owed on the data. A magic patch measured in
+    /// place needs the slower Y basis; one still waiting for a helper remembers the failure.
+    fn auto_corrected_failure(&mut self, pp_id: i32) {
+        if let Some((magic, decision)) = self.inplace_pending.remove(&pp_id) {
+            let y = self.y_meas_lcycles;
+            self.t_stats.inplace_y += 1;
+            self.delay_decision(pp_id, y);
+            // Already held through `decision`; extend by the Y measurement.
+            let now = self.current_lcycle;
+            let start = decision.max(now);
+            self.held.push((decision + y, magic));
+            self.t_stats.hold_patch_lcycles += decision + y - start;
+        } else if self.helper_wanted.iter().any(|w| w.0 == pp_id) {
+            self.failed_waiting.insert(pp_id);
+        }
+    }
+
     fn process_t_gate_outcomes(&mut self) {
         let pp_ids: Vec<i32> = self.pp_paths.iter().map(|(id, _)| *id).collect();
+        if self.frame.is_some() {
+            let mut failed = Vec::new();
+            for &pp_id in &pp_ids {
+                if !self.input.circuit.product(pp_id).gate_type.is_t() {
+                    continue;
+                }
+                if self.rng_uniform.gen_bool(0.5) {
+                    info_sched!("  T gate {} succeeded", pp_id);
+                } else if self.frame_owns(pp_id) {
+                    self.t_gate_failures += 1;
+                    info_sched!(
+                        "  T gate {} failed (50% probability), folded into the frame",
+                        pp_id
+                    );
+                    failed.push(pp_id);
+                } else {
+                    self.t_gate_failures += 1;
+                    info_sched!("  T gate {} failed (50% probability), auto-corrected", pp_id);
+                    self.auto_corrected_failure(pp_id);
+                }
+            }
+            self.frame_end_lcycle(&failed);
+            #[cfg(debug_assertions)]
+            if self.t_correction == TCorrection::Hybrid {
+                assert!(self.frame.as_ref().unwrap().is_local(), "hybrid frame became entangling");
+            }
+            return;
+        }
         for pp_id in pp_ids {
             let pp = self.input.circuit.product(pp_id);
             if !pp.gate_type.is_t() {
@@ -2138,18 +2541,7 @@ impl Scheduler {
                     // nothing is owed on the data. A magic patch measured in place needs the
                     // slower Y basis; one still waiting for a helper remembers the failure.
                     info_sched!("  T gate {} failed (50% probability), auto-corrected", pp_id);
-                    if let Some((magic, decision)) = self.inplace_pending.remove(&pp_id) {
-                        let y = self.y_meas_lcycles;
-                        self.t_stats.inplace_y += 1;
-                        self.delay_decision(pp_id, y);
-                        // Already held through `decision`; extend by the Y measurement.
-                        let now = self.current_lcycle;
-                        let start = decision.max(now);
-                        self.held.push((decision + y, magic));
-                        self.t_stats.hold_patch_lcycles += decision + y - start;
-                    } else if self.helper_wanted.iter().any(|w| w.0 == pp_id) {
-                        self.failed_waiting.insert(pp_id);
-                    }
+                    self.auto_corrected_failure(pp_id);
                     continue;
                 }
                 info_sched!("  T gate {} failed (50% probability), S correction tracked", pp_id);
@@ -2286,6 +2678,43 @@ impl Scheduler {
         println!("T gate failures: {}/{} ({:.1}%)", self.t_gate_failures, tot_t, fail_pct);
         match self.t_correction {
             TCorrection::Legacy => println!("T correction: legacy (per-qubit S record)"),
+            TCorrection::Hybrid => {
+                let f = &self.frame_stats;
+                println!(
+                    "T correction: Hybrid; {} one-qubit failures and {} physical Cliffords folded \
+                     into the frame, {} flush rotations before CX, {} T/M rewritten of {}, {} \
+                     product-lcycles waiting for decoding; multi-qubit T: {} injections, {} helper \
+                     patches ({} found none), {} patch-lcycles held",
+                    f.failures,
+                    f.cliffords,
+                    f.flushes,
+                    f.rewritten,
+                    f.products,
+                    f.waits,
+                    self.t_stats.injections,
+                    self.t_stats.helpers,
+                    self.t_stats.helpers_missing,
+                    self.t_stats.hold_patch_lcycles
+                );
+            }
+            TCorrection::Frame => {
+                let f = &self.frame_stats;
+                let avg =
+                    |w: usize| if f.products > 0 { w as f64 / f.products as f64 } else { 0.0 };
+                println!(
+                    "T correction: Frame; {} failures and {} physical Cliffords folded into the \
+                     frame, {} T/M rewritten of {}, mean weight {:.2} as written -> {:.2} executed, \
+                     max {}, {} product-lcycles waiting for decoding",
+                    f.failures,
+                    f.cliffords,
+                    f.rewritten,
+                    f.products,
+                    avg(f.ideal_weight),
+                    avg(f.exec_weight),
+                    f.max_exec_weight,
+                    f.waits
+                );
+            }
             mode => println!(
                 "T correction: {:?}; {} injections, {} helper patches ({} waited for one, {} \
                  found none), {} patch-lcycles held, max decision delay {} lcycles, {} measured \
@@ -2910,6 +3339,18 @@ mod tests {
     }
 
     /// The lcycle in which product `id` was scheduled.
+    /// Every lcycle product `id` occupies (several for an S or CX).
+    fn lcycles_of(sched: &Scheduler, id: i32) -> Vec<usize> {
+        let v: Vec<usize> = sched
+            .lcycle_scheduled
+            .iter()
+            .filter(|(_, ids)| ids.contains(&id))
+            .map(|(l, _)| *l)
+            .collect();
+        assert!(!v.is_empty(), "product {} was never scheduled", id);
+        v
+    }
+
     fn lcycle_of(sched: &Scheduler, id: i32) -> usize {
         sched
             .lcycle_scheduled
@@ -3232,6 +3673,213 @@ mod tests {
     }
 
     #[test]
+    fn frame_mode_runs_every_product_once_and_rewrites_after_failures() {
+        let n_tm =
+            T_HEAVY_LINES.iter().filter(|l| l.ends_with("<T>") || l.ends_with("<M>")).count();
+        let mut rewrote = false;
+        for latency in [0usize, 2] {
+            for rseed in 0u32..8 {
+                let mut sched = build_scheduler(T_HEAVY_LINES, rseed);
+                sched.set_t_correction(TCorrection::Frame);
+                sched.set_reaction_latency(latency);
+                let n_products = sched.input.circuit.n_products();
+                let (_, n) = sched.sched_circuit().expect("sched_circuit failed");
+                let f = &sched.frame_stats;
+                assert_eq!(n, n_products, "no correction products in frame mode");
+                assert_eq!(f.products, n_tm, "every T and measurement logged once");
+                assert_eq!(f.failures, sched.t_gate_failures);
+                assert_eq!(sched.correction_power.iter().filter(|&&p| p != 0).count(), 0);
+                assert_eq!(sched.t_stats.injections, 0, "no helper machinery");
+                if latency == 0 {
+                    assert_eq!(f.waits, 0, "nothing waits when outcomes are known at once");
+                }
+                // Weights are counted from the log.
+                let w: usize = f.log.iter().map(|(_, _, ops)| ops.len()).sum();
+                assert_eq!(w, f.exec_weight);
+                rewrote |= f.rewritten > 0;
+            }
+        }
+        assert!(rewrote, "some seed must rewrite a product after a failure");
+    }
+
+    #[test]
+    fn frame_mode_waits_for_an_anticommuting_outcome() {
+        // T about Z then a measurement of X on the same qubit: with latency 3 the measurement
+        // starts at least 4 lcycles after the T, whatever the T's outcome.
+        for rseed in 0u32..8 {
+            let mut sched = build_scheduler(&["+Z___<T>", "+X___<M>"], rseed);
+            sched.set_t_correction(TCorrection::Frame);
+            sched.set_reaction_latency(3);
+            sched.sched_circuit().expect("sched_circuit failed");
+            let log = &sched.frame_stats.log;
+            let t_at = log.iter().find(|e| e.1 == 0).unwrap().0;
+            let m_at = log.iter().find(|e| e.1 == 1).unwrap().0;
+            assert!(m_at >= t_at + 4, "seed {}: T at {}, M at {}", rseed, t_at, m_at);
+            // A commuting measurement need not wait.
+            let mut sched = build_scheduler(&["+Z___<T>", "+Z___<M>"], rseed);
+            sched.set_t_correction(TCorrection::Frame);
+            sched.set_reaction_latency(3);
+            sched.sched_circuit().expect("sched_circuit failed");
+            assert_eq!(sched.frame_stats.waits, 0);
+        }
+    }
+
+    #[test]
+    fn frame_mode_without_failures_matches_legacy() {
+        // With -F nothing is owed, so every model gives the same schedule.
+        for rseed in 0u32..4 {
+            let lc = |mode: TCorrection| {
+                Node::set_magic_routing(true);
+                let mut f = NamedTempFile::new().unwrap();
+                for line in T_HEAVY_LINES {
+                    writeln!(f, "{}", line).unwrap();
+                }
+                let mut circuit = Circuit::new(&f.path().to_string_lossy().to_string());
+                circuit.load_circuit().unwrap();
+                let mut topo = TopoGraph::new();
+                topo.set_topo(4, &"dummy".to_string(), &"".to_string(), &0, true, 1, false);
+                let mut s = Scheduler::new(
+                    circuit,
+                    topo,
+                    0.0387396,
+                    "none",
+                    String::new(),
+                    rseed,
+                    true,
+                    false,
+                );
+                s.set_t_correction(mode);
+                s.set_reaction_latency(2);
+                s.sched_circuit().unwrap().0
+            };
+            assert_eq!(lc(TCorrection::Frame), lc(TCorrection::Legacy));
+        }
+    }
+
+    /// One-qubit T gates about every axis between CXs in both directions, a multi-qubit T and
+    /// measurements: exercises every hybrid path.
+    const HYBRID_LINES: &[&str] = &[
+        "+X___<T>",
+        "+_Y__<T>",
+        "+ZX__<CX>",
+        "+Y___<T>",
+        "+_Z__<T>",
+        "+XZ__<CX>",
+        "+Z___<T>",
+        "+__X_<T>",
+        "+_ZX_<CX>",
+        "+XXZ_<T>",
+        "+___Y<T>",
+        "+__XZ<CX>",
+        "+Y___<T>",
+        "+ZX__<CX>",
+        "+_Z__<S>",
+        "+__X_<SX>",
+        "+X___<M>",
+        "+_Y__<M>",
+        "+__ZX<M>",
+        "+___X<M>",
+    ];
+
+    #[test]
+    fn hybrid_keeps_the_frame_local_and_supports_unchanged() {
+        let mut flushed = false;
+        for latency in [0usize, 2] {
+            for rseed in 0u32..12 {
+                let mut sched = build_scheduler(HYBRID_LINES, rseed);
+                sched.set_t_correction(TCorrection::Hybrid);
+                sched.set_reaction_latency(latency);
+                sched.sched_circuit().expect("sched_circuit failed");
+                assert!(sched.frame.as_ref().unwrap().is_local(), "seed {}", rseed);
+                let f = &sched.frame_stats;
+                // A local frame changes letters, never supports.
+                for (_, pp_id, ops) in &f.log {
+                    let ideal: Vec<u16> = sched
+                        .input
+                        .circuit
+                        .product(*pp_id)
+                        .operators
+                        .iter()
+                        .map(|o| o.qubit)
+                        .collect();
+                    let exec: Vec<u16> = ops.iter().map(|o| o.qubit).collect();
+                    assert_eq!(ideal, exec, "seed {}: product {} changed support", rseed, pp_id);
+                }
+                // The multi-qubit T goes to the helper, the one-qubit ones to the frame.
+                assert_eq!(sched.t_stats.injections, 1);
+                assert_eq!(f.flushes, sched.correction_gates_emitted);
+                flushed |= f.flushes > 0;
+            }
+        }
+        assert!(flushed, "some seed must need a flush rotation before a CX");
+    }
+
+    #[test]
+    fn hybrid_runs_a_cx_only_after_its_flush() {
+        // T about X on the control fails -> W Z_0 W^dag = Y_0, which does not commute with the CX:
+        // a rotation runs on q0 first, and the CX starts after it ends.
+        let mut checked = 0;
+        for rseed in 0u32..16 {
+            let mut sched = build_scheduler(&["+X___<T>", "+ZX__<CX>"], rseed);
+            sched.set_t_correction(TCorrection::Hybrid);
+            sched.sched_circuit().expect("sched_circuit failed");
+            if sched.t_gate_failures == 0 {
+                assert_eq!(sched.frame_stats.flushes, 0);
+                continue;
+            }
+            checked += 1;
+            assert_eq!(sched.frame_stats.flushes, 1, "a transposition needs one rotation");
+            let flush_end = lcycles_of(&sched, 2).into_iter().max().unwrap();
+            let cx_start = lcycles_of(&sched, 1).into_iter().min().unwrap();
+            assert!(
+                cx_start > flush_end,
+                "seed {}: CX at {}, flush until {}",
+                rseed,
+                cx_start,
+                flush_end
+            );
+        }
+        assert!(checked > 0);
+    }
+
+    #[test]
+    fn hybrid_without_failures_matches_legacy() {
+        for rseed in 0u32..4 {
+            let lc = |mode: TCorrection| {
+                Node::set_magic_routing(true);
+                let mut f = NamedTempFile::new().unwrap();
+                for line in HYBRID_LINES {
+                    writeln!(f, "{}", line).unwrap();
+                }
+                let mut circuit = Circuit::new(&f.path().to_string_lossy().to_string());
+                circuit.load_circuit().unwrap();
+                let mut topo = TopoGraph::new();
+                topo.set_topo(4, &"dummy".to_string(), &"".to_string(), &0, true, 1, false);
+                let mut s = Scheduler::new(
+                    circuit,
+                    topo,
+                    0.0387396,
+                    "none",
+                    String::new(),
+                    rseed,
+                    true,
+                    false,
+                );
+                s.set_t_correction(mode);
+                s.sched_circuit().unwrap().0
+            };
+            assert_eq!(lc(TCorrection::Hybrid), lc(TCorrection::Legacy));
+        }
+    }
+
+    #[test]
+    fn frame_mode_rejects_hosted_ancillas() {
+        let mut sched = hosted_scheduler(HOSTED_LINES, &[3], 0);
+        sched.set_t_correction(TCorrection::Frame);
+        assert!(sched.sched_circuit().is_err());
+    }
+
+    #[test]
     fn legacy_mode_still_tracks_per_qubit_corrections() {
         // The old model stays available for comparison: some seed must relabel a product.
         let relabelled = (0u32..16).any(|rseed| {
@@ -3477,9 +4125,11 @@ mod tests {
 
     // ── measurements under a pending T-failure correction ───────────────────────────
 
-    /// Runs `lines` with a pending S correction (power 1, about `axis`) on qubit `q` at the start.
+    /// Runs `lines` with a pending S correction (power 1, about `axis`) on qubit `q` at the start,
+    /// under the legacy model (the only one that keeps per-qubit corrections).
     fn run_with_pending(lines: &[&str], q: usize, axis: char) -> Scheduler {
         let mut sched = build_scheduler(lines, 0);
+        sched.set_t_correction(TCorrection::Legacy);
         sched.correction_power[q] = 1;
         sched.correction_basis[q] = axis;
         sched.sched_circuit().expect("sched_circuit failed");
