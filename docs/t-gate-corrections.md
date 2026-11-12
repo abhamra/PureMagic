@@ -8,7 +8,7 @@ wrong, the two models that replace it, and a third that was tried and is kept as
 
 | Flag | Values | Default |
 |---|---|---|
-| `--t-correction` | `litinski`, `inplace-y`, `frame`, `legacy` | `litinski` |
+| `--t-correction` | `litinski`, `inplace-y`, `frame`, `hybrid`, `legacy` | `litinski` |
 | `--y-meas-lcycles` | extra lcycles for an in-place Y measurement | 1 |
 | `--reaction-latency` | lcycles to decode an outcome and act on it (also used for `@` edges) | 0 |
 
@@ -118,6 +118,27 @@ stay Pauli measurements), but not into T gates:
 
 The frame keeps signs out (only supports and letters affect scheduling). It is a GF(2) tableau on
 64-qubit words, so rewriting a product costs O(weight · n/64) word operations.
+
+## 3b. Local frame with flushes (`--t-correction hybrid`)
+
+The exact frame grows products because physical CX lines carry it onto more qubits. The hybrid
+keeps the frame *local*, one one-qubit Clifford per qubit, so a product keeps its support and only
+its letters change:
+
+- **One-qubit T** that fails: folded into the frame (no helper, no hold).
+- **Multi-qubit T** that fails: auto-corrected on a helper as in `litinski`. Its correction is
+  entangling, so it never enters the frame.
+- **Physical S/SX:** pass through the frame (it stays local).
+- **Physical CX:** runs only if the control's frame fixes Z and the target's frame fixes X (then
+  the CX commutes with the frame up to Paulis). Otherwise one or two π/4 one-qubit rotations about
+  X, Y or Z are applied physically first, bringing that qubit's frame to the identity. A rotation
+  about Y uses both of the qubit's data nodes, as a Y measurement does.
+- **Waits:** a T or measurement that anticommutes with a one-qubit T injected in the last L
+  lcycles waits for that outcome, as in `frame`. A CX also waits for undecoded one-qubit T
+  outcomes on its qubits, because they decide whether a rotation is needed.
+
+Like `frame`, it does not support `--ancilla-qubits` yet. With a local frame this would only need
+the release rule to use the executed letter, and the frame cleared when a patch is re-prepared.
 
 ## 4. Approximations
 
@@ -246,8 +267,40 @@ as written and as executed, and the largest executed weight (seed 0, L = 0):
   penalizes them more than Orig (vqe_6 at L = 0: Orig +0%, DC-opt +25%). Litinski charges both
   alike.
 
-`litinski` stays the default. `frame` is kept for circuits without physical Cliffords at low
-latency, and as the reference for an exact frame.
+### The hybrid model
+
+Added to the same comparisons (all ancillas as data patches), every run passing the checker.
+Geomean lcycles relative to `legacy`:
+
+| Set | L | litinski | frame | hybrid |
+|---|---|---|---|---|
+| 24 circuits as transpiled (w unlimited except 5 at `-m 1`) | 0 | +4.1% | +9.6% | +4.1% |
+| | 1 | +6.7% | +23.2% | +14.1% |
+| | 2 | +25.3% | +40.4% | +29.0% |
+| | 4 | +74.3% | +79.8% | +69.1% |
+| 19 circuits, all at `-m 1` | 0 | +3.2% | +19.5% | +2.7% |
+| | 1 | +5.7% | +30.1% | +17.5% |
+| | 4 | +67.4% | +79.9% | +77.3% |
+| 4 large PureMagic benchmarks at `-m 1` | 0 | +1.9% | +465% (3 circuits) | +4.2% |
+| | 1 | +4.8% | +457% (3 circuits) | +45.9% |
+| | 4 | +183.5% | +497% (3 circuits) | +184.9% |
+
+(The large set is qaoa N149, qft n160, square_heisenberg N225 and grover n100; frame mode did not
+finish on grover n100, and qv N064 and fermi_hubbard 128q were run for the hybrid only.)
+
+- **The hybrid removes the growth.** Products keep their weight, so it runs as fast as Litinski
+  (qft n160: 5.7 s per schedule vs 5.6 s, frame 40.8 s), and at L = 0 it matches or slightly beats
+  Litinski (+2.7% vs +3.2% at `-m 1`), with no helper patches at all for one-qubit T gates.
+- **From L = 1 it loses to Litinski.** Runs of one-qubit T gates about alternating axes (the
+  output of single-qubit rotation synthesis) still wait L lcycles per T on the data path, and CXs
+  wait too. Litinski moves those waits onto helper patches: +6.7% vs +14.1% (w unlimited), +4.8%
+  vs +45.9% (large `-m 1`).
+- **At L = 4 the reaction limit dominates every model,** and the hybrid is even with or slightly
+  ahead of Litinski on some sets (+69.1% vs +74.3%; qft n160 +145% vs +225%).
+
+`litinski` stays the default: it is the best model at every latency from 1 up, and within a point
+of the best at 0. `hybrid` is the better choice at zero reaction latency; `frame` is kept as the
+reference for an exact frame.
 
 ### DC-opt vs Orig
 
@@ -275,7 +328,10 @@ from before this change are optimistic by the amounts above.
   (T gates and measurements of weight 1–3, physical S/Sdg/SX/SXdg/CX), replayed from the trace in
   execution order (`bench_results/t_correction_bug/fuzz_frame.py`, `check.py`). Every executed T
   and measurement matches, and flipping the outcome of any T not yet decoded never changes a
-  product that already ran.
+  product that already ran. The hybrid is fuzzed the same way (960 runs over 80 circuits in
+  both modes) and additionally checked never to run a CX that the frame does not commute with,
+  also with any undecoded outcome flipped. Unit tests: `hybrid_keeps_the_frame_local_and_supports_unchanged`,
+  `hybrid_runs_a_cx_only_after_its_flush`, `hybrid_without_failures_matches_legacy`.
 - The schedule checker (`data_processing/plot_dynamic.py`) passes on every comparison run.
 - A two-qubit circuit that shows both problems, and the one-qubit circuit above, were run with
   every model and compared with an exact Clifford-tableau calculation. `legacy` executes 4 and 2

@@ -26,6 +26,7 @@ the reference for how it works. Branch: `mcm-ancilla`, which contains `mcm-suppo
 | 563a4ef | t-autocorrect-litinski | `--t-correction inplace-y` (Gidney in-place Y) and `--y-meas-lcycles` |
 | a76ea98 | mcm-support | Merge of t-autocorrect-litinski: `mcm-support` now holds all of the above |
 | e563b71, 4c53671 | t-correction-frame | `--t-correction frame`: failed T corrections folded into an exact Clifford frame (opt-in; loses to `litinski`, see §5 and `docs/t-gate-corrections.md` §3a) |
+| 5634c69 | t-correction-frame | `--t-correction hybrid`: local frame for one-qubit T gates, cleared by rotations before CX; helper for multi-qubit T gates (`docs/t-gate-corrections.md` §3b) |
 
 ## 1. Model
 
@@ -252,6 +253,17 @@ the flushes that conditional gates cause at transpile time (§8), which is Level
     DC-opt: mean T/M weight 1.24 → 7.31). Long runs of non-commuting T gates stall the data from
     L = 1. Because DC circuits carry the physical Cliffords, it penalizes DC more than Orig. It
     wins only on circuits without physical Cliffords at low latency (9 of 24 at L = 0).
+- **Hybrid model** (`--t-correction hybrid`, 5634c69, opt-in). Keeps the frame local so products
+  never grow:
+  - **Failures:** a failed one-qubit T is folded into the frame; a failed multi-qubit T goes to a
+    Litinski helper.
+  - **Cliffords:** S/SX pass through. Before a CX the frame does not commute with, one or two π/4
+    one-qubit rotations are applied physically, as scheduler-added S-type products (`S`, `SX`, or
+    `SY` on both data nodes), and the CX waits for them and for undecoded one-qubit outcomes on its
+    qubits.
+  - **Cost:** matches Litinski at L = 0 (+4.1% vs +4.1%; +2.7% vs +3.2% at `-m 1`) and runs as
+    fast, but loses from L = 1 (+14.1% vs +6.7%), because runs of one-qubit T gates wait on the
+    data path.
 - **Legacy model.** The S correction is tracked per qubit (`correction_power`) and applied
   lazily: it is merged into the next Clifford on that qubit, or later T bases are conjugated
   (`t_conjugated_bases`).
