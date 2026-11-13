@@ -74,9 +74,11 @@ struct Args {
     /// modelling the time to decode a logical measurement before acting on its outcome. 0 = ideal.
     #[arg(long = "reaction-latency", default_value_t = 0)]
     reaction_latency: usize,
-    /// How a failed T injection is corrected: `litinski` (auto-corrected pi/8 rotation: a borrowed
-    /// |0> helper next to the magic patch, held until the correction is decided; nothing owed on
-    /// the data), `inplace-y` (no helper: the magic patch is held until the decision and then
+    /// How a failed T injection is corrected: `litinski-ready` (auto-corrected pi/8 rotation: a
+    /// borrowed |0> helper next to the magic patch, held until the correction is decided; nothing
+    /// owed on the data; a ready magic state may be wasted as the helper when no other neighbour
+    /// is free), `litinski-y` (the same, but never wasting a ready state: an injection with no
+    /// helper waits, then has its magic patch measured in place in X or Y), `inplace-y` (no helper: the magic patch is held until the decision and then
     /// measured in X, or in Y for a failed T), `frame` (no correction: an exact Clifford frame
     /// rewrites every later T and measurement; they wait for undecoded outcomes they depend on),
     /// `hybrid` (frame for one-qubit T gates, kept local by rotations before CX; helper for
@@ -84,10 +86,10 @@ struct Args {
     /// or `legacy` (the old per-qubit S record, which is
     /// incorrect for multi-qubit T gates and for failures about different axes; kept to compare
     /// against).
-    #[arg(long = "t-correction", value_enum, default_value_t = scheduler::TCorrection::Litinski)]
+    #[arg(long = "t-correction", value_enum, default_value_t = scheduler::TCorrection::LitinskiReady)]
     t_correction: scheduler::TCorrection,
     /// Extra lcycles an in-place Y measurement of a magic patch takes (`inplace-y`, and
-    /// `litinski` injections that found no helper). Gidney's in-place Y measurement takes
+    /// Litinski injections that found no helper, mostly `litinski-y`). Gidney's in-place Y measurement takes
     /// floor(d/2)+2 rounds, about half an lcycle; the default rounds it up to 1.
     #[arg(long = "y-meas-lcycles", default_value_t = 1)]
     y_meas_lcycles: usize,

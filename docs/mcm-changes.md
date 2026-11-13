@@ -14,7 +14,7 @@ In this repository (`PureMagic/`, branch `mcm-support`):
 | File | What it holds |
 |---|---|
 | `docs/mcm-changes.md` | This file: change log (commit table below), MCM specification, scheduler notes, known limitations, plans |
-| `docs/t-gate-corrections.md` | Failed-T corrections: the two bugs in the old model, the five `--t-correction` models, their comparisons, approximations, choosing `--reaction-latency` |
+| `docs/t-gate-corrections.md` | Failed-T corrections: the two bugs in the old model, the six `--t-correction` models, their comparisons, approximations, choosing `--reaction-latency` |
 | `docs/dynamic-circuits.md` | User guide for dynamic circuits (how to run them) |
 | `README.md` | Every command-line flag |
 | `notebooks/dynamic_circuit_tutorial.ipynb` | Walkthrough of a small dynamic circuit end to end |
@@ -54,6 +54,7 @@ Next to it, in `../bench_results/` (benchmark data, not in the repository):
 | a76ea98 | mcm-support | Merge of t-autocorrect-litinski: `mcm-support` now holds all of the above |
 | e563b71, 4c53671 | t-correction-frame | `--t-correction frame`: failed T corrections folded into an exact Clifford frame (opt-in; loses to `litinski`, see §5 and `docs/t-gate-corrections.md` §3a) |
 | 5634c69 | t-correction-frame | `--t-correction hybrid`: local frame for one-qubit T gates, cleared by rotations before CX; helper for multi-qubit T gates (`docs/t-gate-corrections.md` §3b) |
+| (this change) | t-correction-fix | `litinski` split into `litinski-ready` (new default: a ready magic state may be wasted as the helper) and `litinski-y` (the old `litinski`: never waste a ready state, fall back to an in-place X/Y measurement); `docs/t-gate-corrections.md` §2.1–2.2 |
 
 ## 1. Model
 
@@ -254,10 +255,12 @@ the flushes that conditional gates cause at transpile time (§8), which is Level
 
 ### Other scheduler details that matter for dynamic circuits
 
-- **T failures** are a 50% coin flip per executed T. By default (`--t-correction litinski`) the
-  correction is applied on a borrowed helper patch, so nothing is owed on the data; the helper is
-  held until the correction is decided (reaction latency, chained through earlier anticommuting
-  T gates). See `docs/t-gate-corrections.md`. The two bullets below describe only
+- **T failures** are a 50% coin flip per executed T. By default (`--t-correction litinski-ready`)
+  the correction is applied on a borrowed helper patch, so nothing is owed on the data; the helper
+  is held until the correction is decided (reaction latency, chained through earlier
+  anticommuting T gates). When no bus or cultivating neighbour is free, `litinski-ready` wastes a
+  ready magic state as the helper, while `litinski-y` (the former `litinski`) waits and then
+  measures the magic patch in place in X or Y. See `docs/t-gate-corrections.md`. The two bullets below describe only
   `--t-correction legacy`, which is kept to compare against.
 - **Exact-frame model** (`--t-correction frame`, e563b71, opt-in). No correction is ever applied.
   The scheduler keeps an exact Clifford frame W (`src/frame.rs`, a GF(2) tableau without signs)
@@ -288,7 +291,7 @@ the flushes that conditional gates cause at transpile time (§8), which is Level
   1. **A failed one-qubit T** (say about Z₃) is folded into the frame: nothing physical happens
      and no helper is used. The frame now records "S about Z pending on qubit 3".
   2. **A failed multi-qubit T** (say about Z₀Z₁) would put an entangling correction in the frame,
-     so it is auto-corrected on a borrowed helper patch exactly as in `litinski` instead.
+     so it is auto-corrected on a borrowed helper patch exactly as in `litinski-y` instead.
   3. **Every T and measurement about Q** runs about W·Q·W†. A local frame only changes letters:
      with S_Z pending on qubit 3, a T about X₃ runs as a T about Y₃, on the same patch (a Y
      uses both of the qubit's data nodes).

@@ -4,11 +4,18 @@ A T gate in the Pauli-based circuit is a π/8 rotation R_P(π/8) = e^{−iπ/8·
 product P. It is injected by measuring P⊗Z_m jointly with a magic-state patch m. Half the time
 the rotation comes out as R_P(−π/8), and the circuit then owes the Clifford correction
 R_P(π/4). This document covers how PureMagic used to account for that correction, why that was
-wrong, the two models that replace it, and a third that was tried and is kept as an option.
+wrong, and the models that replace it. Litinski's auto-corrected rotation comes in two variants
+that differ only in which patch may be the helper:
+
+- `litinski-ready` (default): when no bus or cultivating neighbour is free, a ready magic state
+  is borrowed as the helper and its state is wasted (§2.1);
+- `litinski-y`: a ready state is never borrowed; an injection without a helper waits, then has
+  its magic patch measured in place in X or Y, Gidney's technique (§2.2). This is what
+  `litinski` meant before the split, and every result below labelled `litinski` is this variant.
 
 | Flag | Values | Default |
 |---|---|---|
-| `--t-correction` | `litinski`, `inplace-y`, `frame`, `hybrid`, `legacy` | `litinski` |
+| `--t-correction` | `litinski-ready`, `litinski-y`, `inplace-y`, `frame`, `hybrid`, `legacy` | `litinski-ready` |
 | `--y-meas-lcycles` | extra lcycles for an in-place Y measurement | 1 |
 | `--reaction-latency` | lcycles to decode an outcome and act on it (also used for `@` edges) | 0 |
 
@@ -40,7 +47,7 @@ model also charged no decoding time before a correction is decided.
 
 `legacy` is kept only for comparison. It reproduces the old schedules line for line.
 
-## 2. Auto-corrected π/8 rotation (`--t-correction litinski`, default)
+## 2. Auto-corrected π/8 rotation (`litinski-ready`, default, and `litinski-y`)
 
 Litinski, *A Game of Surface Codes* (Quantum 3, 128, 2019), auto-corrected π/8 rotations. With a
 |0⟩ helper patch h next to the magic patch m:
@@ -54,19 +61,54 @@ The correction is a choice of measurement basis on an ancilla. Every outcome onl
 the frame, so **no later product is ever changed and no S gate is emitted.** Only the helper
 waits.
 
-What the scheduler does:
+What the scheduler does in both variants:
 
 - **Helper.** A free neighbour of the magic patch, borrowed in the injection lcycle. A bus
   patch comes first, then the cultivating magic patch with the least progress (its cultivation
-  restarts). Never a data patch, a hosted patch, or a ready magic state. With magic routing
-  (`-u`) there are no bus patches, so the helper is always a cultivating magic patch. No patch
-  is dedicated to helpers, so injection stays single-patch.
-- **No free neighbour yet.** The injection waits up to 2 lcycles for one, holding the magic
-  patch. After that, or if no neighbour could ever be a helper, the magic patch is measured in
-  place (section 3). Waiting longer could deadlock two magic patches that wait on each other.
+  restarts). Never a data patch or a hosted patch. With magic routing (`-u`) there are no bus
+  patches, so the helper is always a magic patch. No patch is dedicated to helpers, so injection
+  stays single-patch.
+- **The helper need not be adjacent in principle.** Z_m⊗Y_h could be routed through free tiles to
+  a patch farther away. In this tile model that never helps: any free tile a route could start
+  through can host the helper itself, so the nearest free candidate is always adjacent. A routed
+  search was implemented (on `t-correction-fix`) and found no non-adjacent helper on any
+  benchmark.
 - **Hold.** The helper stays occupied until the correction is decided (the decision lcycle below).
   Data-side products are never delayed: the helper's measurement acts on a different patch, so
   it commutes with everything that follows on the data.
+
+The variants differ when no bus or cultivating neighbour is free. The free neighbours left are
+then usually ready magic states (on most failed searches in the PureMagic benchmarks).
+
+### 2.1 `--t-correction litinski-ready` (default): waste a ready state
+
+A ready magic state is borrowed as the helper, last in the order above; its state is lost and the
+patch starts cultivating again. Fewer injections wait for a helper, and the in-place fallback of
+§2.2 is kept only as a safety net (a magic patch with no free neighbour at all for 2 lcycles).
+
+Measured against `litinski-y` (geomean lcycles; seeds 0–1):
+
+| Set | L = 0 | L = 1 | Better / worse on |
+|---|---|---|---|
+| 5 PureMagic benchmarks at `-m 0` and `-m 1` (10 circuits, no hosting) | −0.3 points vs the old model (+2.7% vs +3.0%) | −0.3 points (+5.1% vs +5.4%) | 6 better at both L, 3 worse, 1 mixed |
+| 7 dcsynth benchmarks, Orig and DC-opt (14 circuits, ancillas hosted) | +1.6% | +1.6% | 3–4 better, 10–11 worse |
+
+On the PureMagic benchmarks, waits for a helper drop from 28.3% to 6.1% of injections, the
+in-place fallback (0.47%) disappears, and 16.5% of helpers are wasted ready states. On the
+dcsynth benchmarks the fallback also disappears (6,828 injections over the runs, to 0) and waits
+halve (421,224 to 122,409), but the 214,889 wasted ready states cost more: these circuits are
+T-dense and limited by magic-state supply. `litinski-ready` is the default; for the dcsynth
+comparisons in this repository, `litinski-y` is the cheaper choice and matches the results
+reported below.
+
+### 2.2 `--t-correction litinski-y`: never waste a ready state; in-place Y fallback
+
+A ready magic state is never a helper. An injection with no other free neighbour waits for one,
+holding its magic patch. After 2 lcycles, or at once if no neighbour could ever be a helper, the
+magic patch is measured in place instead (section 3, Gidney): it is held until the decision and
+measured in X (no correction) or Y (applies it). Waiting longer could deadlock two magic patches
+that each occupy the other's only free neighbour: without the 2-lcycle limit, 4 of 20 PureMagic
+benchmark runs took 1–4 million lcycles instead of 1,500–14,000.
 
 ### When is the correction decided?
 
@@ -126,7 +168,7 @@ keeps the frame *local*, one one-qubit Clifford per qubit, so a product keeps it
 its letters change:
 
 - **One-qubit T** that fails: folded into the frame (no helper, no hold).
-- **Multi-qubit T** that fails: auto-corrected on a helper as in `litinski`. Its correction is
+- **Multi-qubit T** that fails: auto-corrected on a helper as in `litinski-y` (never a ready state). Its correction is
   entangling, so it never enters the frame.
 - **Physical S/SX:** pass through the frame (it stays local).
 - **Physical CX:** runs only if the control's frame fixes Z and the target's frame fixes X (then
@@ -316,8 +358,9 @@ finish on grover n100, and qv N064 and fermi_hubbard 128q were run for the hybri
 - **At L = 4 the reaction limit dominates every model,** and the hybrid is even with or slightly
   ahead of Litinski on some sets (+69.1% vs +74.3%; qft n160 +145% vs +225%).
 
-`litinski` stays the default: it is the best model at every latency from 1 up, and within a point
-of the best at 0. `hybrid` is the better choice at zero reaction latency; `frame` is kept as the
+`litinski` (now `litinski-y`) was the best of these models at every latency from 1 up, and within
+a point of the best at 0; `litinski-ready` (§2.1) is cheaper still on the PureMagic benchmarks
+and is the default. `hybrid` is the better choice at zero reaction latency; `frame` is kept as the
 reference for an exact frame.
 
 ### DC-opt vs Orig

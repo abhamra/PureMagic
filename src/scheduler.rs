@@ -182,8 +182,16 @@ pub(crate) enum TCorrection {
     /// is decoded the helper is measured in X or Z, which applies the correction or not. No
     /// Clifford ever reaches the data: later products are never changed and no S gate is
     /// emitted. The helper is held until that decision (reaction latency, chained through
-    /// earlier T gates whose Paulis anticommute).
-    Litinski,
+    /// earlier T gates whose Paulis anticommute). The helper is a bus patch, else a cultivating
+    /// magic patch, else a ready magic state, whose state is wasted. An injection that finds no
+    /// helper within `HELPER_MAX_WAIT` lcycles has its magic patch measured in place instead (in
+    /// X, or in Y for a failed T); with ready states allowed this is rare. The default.
+    LitinskiReady,
+    /// As `litinski-ready`, but a ready magic state is never borrowed as the helper. Injections
+    /// whose free neighbours are all ready states wait for a helper, and after `HELPER_MAX_WAIT`
+    /// lcycles fall back to measuring the magic patch in place in X or Y (Gidney). This was
+    /// `litinski` before the two were split.
+    LitinskiY,
     /// In-place Y measurement (Gidney, "Inplace Access to the Surface Code Y Basis", Quantum
     /// 2024): no helper. After P (x) Z_m the magic patch itself is held until the correction is
     /// decided, then measured in X (no correction) or Y (applies it). A Y measurement takes
@@ -374,6 +382,8 @@ pub(crate) struct TCorrectionStats {
     /// |0> helper patches borrowed (Litinski), and how many had to wait for a free neighbour.
     pub(crate) helpers: usize,
     pub(crate) helpers_deferred: usize,
+    /// Helpers that were ready magic states (`litinski-ready`; the state is wasted).
+    pub(crate) helpers_ready: usize,
     /// Injections that found no helper within `HELPER_MAX_WAIT` lcycles (or whose magic patch
     /// has no neighbour that could ever be one). Their magic patch is measured in place (the
     /// in-place Y measurement) instead; see docs/t-gate-corrections.md.
@@ -483,7 +493,7 @@ impl Scheduler {
             skipped_set: HashSet::new(),
             n_skipped_t: 0,
             hosted: HostedAncillas::default(),
-            t_correction: TCorrection::Litinski,
+            t_correction: TCorrection::LitinskiReady,
             held: Vec::new(),
             helper_wanted: Vec::new(),
             inplace_pending: HashMap::new(),
@@ -793,9 +803,11 @@ impl Scheduler {
     /// Rank of node `nb` as a |0> helper for a T injection, lower is better, or None if it can
     /// never be one (a data patch, a hosted patch, the route-only half of one). A free routing
     /// (bus) patch comes first, then the cultivating magic patch with the least progress (its
-    /// cultivation restarts). With magic routing (-u) there are no bus patches, so the helper is
-    /// always a cultivating magic patch. A ready magic state is never borrowed: it would waste
-    /// the state, and a T waiting for it could find none left.
+    /// cultivation restarts), and last, with `litinski-ready` only, a ready magic state, which
+    /// is wasted. With magic routing (-u) there are no bus patches, so the helper is always a
+    /// magic patch. Without the last resort (`litinski-y`, and the hybrid's helpers), the free
+    /// neighbours of a magic patch are often all ready states, and injections wait for a helper
+    /// or fall back to measuring the magic patch in place.
     fn helper_rank(&self, nb: u16) -> Option<(u8, i32)> {
         let topo = &self.input.topo;
         if topo.is_hosted(nb) {
@@ -806,8 +818,21 @@ impl Scheduler {
             NodeType::Magic if topo.cultivation_times[nb as usize] > 0 => {
                 Some((1, topo.busy_counts[nb as usize]))
             }
+            NodeType::Magic if self.t_correction == TCorrection::LitinskiReady => Some((2, 0)),
             _ => None,
         }
+    }
+
+    /// Occupies helper `h` (a neighbour of `magic`) until `decision` and logs it.
+    fn take_helper(&mut self, magic: u16, h: u16, decision: usize) {
+        info_sched!("    helper |0> patch {}", self.input.topo.label(h));
+        if self.helper_rank(h).map_or(false, |r| r.0 == 2) {
+            self.t_stats.helpers_ready += 1;
+        }
+        self.t_stats.helper_log.push((self.current_lcycle, magic, h));
+        self.t_stats.helpers += 1;
+        self.mark_nodes_used(&[h]);
+        self.hold(h, decision);
     }
 
     /// A free neighbour of `magic` to borrow as a |0> helper (best `helper_rank`).
@@ -897,13 +922,7 @@ impl Scheduler {
             return;
         }
         match self.pick_helper(magic) {
-            Some(h) => {
-                info_sched!("    helper |0> patch {}", self.input.topo.label(h));
-                self.t_stats.helper_log.push((now, magic, h));
-                self.t_stats.helpers += 1;
-                self.mark_nodes_used(&[h]);
-                self.hold(h, decision);
-            }
+            Some(h) => self.take_helper(magic, h, decision),
             None if self.helper_possible(magic) => {
                 // The magic patch keeps its state until a helper is free (hold_t_patches).
                 info_sched!("    no free neighbour for the helper yet");
@@ -947,10 +966,7 @@ impl Scheduler {
             match self.pick_helper(magic) {
                 Some(h) => {
                     // Z_m (x) Y_h and X_m now; the magic patch is free from the next lcycle.
-                    self.t_stats.helper_log.push((now, magic, h));
-                    self.t_stats.helpers += 1;
-                    self.mark_nodes_used(&[h]);
-                    self.hold(h, decision);
+                    self.take_helper(magic, h, decision);
                     self.failed_waiting.remove(&pp_id);
                 }
                 None if now < give_up => self.helper_wanted.push((pp_id, magic, decision, give_up)),
@@ -1840,7 +1856,10 @@ impl Scheduler {
         }
         if matches!(
             self.t_correction,
-            TCorrection::Litinski | TCorrection::InplaceY | TCorrection::Hybrid
+            TCorrection::LitinskiReady
+                | TCorrection::LitinskiY
+                | TCorrection::InplaceY
+                | TCorrection::Hybrid
         ) {
             self.hold_t_patches();
         }
@@ -2273,7 +2292,9 @@ impl Scheduler {
                         // With T failures switched off (-F) no correction is ever owed, so the
                         // auto-correction needs no helper and no hold.
                         let helper_corrected = match self.t_correction {
-                            TCorrection::Litinski | TCorrection::InplaceY => true,
+                            TCorrection::LitinskiReady
+                            | TCorrection::LitinskiY
+                            | TCorrection::InplaceY => true,
                             TCorrection::Hybrid => !self.frame_owns(pp_id),
                             _ => false,
                         };
@@ -2716,12 +2737,13 @@ impl Scheduler {
                 );
             }
             mode => println!(
-                "T correction: {:?}; {} injections, {} helper patches ({} waited for one, {} \
-                 found none), {} patch-lcycles held, max decision delay {} lcycles, {} measured \
-                 in place ({} in Y)",
+                "T correction: {:?}; {} injections, {} helper patches ({} ready states wasted, {} \
+                 waited for one, {} found none), {} patch-lcycles held, max decision delay {} \
+                 lcycles, {} measured in place ({} in Y)",
                 mode,
                 self.t_stats.injections,
                 self.t_stats.helpers,
+                self.t_stats.helpers_ready,
                 self.t_stats.helpers_deferred,
                 self.t_stats.helpers_missing,
                 self.t_stats.hold_patch_lcycles,
@@ -3648,6 +3670,64 @@ mod tests {
             let (t1, _, _, d1) = log[1];
             assert_eq!(d0, t0 + 2);
             assert!(d1 == (t1 + 2).max(d0 + 2) || d1 == (t1 + 2).max(d0 + 3 + 2));
+        }
+    }
+
+    #[test]
+    fn litinski_helper_rank_prefers_bus_then_cultivating_then_ready() {
+        let mut sched = build_scheduler(T_HEAVY_LINES, 0);
+        sched.sched_circuit().expect("sched_circuit failed");
+        let topo = &mut sched.input.topo;
+        let magic: Vec<u16> = (0..topo.n_nodes as u16)
+            .filter(|&n| topo.node(n).node_type == NodeType::Magic)
+            .collect();
+        let data =
+            (0..topo.n_nodes as u16).find(|&n| topo.node(n).node_type == NodeType::Data).unwrap();
+        let (a, b) = (magic[0], magic[1]);
+        topo.cultivation_times[a as usize] = 0; // ready
+        topo.cultivation_times[b as usize] = 7; // cultivating
+        topo.busy_counts[b as usize] = 3;
+        assert_eq!(sched.helper_rank(data), None, "a data patch is never a helper");
+        let (ra, rb) = (sched.helper_rank(a).unwrap(), sched.helper_rank(b).unwrap());
+        assert!(rb < ra, "a cultivating patch is preferred to wasting a ready state");
+        sched.set_t_correction(TCorrection::LitinskiY);
+        assert_eq!(sched.helper_rank(a), None, "litinski-y never borrows a ready state");
+        assert!(sched.helper_rank(b).is_some());
+    }
+
+    #[test]
+    fn litinski_y_never_wastes_a_ready_state_and_falls_back_in_place() {
+        let (mut wasted_ready, mut any_inplace_or_wait) = (0, false);
+        for latency in [0usize, 2] {
+            for rseed in 0u32..8 {
+                let mut y = build_scheduler(T_HEAVY_LINES, rseed);
+                y.set_t_correction(TCorrection::LitinskiY);
+                y.set_reaction_latency(latency);
+                y.sched_circuit().expect("sched_circuit failed");
+                let st = &y.t_stats;
+                assert_eq!(st.helpers_ready, 0);
+                assert_eq!(st.helpers + st.helpers_missing, st.injections);
+                assert_eq!(st.inplace, st.helpers_missing);
+                any_inplace_or_wait |= st.helpers_missing + st.helpers_deferred > 0;
+                let mut r = build_scheduler(T_HEAVY_LINES, rseed);
+                r.set_reaction_latency(latency);
+                r.sched_circuit().expect("sched_circuit failed");
+                wasted_ready += r.t_stats.helpers_ready;
+            }
+        }
+        assert!(any_inplace_or_wait, "litinski-y should have to wait or fall back somewhere");
+        assert!(wasted_ready > 0, "litinski-ready should borrow a ready state somewhere");
+    }
+
+    #[test]
+    fn litinski_ready_never_borrows_a_hosted_patch() {
+        for rseed in 0u32..4 {
+            let mut sched = hosted_scheduler(HOSTED_LINES, &[3], rseed);
+            sched.set_reaction_latency(1);
+            sched.sched_circuit().expect("sched_circuit failed");
+            for &(_, _, h) in &sched.t_stats.helper_log {
+                assert!(!sched.input.topo.is_hosted(h), "helper on a hosted patch");
+            }
         }
     }
 
