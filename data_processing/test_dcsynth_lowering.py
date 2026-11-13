@@ -338,6 +338,54 @@ def test_synthesis_is_exact_for_cliffords_and_close_otherwise():
         assert lowering.t_count(seq) > 0
 
 
+def test_gridsynth_is_exact_for_cliffords_and_close_otherwise():
+    for name in ("x", "y", "z", "h", "s", "sdg"):
+        seq = lowering.synth_1q(lowering.G[name], EPS, synthesizer="gridsynth")
+        assert lowering.phase_distance(lowering.seq_matrix(seq), lowering.G[name]) < 1e-12
+        assert lowering.t_count(seq) == 0
+    for theta in (0.3, -1.1, 2.5):  # a diagonal target is one Rz
+        u = lowering.rz_matrix(theta)
+        seq = lowering.synth_1q(u, EPS, synthesizer="gridsynth")
+        assert lowering.phase_distance(lowering.seq_matrix(seq), u) < 8 * EPS, theta
+    for seed in range(4):
+        u = random_unitary(2, seed=seed).data
+        seq = lowering.synth_1q(u, EPS, synthesizer="gridsynth")
+        assert lowering.phase_distance(lowering.seq_matrix(seq), u) < 8 * EPS, seed
+        assert lowering.t_count(seq) > 0
+
+
+def circ_cliffordt_with_corrections() -> QuantumCircuit:
+    """A reassembled Clifford+T circuit: named gates that must survive as written (t t is not
+    merged into s), with dcsynth's per-qubit corrections as generic unitaries."""
+    qc = QuantumCircuit(3)
+    c = ClassicalRegister(1, "c")
+    qc.add_register(c)
+    qc.h(0), qc.t(0), qc.t(0), qc.h(1), qc.tdg(1), qc.cx(0, 2), qc.s(2), qc.cx(1, 2)
+    qc.measure(2, c[0]), qc.reset(2)
+    u = random_unitary(2, seed=5).data
+    qc.append(UnitaryGate(u), [1])  # an unconditional generic unitary next to named gates
+    qc.t(1)
+    perqubit_corrections(qc, [c[0]], {0: [u, vd.G1["z"] @ u]})
+    qc.h(0), qc.t(0), qc.cx(0, 1)
+    return finish(qc)
+
+
+def test_keep_cliffordt_emits_gates_as_written_and_matches(tmp_path: Path):
+    qc = circ_cliffordt_with_corrections()
+    named = sum(inst.operation.name in lowering.KEPT_GATES for inst in qc.data)
+    for synthesizer in ("cyclosynth", "gridsynth"):
+        text, stats = lowering.lower(qc, epsilon=EPS, keep_cliffordt=True,
+                                     synthesizer=synthesizer)
+        assert stats["kept_gates"] == named, synthesizer
+        # t t on qubit 0 stays two t gates; without --keep-cliffordt they merge into one s
+        assert "t q[0];\nt q[0];" in text, synthesizer
+        _, got = run_lowered(text, tmp_path, f"kept_{synthesizer}")
+        tv = vd.tv_distance(run_qiskit(qc), got)
+        assert tv < 5e-5, f"{synthesizer}: kept-gate lowering differs (TV {tv:.2e})"
+    merged, _ = lowering.lower(qc, epsilon=EPS)
+    assert "t q[0];\nt q[0];" not in merged
+
+
 def _lower_and_compare(name: str, tmp_path: Path) -> Path:
     qc = CIRCUITS[name]()
     text, stats = lowering.lower(qc, epsilon=EPS)

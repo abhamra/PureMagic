@@ -16,7 +16,9 @@ This script does that lowering. The steps:
      (fewer T gates), and flushed at every CX, measurement, reset or conditional.
   2. A 2x2 unitary becomes Clifford+T by: identity -> nothing; a Pauli -> one x/y/z gate (those
      are free Pauli-frame updates downstream); another Clifford -> a shortest h/s word; anything
-     else -> ZYZ Euler angles synthesised by cyclosynth to `--epsilon` (jointly optimised U3).
+     else -> ZYZ Euler angles synthesised to `--epsilon` by cyclosynth (jointly optimised U3; the
+     default) or, with `--synthesizer gridsynth`, by gridsynth (Ross-Selinger, pygridsynth: one
+     Rz for a diagonal target, else three at epsilon/3 each, as BQSKit's Clifford+T flow does).
   3. An `if_else` is flattened to leaves "under these bit values, apply this unitary to qubit q".
      For each qubit the leaves are completed to all 2^k assignments of the k bits involved. Then
      the *cheapest* assignment's unitary U_ref is applied unconditionally and only the difference
@@ -24,6 +26,11 @@ This script does that lowering. The steps:
      Pauli (or at worst a Clifford), so most of them become free frame updates instead of
      conditional T gates that the scheduler must wait on. (dcsynth's ae_4 corrections are Paulis
      only to within ~1e-5; see `--clifford-tol`.)
+
+With `--keep-cliffordt` the input is taken to be already (mostly) Clifford+T, e.g. a circuit
+reassembled from blocks that BQSKit compiled: gates named h, s, sdg, t, tdg, x, y, z, sx, sxdg
+are emitted exactly as written, never merged or resynthesised; only the remaining single-qubit
+unitaries (dcsynth's correction branches) go through step 2.
 
 Anything `transpile` cannot express (a conditional CX, a measurement inside an `if_else`, a
 classical expression as a condition) raises `NotImplementedError` rather than being dropped.
@@ -63,6 +70,8 @@ G = {
 I2 = np.eye(2, dtype=complex)
 # Rz(k*pi/4) up to global phase, as gates in time order (T^k).
 EXACT_RZ = {0: [], 1: ["t"], 2: ["s"], 3: ["s", "t"], 4: ["z"], 5: ["z", "t"], 6: ["sdg"], 7: ["tdg"]}
+#: Gates `--keep-cliffordt` emits as written (all are in `transpile`'s dialect).
+KEPT_GATES = frozenset({"h", "s", "sdg", "t", "tdg", "x", "y", "z", "sx", "sxdg"})
 MAX_COND_BITS = 8  # beyond this a single if_else is emitted leaf by leaf instead of completed
 
 
@@ -240,13 +249,16 @@ def synth_rz(theta: float, eps: float) -> list[str]:
     return _to_gates(_gates_of(_cyclosynth().synthesize_rz(theta, eps), f"Rz({theta})"))
 
 
-def synth_1q(u: np.ndarray, eps: float, cliff_tol: float = 1e-7) -> list[str]:
+def synth_1q(u: np.ndarray, eps: float, cliff_tol: float = 1e-7,
+             synthesizer: str = "cyclosynth") -> list[str]:
     """Clifford+T gates (time order) equal to `u` up to a global phase.
 
     Exact for identity, Paulis and Cliffords (within `cliff_tol`). Otherwise `u` ~ Rz(phi) Ry(theta)
-    Rz(lam) goes to cyclosynth: a diagonal target as one Rz, a general one through its jointly
-    optimised U3 route (valid for eps >= 1e-10), falling back to the rotation-by-rotation ZYZ
-    route (eps/3 each) below that or if the joint search finds nothing.
+    Rz(lam) is synthesised. cyclosynth: a diagonal target as one Rz, a general one through its
+    jointly optimised U3 route (valid for eps >= 1e-10), falling back to the rotation-by-rotation
+    ZYZ route (eps/3 each) below that or if the joint search finds nothing. gridsynth: a diagonal
+    target as one Rz, a general one as Rz(lam), Ry(theta) = S H Rz(theta) H Sdg, Rz(phi) at eps/3
+    each.
     """
     if phase_distance(u, I2) < cliff_tol:
         return []
@@ -259,7 +271,16 @@ def synth_1q(u: np.ndarray, eps: float, cliff_tol: float = 1e-7) -> list[str]:
     from qiskit.synthesis import OneQubitEulerDecomposer
 
     theta, phi, lam = OneQubitEulerDecomposer("ZYZ").angles(u)  # u ~ Rz(phi) Ry(theta) Rz(lam)
-    if abs(theta) < 1e-12:
+    if synthesizer == "gridsynth":
+        if abs(theta) < 1e-12:
+            out = synth_rz_grid(phi + lam, eps)
+        else:
+            e3 = eps / 3
+            out = (synth_rz_grid(lam, e3) + ["sdg", "h"] + synth_rz_grid(theta, e3)
+                   + ["h", "s"] + synth_rz_grid(phi, e3))
+    elif synthesizer != "cyclosynth":
+        raise ValueError(f"unknown synthesizer {synthesizer!r}")
+    elif abs(theta) < 1e-12:
         out = synth_rz(phi + lam, eps)
     else:
         cs = _cyclosynth()
@@ -278,6 +299,43 @@ def synth_1q(u: np.ndarray, eps: float, cliff_tol: float = 1e-7) -> list[str]:
     return out
 
 
+# ----------------------------------------------------------------------------- gridsynth
+# The Ross-Selinger algorithm as BQSKit's Clifford+T flow runs it (bqskit-ft's GridSynthPass calls
+# pygridsynth's gridsynth_gates). Its string is over H S T X W (W = global phase).
+_GS_REVERSED: bool | None = None
+
+
+def _gridsynth_gates():
+    try:
+        import mpmath
+        from pygridsynth.gridsynth import gridsynth_gates
+    except ImportError as e:  # pragma: no cover
+        raise SystemExit("cannot import pygridsynth (pip install pygridsynth mpmath)") from e
+    mpmath.mp.dps = max(mpmath.mp.dps, 128)  # as bqskit-ft sets it
+    return mpmath, gridsynth_gates
+
+
+def _grid_letters(theta: float, eps: float) -> str:
+    mpmath, gridsynth_gates = _gridsynth_gates()
+    return str(gridsynth_gates(mpmath.mpf(theta), mpmath.mpf(eps)))
+
+
+def synth_rz_grid(theta: float, eps: float) -> list[str]:
+    """Rz(theta) as Clifford+T gates (time order), by gridsynth."""
+    global _GS_REVERSED
+    k = round(theta / (math.pi / 4))
+    if abs(theta - k * math.pi / 4) < 1e-9:
+        return list(EXACT_RZ[k % 8])
+    if _GS_REVERSED is None:  # bqskit-ft says matrix order; check, as for cyclosynth
+        g = _grid_letters(0.3, 1e-3)
+        d = [(phase_distance(seq_matrix(_letters_to_gates(g, rev)), rz_matrix(0.3)), rev)
+             for rev in (False, True)]
+        dist, _GS_REVERSED = min(d)
+        if dist > 1e-2:
+            raise RuntimeError(f"cannot interpret gridsynth output (distance {dist:.2e})")
+    return _letters_to_gates(_grid_letters(theta, eps), _GS_REVERSED)
+
+
 def t_count(seq: list[str]) -> int:
     return sum(g in ("t", "tdg") for g in seq)
 
@@ -294,8 +352,10 @@ class Lowerer:
     With ``dry=True`` nothing is synthesized: each target is recorded with its distance to the
     nearest Clifford (kind ``item``), which is all `lower` needs to split an error budget."""
 
-    def __init__(self, qc, eps: float, cliff_tol: float, dry: bool = False) -> None:
+    def __init__(self, qc, eps: float, cliff_tol: float, dry: bool = False,
+                 keep_cliffordt: bool = False, synthesizer: str = "cyclosynth") -> None:
         self.qc, self.eps, self.cliff_tol, self.dry = qc, eps, cliff_tol, dry
+        self.keep_cliffordt, self.synthesizer = keep_cliffordt, synthesizer
         self.lines: list[str] = []
         self.pending: dict[int, np.ndarray] = {}
         self.stats: Counter = Counter()
@@ -310,7 +370,7 @@ class Lowerer:
             self.ledger.append(("item", d))
             return nearest_clifford(u, self.cliff_tol) or ["t"]  # a placeholder rotation
         if key not in self._cache:
-            word = synth_1q(u, self.eps, self.cliff_tol)
+            word = synth_1q(u, self.eps, self.cliff_tol, self.synthesizer)
             self._cache[key] = (word, phase_distance(seq_matrix(word), u))
         word, err = self._cache[key]
         if err > 1e-15 or t_count(word):
@@ -477,6 +537,10 @@ class Lowerer:
                 self.stats["reset"] += 1
             elif isinstance(op, IfElseOp):
                 self._emit_if(inst, qmap, cmap)
+            elif self.keep_cliffordt and op.name in KEPT_GATES and not op.num_clbits:
+                self.flush(qs[0])  # an earlier unitary runs first, on its own
+                self.emit(op.name, qs[0])
+                self.stats["kept_gates"] += 1
             elif op.num_qubits == 1 and not op.num_clbits:
                 self.add_1q(Operator(op).data, qs[0])
             elif op.name == "cx":
@@ -551,8 +615,12 @@ def allocate(distances: list[float], budget: float) -> tuple[float, float]:
 
 def lower(qc, epsilon: float = 1e-8, clifford_tol: float = 1e-7,
           synth_mode: str = "u3", error_budget: float | None = None,
-          block_error: float = 0.0) -> tuple[str, Counter]:
+          block_error: float = 0.0, keep_cliffordt: bool = False,
+          synthesizer: str = "cyclosynth") -> tuple[str, Counter]:
     """Lower a dcsynth circuit; returns (OpenQASM 2 text, statistics).
+
+    `synthesizer` (cyclosynth or gridsynth) synthesises the non-Clifford unitaries; with
+    `keep_cliffordt`, gates already in Clifford+T are emitted as written (see the module docs).
 
     Error accounting. Every error is measured as half the diamond distance of the implemented
     operation from the ideal one, and these add up along the circuit. The total is at most
@@ -573,7 +641,8 @@ def lower(qc, epsilon: float = 1e-8, clifford_tol: float = 1e-7,
                              f"({block_error:.3g}); compile the blocks more accurately")
         tau = clifford_tol
         for _ in range(6):
-            dry = Lowerer(qc, rest, tau, dry=True)
+            dry = Lowerer(qc, rest, tau, dry=True, keep_cliffordt=keep_cliffordt,
+                          synthesizer=synthesizer)
             dry.run()
             epsilon, new_tau = allocate([e for _, e in dry.ledger], rest)
             if abs(new_tau - tau) <= 1e-3 * new_tau:
@@ -581,7 +650,8 @@ def lower(qc, epsilon: float = 1e-8, clifford_tol: float = 1e-7,
                 break
             tau = new_tau
         clifford_tol = tau
-    lw = Lowerer(qc, epsilon, clifford_tol)
+    lw = Lowerer(qc, epsilon, clifford_tol, keep_cliffordt=keep_cliffordt,
+                 synthesizer=synthesizer)
     text = lw.run()
     rot = [e for k, e in lw.ledger if k == "rot"]
     snap = [e for k, e in lw.ledger if k == "snap"]
@@ -630,6 +700,16 @@ def main() -> int:
         help="u3: jointly optimised U3 (fewest T, slow at eps 1e-8); zyz: three fast Rz syntheses",
     )
     ap.add_argument(
+        "--synthesizer", choices=("cyclosynth", "gridsynth"), default="cyclosynth",
+        help="what synthesises non-Clifford unitaries: cyclosynth (default) or gridsynth "
+             "(Ross-Selinger, via pygridsynth, as BQSKit's Clifford+T flow)",
+    )
+    ap.add_argument(
+        "--keep-cliffordt", action="store_true",
+        help="emit gates already in Clifford+T (h s sdg t tdg x y z sx sxdg) as written; only "
+             "the other single-qubit unitaries are synthesised (for reassembled Clifford+T blocks)",
+    )
+    ap.add_argument(
         "--error-budget", type=float, default=None,
         help="total error allowed for the whole circuit (half diamond distance); chooses "
              "--epsilon and --clifford-tol so that block error + lowering error fits it",
@@ -641,7 +721,7 @@ def main() -> int:
     args = ap.parse_args()
     qc = load_circuit(args.input)
     text, st = lower(qc, args.epsilon, args.clifford_tol, args.synth,
-                     args.error_budget, args.block_error)
+                     args.error_budget, args.block_error, args.keep_cliffordt, args.synthesizer)
     out = args.output or args.input.with_suffix(".cliffordt.qasm")
     out.write_text(text)
     print(
