@@ -7,15 +7,15 @@ R_P(π/4). This document covers how PureMagic used to account for that correctio
 wrong, and the models that replace it. Litinski's auto-corrected rotation comes in two variants
 that differ only in which patch may be the helper:
 
-- `litinski-ready` (default): when no bus or cultivating neighbour is free, a ready magic state
-  is borrowed as the helper and its state is wasted (§2.1);
-- `litinski-y`: a ready state is never borrowed; an injection without a helper waits, then has
-  its magic patch measured in place in X or Y, Gidney's technique (§2.2). This is what
+- `litinski-y` (default): a ready state is never borrowed; an injection without a helper waits,
+  then has its magic patch measured in place in X or Y, Gidney's technique (§2.1). This is what
   `litinski` meant before the split, and every result below labelled `litinski` is this variant.
+- `litinski-ready`: when no bus or cultivating neighbour is free, a ready magic state is borrowed
+  as the helper and its state is wasted (§2.2).
 
 | Flag | Values | Default |
 |---|---|---|
-| `--t-correction` | `litinski-ready`, `litinski-y`, `inplace-y`, `frame`, `hybrid`, `legacy` | `litinski-ready` |
+| `--t-correction` | `litinski-y`, `litinski-ready`, `inplace-y`, `frame`, `hybrid`, `legacy` | `litinski-y` |
 | `--y-meas-lcycles` | extra lcycles for an in-place Y measurement | 1 |
 | `--reaction-latency` | lcycles to decode an outcome and act on it (also used for `@` edges) | 0 |
 
@@ -47,7 +47,7 @@ model also charged no decoding time before a correction is decided.
 
 `legacy` is kept only for comparison. It reproduces the old schedules line for line.
 
-## 2. Auto-corrected π/8 rotation (`litinski-ready`, default, and `litinski-y`)
+## 2. Auto-corrected π/8 rotation (`litinski-y`, default, and `litinski-ready`)
 
 Litinski, *A Game of Surface Codes* (Quantum 3, 128, 2019), auto-corrected π/8 rotations. With a
 |0⟩ helper patch h next to the magic patch m:
@@ -80,11 +80,20 @@ What the scheduler does in both variants:
 The variants differ when no bus or cultivating neighbour is free. The free neighbours left are
 then usually ready magic states (on most failed searches in the PureMagic benchmarks).
 
-### 2.1 `--t-correction litinski-ready` (default): waste a ready state
+### 2.1 `--t-correction litinski-y` (default): never waste a ready state; in-place Y fallback
+
+A ready magic state is never a helper. An injection with no other free neighbour waits for one,
+holding its magic patch. After 2 lcycles, or at once if no neighbour could ever be a helper, the
+magic patch is measured in place instead (section 3, Gidney): it is held until the decision and
+measured in X (no correction) or Y (applies it). Waiting longer could deadlock two magic patches
+that each occupy the other's only free neighbour: without the 2-lcycle limit, 4 of 20 PureMagic
+benchmark runs took 1–4 million lcycles instead of 1,500–14,000.
+
+### 2.2 `--t-correction litinski-ready`: waste a ready state
 
 A ready magic state is borrowed as the helper, last in the order above; its state is lost and the
 patch starts cultivating again. Fewer injections wait for a helper, and the in-place fallback of
-§2.2 is kept only as a safety net (a magic patch with no free neighbour at all for 2 lcycles).
+§2.1 is kept only as a safety net (a magic patch with no free neighbour at all for 2 lcycles).
 
 Measured against `litinski-y` (geomean lcycles; seeds 0–1):
 
@@ -97,18 +106,11 @@ On the PureMagic benchmarks, waits for a helper drop from 28.3% to 6.1% of injec
 in-place fallback (0.47%) disappears, and 16.5% of helpers are wasted ready states. On the
 dcsynth benchmarks the fallback also disappears (6,828 injections over the runs, to 0) and waits
 halve (421,224 to 122,409), but the 214,889 wasted ready states cost more: these circuits are
-T-dense and limited by magic-state supply. `litinski-ready` is the default; for the dcsynth
-comparisons in this repository, `litinski-y` is the cheaper choice and matches the results
-reported below.
+T-dense and limited by magic-state supply.
 
-### 2.2 `--t-correction litinski-y`: never waste a ready state; in-place Y fallback
-
-A ready magic state is never a helper. An injection with no other free neighbour waits for one,
-holding its magic patch. After 2 lcycles, or at once if no neighbour could ever be a helper, the
-magic patch is measured in place instead (section 3, Gidney): it is held until the decision and
-measured in X (no correction) or Y (applies it). Waiting longer could deadlock two magic patches
-that each occupy the other's only free neighbour: without the 2-lcycle limit, 4 of 20 PureMagic
-benchmark runs took 1–4 million lcycles instead of 1,500–14,000.
+Over all 24 circuits, `litinski-ready` costs +0.8% more lcycles than `litinski-y` (geomean, at
+both L = 0 and L = 1) and is worse on 13–15 of them. That, and never wasting a magic state, is
+why `litinski-y` is the default.
 
 ### When is the correction decided?
 
@@ -358,9 +360,9 @@ finish on grover n100, and qv N064 and fermi_hubbard 128q were run for the hybri
 - **At L = 4 the reaction limit dominates every model,** and the hybrid is even with or slightly
   ahead of Litinski on some sets (+69.1% vs +74.3%; qft n160 +145% vs +225%).
 
-`litinski` (now `litinski-y`) was the best of these models at every latency from 1 up, and within
-a point of the best at 0; `litinski-ready` (§2.1) is cheaper still on the PureMagic benchmarks
-and is the default. `hybrid` is the better choice at zero reaction latency; `frame` is kept as the
+`litinski` (now `litinski-y`, the default) is the best of these models at every latency from 1
+up, and within a point of the best at 0; `litinski-ready` (§2.2) is slightly cheaper on the
+PureMagic benchmarks but more expensive on the dcsynth ones. `hybrid` is the better choice at zero reaction latency; `frame` is kept as the
 reference for an exact frame.
 
 ### DC-opt vs Orig

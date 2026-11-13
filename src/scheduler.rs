@@ -185,12 +185,13 @@ pub(crate) enum TCorrection {
     /// earlier T gates whose Paulis anticommute). The helper is a bus patch, else a cultivating
     /// magic patch, else a ready magic state, whose state is wasted. An injection that finds no
     /// helper within `HELPER_MAX_WAIT` lcycles has its magic patch measured in place instead (in
-    /// X, or in Y for a failed T); with ready states allowed this is rare. The default.
+    /// X, or in Y for a failed T); with ready states allowed this is rare.
     LitinskiReady,
     /// As `litinski-ready`, but a ready magic state is never borrowed as the helper. Injections
     /// whose free neighbours are all ready states wait for a helper, and after `HELPER_MAX_WAIT`
     /// lcycles fall back to measuring the magic patch in place in X or Y (Gidney). This was
-    /// `litinski` before the two were split.
+    /// `litinski` before the two were split. The default: it never wastes a magic state, and is
+    /// cheaper overall on the benchmarks (docs/t-gate-corrections.md).
     LitinskiY,
     /// In-place Y measurement (Gidney, "Inplace Access to the Surface Code Y Basis", Quantum
     /// 2024): no helper. After P (x) Z_m the magic patch itself is held until the correction is
@@ -493,7 +494,7 @@ impl Scheduler {
             skipped_set: HashSet::new(),
             n_skipped_t: 0,
             hosted: HostedAncillas::default(),
-            t_correction: TCorrection::LitinskiReady,
+            t_correction: TCorrection::LitinskiY,
             held: Vec::new(),
             helper_wanted: Vec::new(),
             inplace_pending: HashMap::new(),
@@ -3676,6 +3677,7 @@ mod tests {
     #[test]
     fn litinski_helper_rank_prefers_bus_then_cultivating_then_ready() {
         let mut sched = build_scheduler(T_HEAVY_LINES, 0);
+        sched.set_t_correction(TCorrection::LitinskiReady);
         sched.sched_circuit().expect("sched_circuit failed");
         let topo = &mut sched.input.topo;
         let magic: Vec<u16> = (0..topo.n_nodes as u16)
@@ -3710,6 +3712,7 @@ mod tests {
                 assert_eq!(st.inplace, st.helpers_missing);
                 any_inplace_or_wait |= st.helpers_missing + st.helpers_deferred > 0;
                 let mut r = build_scheduler(T_HEAVY_LINES, rseed);
+                r.set_t_correction(TCorrection::LitinskiReady);
                 r.set_reaction_latency(latency);
                 r.sched_circuit().expect("sched_circuit failed");
                 wasted_ready += r.t_stats.helpers_ready;
@@ -3723,6 +3726,7 @@ mod tests {
     fn litinski_ready_never_borrows_a_hosted_patch() {
         for rseed in 0u32..4 {
             let mut sched = hosted_scheduler(HOSTED_LINES, &[3], rseed);
+            sched.set_t_correction(TCorrection::LitinskiReady);
             sched.set_reaction_latency(1);
             sched.sched_circuit().expect("sched_circuit failed");
             for &(_, _, h) in &sched.t_stats.helper_log {

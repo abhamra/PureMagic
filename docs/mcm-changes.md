@@ -54,7 +54,7 @@ Next to it, in `../bench_results/` (benchmark data, not in the repository):
 | a76ea98 | mcm-support | Merge of t-autocorrect-litinski: `mcm-support` now holds all of the above |
 | e563b71, 4c53671 | t-correction-frame | `--t-correction frame`: failed T corrections folded into an exact Clifford frame (opt-in; loses to `litinski`, see §5 and `docs/t-gate-corrections.md` §3a) |
 | 5634c69 | t-correction-frame | `--t-correction hybrid`: local frame for one-qubit T gates, cleared by rotations before CX; helper for multi-qubit T gates (`docs/t-gate-corrections.md` §3b) |
-| (this change) | t-correction-fix | `litinski` split into `litinski-ready` (new default: a ready magic state may be wasted as the helper) and `litinski-y` (the old `litinski`: never waste a ready state, fall back to an in-place X/Y measurement); `docs/t-gate-corrections.md` §2.1–2.2 |
+| a91db93 | t-correction-fix | `litinski` split into `litinski-y` (default; the old `litinski`: never waste a ready state, fall back to an in-place X/Y measurement) and `litinski-ready` (a ready magic state may be wasted as the helper; +0.8% over the 24 circuits); `docs/t-gate-corrections.md` §2.1–2.2 |
 
 ## 1. Model
 
@@ -255,12 +255,12 @@ the flushes that conditional gates cause at transpile time (§8), which is Level
 
 ### Other scheduler details that matter for dynamic circuits
 
-- **T failures** are a 50% coin flip per executed T. By default (`--t-correction litinski-ready`)
-  the correction is applied on a borrowed helper patch, so nothing is owed on the data; the helper
-  is held until the correction is decided (reaction latency, chained through earlier
-  anticommuting T gates). When no bus or cultivating neighbour is free, `litinski-ready` wastes a
-  ready magic state as the helper, while `litinski-y` (the former `litinski`) waits and then
-  measures the magic patch in place in X or Y. See `docs/t-gate-corrections.md`. The two bullets below describe only
+- **T failures** are a 50% coin flip per executed T. By default (`--t-correction litinski-y`, the
+  former `litinski`) the correction is applied on a borrowed helper patch, so nothing is owed on
+  the data; the helper is held until the correction is decided (reaction latency, chained through
+  earlier anticommuting T gates). When no bus or cultivating neighbour is free, `litinski-y`
+  waits and then measures the magic patch in place in X or Y, while `litinski-ready` wastes a
+  ready magic state as the helper. See `docs/t-gate-corrections.md`. The two bullets below describe only
   `--t-correction legacy`, which is kept to compare against.
 - **Exact-frame model** (`--t-correction frame`, e563b71, opt-in). No correction is ever applied.
   The scheduler keeps an exact Clifford frame W (`src/frame.rs`, a GF(2) tableau without signs)
