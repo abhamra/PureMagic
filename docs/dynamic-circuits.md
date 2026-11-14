@@ -20,9 +20,26 @@ dcsynth circuit (Qiskit)        dcsynth_to_cliffordt.py      transpile          
   UnitaryGate bodies             (1-bit cregs, if(m3==1) g)    (+ `@id` classical deps)      (--reaction-latency L)
 ```
 
+**Remove idle ancillas first.** dcsynth's `assemble()` declares its whole ancilla budget
+(`QuantumCircuit(data_num + ancilla_num)`) but reuses ancillas freely, so most of them are never
+touched (e.g. 2 of 322 for vqe_6 at one ancilla per block). PureMagic gives every declared qubit a
+patch, so idle ones enlarge the layout and the volume. Before lowering, delete the ancillas no
+instruction touches, keeping every other qubit in order:
+
+```python
+from qiskit.converters import circuit_to_dag, dag_to_circuit
+used = {qc.find_bit(q).index for ins in qc.data for q in ins.qubits}   # if_else lists all its qubits
+idle = [qc.qubits[i] for i in range(n_data, qc.num_qubits) if i not in used]
+if idle:
+    dag = circuit_to_dag(qc); dag.remove_qubits(*idle); qc = dag_to_circuit(dag)
+```
+
+The benchmark harness does this in stage A (`bench_results/scripts/assemble_variants.py`,
+`strip_idle_ancillas`); see `bench_results/REPORT.md`, "Idle-ancilla removal".
+
 ```bash
 cargo build --release --bins
-# in dcsynth's environment, on the circuit it assembled (see "What dcsynth emits"):
+# in dcsynth's environment, on the circuit it assembled, idle ancillas removed (above):
 #   from qiskit import qpy; qpy.dump(qc, open("circuit.qpy", "wb"))
 python data_processing/dcsynth_to_cliffordt.py circuit.qpy -o circuit.cliffordt.qasm --epsilon 1e-8
 ./target/release/transpile -i circuit.cliffordt.qasm -o circuit.trans --defer_trailing   # --reset_mode frame|flush|init

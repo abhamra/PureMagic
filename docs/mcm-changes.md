@@ -465,7 +465,8 @@ grover_3, ae_3 and ae_4.
 - **Unsupported.** Measurement or reset inside `if`, conditional gates on three or more qubits,
   classical expressions, loops.
 - **Modelling.** Every qubit, ancilla included, is a full logical patch, unless hosted. Unused
-  declared qubits still get patches: strip them before scheduling (the benchmark harness does).
+  declared qubits still get patches: strip them before scheduling (the benchmark harness does;
+  `docs/dynamic-circuits.md`, "Pipeline", shows how).
 - **Hosting relies on `--reset_mode flush|init`.** A hosted patch is released only after a
   weight-1 X/Z measurement or `<R>`; with `frame`, ancilla measurements are usually multi-qubit,
   so the patch stays live until its last product.
