@@ -179,7 +179,8 @@ def _cyclosynth():
         import cyclosynth
     except ImportError as e:  # pragma: no cover
         raise SystemExit(
-            "cannot import cyclosynth. Build it from the cyclosynth/ submodule "
+            f"cannot import cyclosynth ({type(e).__name__}: {e}) in {sys.executable}. Build it "
+            "from the cyclosynth/ submodule "
             "(cd cyclosynth && maturin build --release && pip install target/wheels/*.whl)"
         ) from e
     return cyclosynth
